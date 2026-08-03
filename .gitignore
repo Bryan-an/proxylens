@@ -1,0 +1,68 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Build and release output
+*.dSYM
+*.dSYM.zip
+*.ipa
+*.app.zip
+dist/
+release/
+coverage/
+
+# Logs and local tooling state
+*.log
+.codex-log/
+.swift-format-cache/
+.swiftpm-cache/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+private-keys/
+certificates/
+
+# ProxyLens local captures, sessions, and generated data
+.proxylens/
+capture-data/
+sessions/
+*.proxylens-session
+*.proxylens-ca
+
+# Temporary files and editor state
+.tmp/
+tmp/
+*.swp
+*.swo
+*~
+*.orig
+
+# Optional dependency managers
+Carthage/Build/
+Pods/
+
+# Fastlane generated output
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
