@@ -1,0 +1,614 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		02AA3E5CF2D3A84FDEDDA24C /* ProxyLensIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */; };
+		373B10301985160C7CE114CD /* ProxyLensPlatform in Frameworks */ = {isa = PBXBuildFile; productRef = 18B3570142EE7D25C687F016 /* ProxyLensPlatform */; };
+		82E9F96DC626E6ECD9CC4E77 /* AppRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFDFBB4A0E109EE410B35366 /* AppRootView.swift */; };
+		85D80C4974F4313825EF6297 /* ProxyLensCore in Frameworks */ = {isa = PBXBuildFile; productRef = 708F2844C30F68CD32CA2B79 /* ProxyLensCore */; };
+		8F716C718834177D066B5E10 /* ProxyLensUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D5BA0765D03EAF524893CFC /* ProxyLensUITests.swift */; };
+		9C01985BB4429DD4DD2E6DD8 /* ProxyLensCapture in Frameworks */ = {isa = PBXBuildFile; productRef = 20B4DE37BCA1F153F20E438A /* ProxyLensCapture */; };
+		CB41E5410231F1DF25E24FB3 /* ProxyLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 743A909ABF3FCA97B1C842A4 /* ProxyLensApp.swift */; };
+		CC3BF6C33EBF71CD07924062 /* ProxyLensApplication in Frameworks */ = {isa = PBXBuildFile; productRef = 44FD6C85C044A8636F92B57A /* ProxyLensApplication */; };
+		D12D1930AFFC6F304E1E311C /* ProxyLensPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 4BA26ACD4944A3F84274EAF3 /* ProxyLensPersistence */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D538C2403D30E8E8CDD5B157 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 790FD78CBE7FE49997A127B9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 88FBBFAEB41803F06286C11C;
+			remoteInfo = ProxyLens;
+		};
+		EE8480B65BBF6C7D302F7C24 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 790FD78CBE7FE49997A127B9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 88FBBFAEB41803F06286C11C;
+			remoteInfo = ProxyLens;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		07B2D15FC28073283A671F99 /* ProxyLensIntegrationTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ProxyLensIntegrationTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0D5BA0765D03EAF524893CFC /* ProxyLensUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyLensUITests.swift; sourceTree = "<group>"; };
+		485699450B3F68111CF42269 /* ProxyLensApplication */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensApplication; path = Packages/ProxyLensApplication; sourceTree = SOURCE_ROOT; };
+		5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyLensIntegrationTests.swift; sourceTree = "<group>"; };
+		743A909ABF3FCA97B1C842A4 /* ProxyLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyLensApp.swift; sourceTree = "<group>"; };
+		857CBA8B74A3413E49C76FF0 /* ProxyLensUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ProxyLensUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B56F3F9C9B942B5BC3B2D5B1 /* ProxyLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProxyLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0611AF5853FFCC3AA99B0E1 /* ProxyLensCapture */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensCapture; path = Packages/ProxyLensCapture; sourceTree = SOURCE_ROOT; };
+		C19617C5B9D59052C996587E /* ProxyLensPersistence */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensPersistence; path = Packages/ProxyLensPersistence; sourceTree = SOURCE_ROOT; };
+		D2705B7CDD7A834453F4309F /* ProxyLensPlatform */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensPlatform; path = Packages/ProxyLensPlatform; sourceTree = SOURCE_ROOT; };
+		EFDFBB4A0E109EE410B35366 /* AppRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRootView.swift; sourceTree = "<group>"; };
+		F30393A0CEF1F447D93AAB87 /* ProxyLensCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensCore; path = Packages/ProxyLensCore; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		ED2B8A43B1475A817D106EC6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				85D80C4974F4313825EF6297 /* ProxyLensCore in Frameworks */,
+				CC3BF6C33EBF71CD07924062 /* ProxyLensApplication in Frameworks */,
+				9C01985BB4429DD4DD2E6DD8 /* ProxyLensCapture in Frameworks */,
+				D12D1930AFFC6F304E1E311C /* ProxyLensPersistence in Frameworks */,
+				373B10301985160C7CE114CD /* ProxyLensPlatform in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		08970E6CCA36799A9EEB2DDB /* ProxyLensApp */ = {
+			isa = PBXGroup;
+			children = (
+				9654A61E86909CD5A9BA4DB3 /* App */,
+				EDF41D2C7ECB9314FA5E7CCE /* UI */,
+			);
+			path = ProxyLensApp;
+			sourceTree = "<group>";
+		};
+		306A2783A537A2CCD76FE929 /* Shell */ = {
+			isa = PBXGroup;
+			children = (
+				EFDFBB4A0E109EE410B35366 /* AppRootView.swift */,
+			);
+			path = Shell;
+			sourceTree = "<group>";
+		};
+		4414501C563134A9B07DE60C /* ProxyLensUITests */ = {
+			isa = PBXGroup;
+			children = (
+				0D5BA0765D03EAF524893CFC /* ProxyLensUITests.swift */,
+			);
+			path = ProxyLensUITests;
+			sourceTree = "<group>";
+		};
+		5884DA73E96AAD47ACEE6F15 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				ADA7BF26DCA280261421A468 /* ProxyLensIntegrationTests */,
+				4414501C563134A9B07DE60C /* ProxyLensUITests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		810112C4DB4F25F0943530DD = {
+			isa = PBXGroup;
+			children = (
+				B5B3D91BEC1782077B4160CB /* Packages */,
+				08970E6CCA36799A9EEB2DDB /* ProxyLensApp */,
+				5884DA73E96AAD47ACEE6F15 /* Tests */,
+				CC1E732479B210873B346F95 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		9654A61E86909CD5A9BA4DB3 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				743A909ABF3FCA97B1C842A4 /* ProxyLensApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		ADA7BF26DCA280261421A468 /* ProxyLensIntegrationTests */ = {
+			isa = PBXGroup;
+			children = (
+				5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */,
+			);
+			path = ProxyLensIntegrationTests;
+			sourceTree = "<group>";
+		};
+		B5B3D91BEC1782077B4160CB /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				485699450B3F68111CF42269 /* ProxyLensApplication */,
+				C0611AF5853FFCC3AA99B0E1 /* ProxyLensCapture */,
+				F30393A0CEF1F447D93AAB87 /* ProxyLensCore */,
+				C19617C5B9D59052C996587E /* ProxyLensPersistence */,
+				D2705B7CDD7A834453F4309F /* ProxyLensPlatform */,
+			);
+			path = Packages;
+			sourceTree = "<group>";
+		};
+		CC1E732479B210873B346F95 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B56F3F9C9B942B5BC3B2D5B1 /* ProxyLens.app */,
+				07B2D15FC28073283A671F99 /* ProxyLensIntegrationTests.xctest */,
+				857CBA8B74A3413E49C76FF0 /* ProxyLensUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		EDF41D2C7ECB9314FA5E7CCE /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				306A2783A537A2CCD76FE929 /* Shell */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		5173617D16C58A9C4B60F160 /* ProxyLensIntegrationTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0574DE351A0DED534F4A5DC7 /* Build configuration list for PBXNativeTarget "ProxyLensIntegrationTests" */;
+			buildPhases = (
+				86305F09D0312AC1DD289003 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				F416BE298DC9950E164DF7B3 /* PBXTargetDependency */,
+			);
+			name = ProxyLensIntegrationTests;
+			packageProductDependencies = (
+			);
+			productName = ProxyLensIntegrationTests;
+			productReference = 07B2D15FC28073283A671F99 /* ProxyLensIntegrationTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		7325B8C37FBF4C67920F6E45 /* ProxyLensUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4E840496399319305E8DD953 /* Build configuration list for PBXNativeTarget "ProxyLensUITests" */;
+			buildPhases = (
+				BC210B42EB70A29F075DF088 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				F0553C21BE46BF59D985BBD5 /* PBXTargetDependency */,
+			);
+			name = ProxyLensUITests;
+			packageProductDependencies = (
+			);
+			productName = ProxyLensUITests;
+			productReference = 857CBA8B74A3413E49C76FF0 /* ProxyLensUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		88FBBFAEB41803F06286C11C /* ProxyLens */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F84C8DFFDE07A77FAABB4C8A /* Build configuration list for PBXNativeTarget "ProxyLens" */;
+			buildPhases = (
+				D20C972A9198274E55C36E9F /* Sources */,
+				ED2B8A43B1475A817D106EC6 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ProxyLens;
+			packageProductDependencies = (
+				708F2844C30F68CD32CA2B79 /* ProxyLensCore */,
+				44FD6C85C044A8636F92B57A /* ProxyLensApplication */,
+				20B4DE37BCA1F153F20E438A /* ProxyLensCapture */,
+				4BA26ACD4944A3F84274EAF3 /* ProxyLensPersistence */,
+				18B3570142EE7D25C687F016 /* ProxyLensPlatform */,
+			);
+			productName = ProxyLens;
+			productReference = B56F3F9C9B942B5BC3B2D5B1 /* ProxyLens.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		790FD78CBE7FE49997A127B9 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					7325B8C37FBF4C67920F6E45 = {
+						TestTargetID = 88FBBFAEB41803F06286C11C;
+					};
+				};
+			};
+			buildConfigurationList = CC74568350DEE9C880579B8A /* Build configuration list for PBXProject "ProxyLens" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 810112C4DB4F25F0943530DD;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				3D4E4225E4B0F85DBF9A7D79 /* XCLocalSwiftPackageReference "Packages/ProxyLensApplication" */,
+				29FAEDB4F8892AF73666EEDF /* XCLocalSwiftPackageReference "Packages/ProxyLensCapture" */,
+				2303FE2A6E9AFA767D22DC58 /* XCLocalSwiftPackageReference "Packages/ProxyLensCore" */,
+				635B79A077B220C8AEEFDBFC /* XCLocalSwiftPackageReference "Packages/ProxyLensPersistence" */,
+				4A97D879A4ED655EDC7EAB63 /* XCLocalSwiftPackageReference "Packages/ProxyLensPlatform" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = CC1E732479B210873B346F95 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				88FBBFAEB41803F06286C11C /* ProxyLens */,
+				5173617D16C58A9C4B60F160 /* ProxyLensIntegrationTests */,
+				7325B8C37FBF4C67920F6E45 /* ProxyLensUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		86305F09D0312AC1DD289003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				02AA3E5CF2D3A84FDEDDA24C /* ProxyLensIntegrationTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BC210B42EB70A29F075DF088 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8F716C718834177D066B5E10 /* ProxyLensUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D20C972A9198274E55C36E9F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				82E9F96DC626E6ECD9CC4E77 /* AppRootView.swift in Sources */,
+				CB41E5410231F1DF25E24FB3 /* ProxyLensApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		F0553C21BE46BF59D985BBD5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 88FBBFAEB41803F06286C11C /* ProxyLens */;
+			targetProxy = D538C2403D30E8E8CDD5B157 /* PBXContainerItemProxy */;
+		};
+		F416BE298DC9950E164DF7B3 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 88FBBFAEB41803F06286C11C /* ProxyLens */;
+			targetProxy = EE8480B65BBF6C7D302F7C24 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0FAE36C7F6FEE2AE2560C671 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = ProxyLens;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.proxylens.ProxyLens;
+				PRODUCT_NAME = ProxyLens;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		32B447F21D8B19508930E141 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.proxylens.ProxyLensUITests;
+				SDKROOT = macosx;
+				TEST_TARGET_NAME = ProxyLens;
+			};
+			name = Release;
+		};
+		352A39613295234A4B095810 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.proxylens.ProxyLensIntegrationTests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ProxyLens.app/Contents/MacOS/ProxyLens";
+			};
+			name = Debug;
+		};
+		3E051ED4AB5249E73D09B1A3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		C335CE04A0B16251350DE1AA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.proxylens.ProxyLensUITests;
+				SDKROOT = macosx;
+				TEST_TARGET_NAME = ProxyLens;
+			};
+			name = Debug;
+		};
+		CDCE43D2D39A5E44D5E8CE15 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		D155480DA70467FE15A01909 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = ProxyLens;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.proxylens.ProxyLens;
+				PRODUCT_NAME = ProxyLens;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		F1FA09B94D8AC79AF34D9A3A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.proxylens.ProxyLensIntegrationTests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ProxyLens.app/Contents/MacOS/ProxyLens";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0574DE351A0DED534F4A5DC7 /* Build configuration list for PBXNativeTarget "ProxyLensIntegrationTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				352A39613295234A4B095810 /* Debug */,
+				F1FA09B94D8AC79AF34D9A3A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		4E840496399319305E8DD953 /* Build configuration list for PBXNativeTarget "ProxyLensUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C335CE04A0B16251350DE1AA /* Debug */,
+				32B447F21D8B19508930E141 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		CC74568350DEE9C880579B8A /* Build configuration list for PBXProject "ProxyLens" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3E051ED4AB5249E73D09B1A3 /* Debug */,
+				CDCE43D2D39A5E44D5E8CE15 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F84C8DFFDE07A77FAABB4C8A /* Build configuration list for PBXNativeTarget "ProxyLens" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0FAE36C7F6FEE2AE2560C671 /* Debug */,
+				D155480DA70467FE15A01909 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		2303FE2A6E9AFA767D22DC58 /* XCLocalSwiftPackageReference "Packages/ProxyLensCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/ProxyLensCore;
+		};
+		29FAEDB4F8892AF73666EEDF /* XCLocalSwiftPackageReference "Packages/ProxyLensCapture" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/ProxyLensCapture;
+		};
+		3D4E4225E4B0F85DBF9A7D79 /* XCLocalSwiftPackageReference "Packages/ProxyLensApplication" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/ProxyLensApplication;
+		};
+		4A97D879A4ED655EDC7EAB63 /* XCLocalSwiftPackageReference "Packages/ProxyLensPlatform" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/ProxyLensPlatform;
+		};
+		635B79A077B220C8AEEFDBFC /* XCLocalSwiftPackageReference "Packages/ProxyLensPersistence" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/ProxyLensPersistence;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		18B3570142EE7D25C687F016 /* ProxyLensPlatform */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ProxyLensPlatform;
+		};
+		20B4DE37BCA1F153F20E438A /* ProxyLensCapture */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ProxyLensCapture;
+		};
+		44FD6C85C044A8636F92B57A /* ProxyLensApplication */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ProxyLensApplication;
+		};
+		4BA26ACD4944A3F84274EAF3 /* ProxyLensPersistence */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ProxyLensPersistence;
+		};
+		708F2844C30F68CD32CA2B79 /* ProxyLensCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = ProxyLensCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 790FD78CBE7FE49997A127B9 /* Project object */;
+}

@@ -1,0 +1,78 @@
+name: ProxyLens
+
+options:
+  bundleIdPrefix: com.proxylens
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+
+packages:
+  ProxyLensCore:
+    path: Packages/ProxyLensCore
+  ProxyLensApplication:
+    path: Packages/ProxyLensApplication
+  ProxyLensCapture:
+    path: Packages/ProxyLensCapture
+  ProxyLensPersistence:
+    path: Packages/ProxyLensPersistence
+  ProxyLensPlatform:
+    path: Packages/ProxyLensPlatform
+
+targets:
+  ProxyLens:
+    type: application
+    platform: macOS
+    sources:
+      - path: ProxyLensApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.proxylens.ProxyLens
+        PRODUCT_NAME: ProxyLens
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: ProxyLens
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+    dependencies:
+      - package: ProxyLensCore
+        product: ProxyLensCore
+      - package: ProxyLensApplication
+        product: ProxyLensApplication
+      - package: ProxyLensCapture
+        product: ProxyLensCapture
+      - package: ProxyLensPersistence
+        product: ProxyLensPersistence
+      - package: ProxyLensPlatform
+        product: ProxyLensPlatform
+
+  ProxyLensIntegrationTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/ProxyLensIntegrationTests
+    dependencies:
+      - target: ProxyLens
+
+  ProxyLensUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: Tests/ProxyLensUITests
+    dependencies:
+      - target: ProxyLens
+
+schemes:
+  ProxyLens:
+    build:
+      targets:
+        ProxyLens: all
+        ProxyLensIntegrationTests: [test]
+        ProxyLensUITests: [test]
+    test:
+      targets:
+        - name: ProxyLensIntegrationTests
+        - name: ProxyLensUITests
