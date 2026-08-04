@@ -1,0 +1,35 @@
+name: Quality
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          xcrun --find swift-format
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Run quality checks
+        env:
+          CI: "true"
+        run: ./scripts/quality.sh ci

@@ -210,6 +210,13 @@ When code exists:
 - Run focused tests first, then the full suite before handing off.
 - For documentation-only changes, verify links/paths and check the instruction file remains below 32 KiB.
 
+## Quality workflow
+
+- Run `./scripts/setup-hooks.sh` once per clone to enable the versioned hooks in `.githooks/`.
+- `pre-commit` checks staged whitespace and staged Swift formatting; `pre-push` runs the full local quality script.
+- Use `./scripts/quality.sh format` for explicit formatting and `./scripts/quality.sh ci` to reproduce the GitHub Actions quality job locally.
+- Keep GitHub Actions and protected-branch status checks as the authoritative merge gate because local hooks can be bypassed.
+
 ## Implementation order
 
 1. Define core flow/message/body/rule types and ports.
@@ -233,4 +240,3 @@ Defer HTTP/2, HTTP/3, mobile/VPN capture, scripting, cloud, collaboration, and t
 - Use official documentation when verifying current Swift, Apple, SwiftNIO, GRDB, signing, or security APIs.
 - Never commit secrets, captured credentials, private keys, generated session data, or local macOS configuration.
 - Do not change product scope, entitlements, distribution model, or architecture boundaries silently.
-
