@@ -290,7 +290,7 @@ Conceptually:
 let certificateProvider = KeychainCertificateProvider(...)
 let bodyStore = FileBodyStore(...)
 let sessionStore = GRDBSessionStore(...)
-let proxyEngine = NIOCaptureEngine(
+let proxyEngine = NIOProxyEngine(
     certificateProvider: certificateProvider
 )
 let systemProxy = MacOSSystemProxyController(...)

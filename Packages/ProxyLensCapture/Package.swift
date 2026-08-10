@@ -10,7 +10,9 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../ProxyLensCore"),
-        .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.3")
+        .package(path: "../ProxyLensPlatform"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.3"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.36.1")
     ],
     targets: [
         .target(
@@ -19,17 +21,22 @@ let package = Package(
                 .product(name: "ProxyLensCore", package: "ProxyLensCore"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
-                .product(name: "NIOPosix", package: "swift-nio")
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl")
             ]
         ),
         .testTarget(
             name: "ProxyLensCaptureTests",
             dependencies: [
                 "ProxyLensCapture",
+                .product(name: "ProxyLensPlatform", package: "ProxyLensPlatform"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
-                .product(name: "NIOPosix", package: "swift-nio")
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl")
             ]
         )
     ]

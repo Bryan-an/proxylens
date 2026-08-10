@@ -47,6 +47,15 @@ actor FlowTransaction {
         await eventSink.publish(.updated(flow))
     }
 
+    func markTLSHandshakeCompleted(at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+
+        flow.markTLSHandshakeCompleted(at: date)
+        await eventSink.publish(.updated(flow))
+    }
+
     func receiveResponse(_ response: HTTPResponse, at date: Date) async {
         guard !isFinished else {
             return

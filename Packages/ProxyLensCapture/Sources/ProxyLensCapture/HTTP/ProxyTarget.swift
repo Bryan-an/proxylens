@@ -6,8 +6,18 @@ struct ProxyTarget: Sendable {
     let host: String
     let port: Int
     let originForm: String
+    let usesTLS: Bool
 
-    init(uri: String, headers: NIOHTTP1.HTTPHeaders) throws {
+    init(
+        uri: String,
+        headers: NIOHTTP1.HTTPHeaders,
+        tunnelTarget: ConnectTarget? = nil
+    ) throws {
+        if let tunnelTarget {
+            try self.init(tunneledURI: uri, target: tunnelTarget)
+            return
+        }
+
         let parsedURL: URL
         let originForm: String
 
@@ -46,10 +56,64 @@ struct ProxyTarget: Sendable {
             throw ProxyTargetError.invalidPort(port)
         }
 
-        self.url = parsedURL
+        self.init(
+            url: parsedURL,
+            host: host,
+            port: port,
+            originForm: originForm.isEmpty ? "/" : originForm,
+            usesTLS: false
+        )
+    }
+
+    private init(tunneledURI uri: String, target: ConnectTarget) throws {
+        guard uri == "*" || uri.hasPrefix("/"),
+            let relativeComponents = URLComponents(string: uri == "*" ? "/" : uri),
+            relativeComponents.scheme == nil,
+            relativeComponents.host == nil,
+            relativeComponents.user == nil,
+            relativeComponents.password == nil,
+            relativeComponents.fragment == nil
+        else {
+            throw ProxyTargetError.invalidURI(uri)
+        }
+
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = target.host
+        if target.port != 443 {
+            components.port = target.port
+        }
+        components.percentEncodedPath =
+            relativeComponents.percentEncodedPath.isEmpty
+            ? "/"
+            : relativeComponents.percentEncodedPath
+        components.percentEncodedQuery = relativeComponents.percentEncodedQuery
+
+        guard let url = components.url else {
+            throw ProxyTargetError.invalidURI(uri)
+        }
+
+        self.init(
+            url: url,
+            host: target.host,
+            port: target.port,
+            originForm: uri == "*" ? "*" : uri,
+            usesTLS: true
+        )
+    }
+
+    private init(
+        url: URL,
+        host: String,
+        port: Int,
+        originForm: String,
+        usesTLS: Bool
+    ) {
+        self.url = url
         self.host = host
         self.port = port
-        self.originForm = originForm.isEmpty ? "/" : originForm
+        self.originForm = originForm
+        self.usesTLS = usesTLS
     }
 
     private static func originForm(for url: URL) -> String {

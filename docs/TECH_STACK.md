@@ -155,6 +155,8 @@ TLS is a product subsystem, not an implementation detail. It should be isolated 
 
 The root CA private key must never be written to normal logs, SQLite, exported session files, or crash reports. The certificate store should expose only the minimum operations needed by the TLS subsystem.
 
+For P0, the root uses a permanent P-256 `SecKey` marked sensitive and non-extractable, while its public certificate is stored as a native Keychain certificate item. Per-host P-256 leaf keys are short-lived, generated only in memory, and held in a bounded cache. Only leaf certificate/key PEM crosses the certificate-provider boundary into NIOSSL; root private-key bytes are never serialized. Both intercepted client channels and upstream channels require TLS 1.2 or newer, and upstream verification remains enabled against the system trust store plus explicitly configured additional roots used by local tests.
+
 ### Trust and system proxy setup
 
 The first release should provide explicit onboarding and a reversible setup flow:

@@ -2,15 +2,21 @@ import Foundation
 import NIOCore
 import NIOHTTP1
 import NIOPosix
+import NIOSSL
+import NIOTLS
 import ProxyLensCore
 
-final class HTTPProxyHandler: ChannelInboundHandler {
+final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
     private let sessionID: SessionID
     private let eventSink: any FlowEventSink
     private let maxPendingRequestBytes: Int
+    private let interceptHTTPS: Bool
+    private let certificateProvider: (any CertificateProvider)?
+    private let upstreamTLSContext: NIOSSLContext?
+    private let tunnelTarget: ConnectTarget?
 
     private var requestHead: HTTPRequestHead?
     private var upstreamChannel: Channel?
@@ -19,15 +25,25 @@ final class HTTPProxyHandler: ChannelInboundHandler {
     private var requestEnded = false
     private var responseStarted = false
     private var transaction: FlowTransaction?
+    private var pendingConnectTarget: ConnectTarget?
+    private var isPreparingTLSIntercept = false
 
     init(
         sessionID: SessionID,
         eventSink: any FlowEventSink,
-        maxPendingRequestBytes: Int
+        maxPendingRequestBytes: Int,
+        interceptHTTPS: Bool = false,
+        certificateProvider: (any CertificateProvider)? = nil,
+        upstreamTLSContext: NIOSSLContext? = nil,
+        tunnelTarget: ConnectTarget? = nil
     ) {
         self.sessionID = sessionID
         self.eventSink = eventSink
         self.maxPendingRequestBytes = max(1, maxPendingRequestBytes)
+        self.interceptHTTPS = interceptHTTPS
+        self.certificateProvider = certificateProvider
+        self.upstreamTLSContext = upstreamTLSContext
+        self.tunnelTarget = tunnelTarget
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -92,19 +108,18 @@ final class HTTPProxyHandler: ChannelInboundHandler {
             return
         }
 
-        guard head.method != .CONNECT else {
-            sendError(
-                statusCode: 501,
-                reason: "Not Implemented",
-                message: "CONNECT is implemented in the TLS interception milestone.",
-                context: context
-            )
+        if head.method == .CONNECT {
+            receiveConnectHead(head, context: context)
             return
         }
 
         let target: ProxyTarget
         do {
-            target = try ProxyTarget(uri: head.uri, headers: head.headers)
+            target = try ProxyTarget(
+                uri: head.uri,
+                headers: head.headers,
+                tunnelTarget: tunnelTarget
+            )
         } catch {
             sendError(
                 statusCode: 400, reason: "Bad Request", message: error.localizedDescription,
@@ -132,9 +147,10 @@ final class HTTPProxyHandler: ChannelInboundHandler {
             rawTarget: head.uri
         )
         let connection = ConnectionInfo(
-            protocolKind: .http,
+            protocolKind: target.usesTLS ? .https : .http,
             upstreamHost: target.host,
-            upstreamPort: UInt16(target.port)
+            upstreamPort: UInt16(target.port),
+            tlsIntercepted: target.usesTLS
         )
         let flow = Flow(sessionID: sessionID, request: request, connection: connection)
         let transaction = FlowTransaction(flow: flow, eventSink: eventSink)
@@ -161,8 +177,150 @@ final class HTTPProxyHandler: ChannelInboundHandler {
         )
     }
 
+    private func receiveConnectHead(_ head: HTTPRequestHead, context: ChannelHandlerContext) {
+        guard tunnelTarget == nil else {
+            sendError(
+                statusCode: 400,
+                reason: "Bad Request",
+                message: "Nested CONNECT requests are not supported.",
+                context: context
+            )
+            return
+        }
+
+        guard interceptHTTPS else {
+            sendError(
+                statusCode: 501,
+                reason: "Not Implemented",
+                message: "HTTPS interception is disabled for this proxy listener.",
+                context: context
+            )
+            return
+        }
+
+        guard certificateProvider != nil, upstreamTLSContext != nil else {
+            sendError(
+                statusCode: 503,
+                reason: "Service Unavailable",
+                message: "HTTPS interception is not configured.",
+                context: context
+            )
+            return
+        }
+
+        do {
+            let target = try ConnectTarget(authority: head.uri)
+            requestHead = head
+            pendingConnectTarget = target
+        } catch {
+            sendError(
+                statusCode: 400,
+                reason: "Bad Request",
+                message: error.localizedDescription,
+                context: context
+            )
+        }
+    }
+
+    private func beginTLSIntercept(target: ConnectTarget, context: ChannelHandlerContext) {
+        guard !isPreparingTLSIntercept, let certificateProvider, let upstreamTLSContext else {
+            return
+        }
+        isPreparingTLSIntercept = true
+
+        let channel = context.channel
+        channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
+            channel.close(promise: nil)
+        }
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        Task {
+            do {
+                let identity = try await certificateProvider.leafCertificate(for: target.host)
+                let serverTLSContext = try TLSContextFactory.serverContext(identity: identity)
+                channel.eventLoop.execute {
+                    loopBoundSelf.value.finishTLSIntercept(
+                        target: target,
+                        serverTLSContext: serverTLSContext,
+                        upstreamTLSContext: upstreamTLSContext,
+                        channel: channel
+                    )
+                }
+            } catch {
+                let message = error.localizedDescription
+                channel.eventLoop.execute {
+                    loopBoundSelf.value.failTLSIntercept(message: message, channel: channel)
+                }
+            }
+        }
+    }
+
+    private func finishTLSIntercept(
+        target: ConnectTarget,
+        serverTLSContext: NIOSSLContext,
+        upstreamTLSContext: NIOSSLContext,
+        channel: Channel
+    ) {
+        let response = HTTPResponseHead(
+            version: .http1_1,
+            status: .ok,
+            headers: NIOHTTP1.HTTPHeaders()
+        )
+        channel.write(HTTPServerResponsePart.head(response), promise: nil)
+        let sessionID = self.sessionID
+        let eventSink = self.eventSink
+        let maxPendingRequestBytes = self.maxPendingRequestBytes
+        let certificateProvider = self.certificateProvider
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).flatMap {
+            HTTPServerPipeline.removePlaintextHTTPHandlers(from: channel)
+        }.flatMapThrowing {
+            let tlsHandler = NIOSSLServerHandler(context: serverTLSContext)
+            try channel.pipeline.syncOperations.addHandler(
+                tlsHandler,
+                name: HTTPServerPipeline.tlsHandlerName
+            )
+            try HTTPServerPipeline.install(
+                on: channel,
+                handler: HTTPProxyHandler(
+                    sessionID: sessionID,
+                    eventSink: eventSink,
+                    maxPendingRequestBytes: maxPendingRequestBytes,
+                    interceptHTTPS: false,
+                    certificateProvider: certificateProvider,
+                    upstreamTLSContext: upstreamTLSContext,
+                    tunnelTarget: target
+                )
+            )
+        }.flatMap {
+            channel.setOption(ChannelOptions.autoRead, value: true)
+        }.whenFailure { _ in
+            channel.close(promise: nil)
+        }
+    }
+
+    private func failTLSIntercept(message: String, channel: Channel) {
+        sendError(
+            statusCode: 500,
+            reason: "Internal Server Error",
+            message: "TLS interception setup failed: \(message)",
+            channel: channel
+        )
+    }
+
     private func receiveRequestBody(_ buffer: inout ByteBuffer, context: ChannelHandlerContext) {
         let byteCount = buffer.readableBytes
+
+        if pendingConnectTarget != nil {
+            if byteCount > 0 {
+                sendError(
+                    statusCode: 400,
+                    reason: "Bad Request",
+                    message: "CONNECT requests cannot contain a body.",
+                    context: context
+                )
+            }
+            return
+        }
 
         if let upstreamChannel {
             upstreamChannel.write(
@@ -191,6 +349,11 @@ final class HTTPProxyHandler: ChannelInboundHandler {
         _ trailers: NIOHTTP1.HTTPHeaders?,
         context: ChannelHandlerContext
     ) {
+        if let target = pendingConnectTarget {
+            beginTLSIntercept(target: target, context: context)
+            return
+        }
+
         requestEnded = true
         if let transaction {
             Task {
@@ -218,12 +381,34 @@ final class HTTPProxyHandler: ChannelInboundHandler {
     ) {
         let bootstrap = ClientBootstrap(group: clientChannel.eventLoop)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelInitializer { channel in
-                channel.pipeline.addHTTPClientHandlers().flatMapThrowing {
+            .channelInitializer { [upstreamTLSContext] channel in
+                let tlsFuture: EventLoopFuture<Void>
+                if target.usesTLS {
+                    do {
+                        guard let upstreamTLSContext else {
+                            throw TLSInterceptionError.missingUpstreamTLSContext
+                        }
+                        let tlsHandler = try NIOSSLClientHandler(
+                            context: upstreamTLSContext,
+                            serverHostname: target.host
+                        )
+                        try channel.pipeline.syncOperations.addHandler(tlsHandler)
+                        tlsFuture = channel.eventLoop.makeSucceededVoidFuture()
+                    } catch {
+                        return channel.eventLoop.makeFailedFuture(error)
+                    }
+                } else {
+                    tlsFuture = channel.eventLoop.makeSucceededVoidFuture()
+                }
+
+                return tlsFuture.flatMap {
+                    channel.pipeline.addHTTPClientHandlers()
+                }.flatMapThrowing {
                     try channel.pipeline.syncOperations.addHandler(
                         UpstreamResponseHandler(
                             clientChannel: clientChannel,
-                            transaction: transaction
+                            transaction: transaction,
+                            usesTLS: target.usesTLS
                         )
                     )
                 }
@@ -316,11 +501,13 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
 
     private let clientChannel: Channel
     private let transaction: FlowTransaction
+    private let usesTLS: Bool
     private var responseStarted = false
 
-    init(clientChannel: Channel, transaction: FlowTransaction) {
+    init(clientChannel: Channel, transaction: FlowTransaction, usesTLS: Bool) {
         self.clientChannel = clientChannel
         self.transaction = transaction
+        self.usesTLS = usesTLS
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -373,12 +560,28 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         clientChannel.flush()
     }
 
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let tlsEvent = event as? TLSUserEvent, case .handshakeCompleted = tlsEvent {
+            let transaction = self.transaction
+            Task { [transaction] in
+                await transaction.markTLSHandshakeCompleted(at: Date())
+            }
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         let transaction = self.transaction
         let failure: FlowFailure =
-            responseStarted
-            ? .protocolError(error.localizedDescription)
-            : .upstreamUnavailable
+            if usesTLS, let sslError = error as? NIOSSLError,
+                case .handshakeFailed = sslError
+            {
+                .tlsHandshakeFailed
+            } else if responseStarted {
+                .protocolError(error.localizedDescription)
+            } else {
+                .upstreamUnavailable
+            }
         Task { [transaction, failure] in
             await transaction.fail(failure)
         }
