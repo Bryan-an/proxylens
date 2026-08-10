@@ -5,6 +5,8 @@ actor FlowTransaction {
     private var flow: Flow
     private let eventSink: any FlowEventSink
     private var isFinished = false
+    private var requestBodyIsComplete = false
+    private var responseBodyIsComplete = false
 
     init(flow: Flow, eventSink: any FlowEventSink) {
         self.flow = flow
@@ -25,13 +27,22 @@ actor FlowTransaction {
         }
     }
 
-    func markRequestBodyCompleted(at date: Date) async {
+    func finishRequestBody(_ body: BodyReference?, at date: Date) async {
         guard !isFinished else {
             return
         }
 
+        if let body {
+            flow.attachRequestBody(body)
+        }
         flow.markRequestBodyCompleted(at: date)
-        await eventSink.publish(.updated(flow))
+        requestBodyIsComplete = true
+
+        if responseBodyIsComplete {
+            await complete(at: date)
+        } else {
+            await eventSink.publish(.updated(flow))
+        }
     }
 
     func markUpstreamConnected(at date: Date) async {
@@ -74,12 +85,31 @@ actor FlowTransaction {
         await eventSink.publish(.updated(flow))
     }
 
-    func finishResponse(at date: Date) async {
+    func finishResponse(_ body: BodyReference?, at date: Date) async {
         guard !isFinished else {
             return
         }
 
+        if let body {
+            flow.attachResponseBody(body)
+        }
         flow.markResponseBodyCompleted(at: date)
+        responseBodyIsComplete = true
+
+        if requestBodyIsComplete {
+            await complete(at: date)
+        } else {
+            await eventSink.publish(.updated(flow))
+        }
+    }
+
+    private func complete(at date: Date) async {
+        if flow.state == .receivingRequest {
+            try? flow.transition(to: .connectingUpstream)
+        }
+        if flow.state == .connectingUpstream {
+            try? flow.transition(to: .receivingResponse)
+        }
         if !flow.state.isTerminal {
             try? flow.transition(to: .completed)
         }

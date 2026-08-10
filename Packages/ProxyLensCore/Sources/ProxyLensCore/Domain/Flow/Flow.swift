@@ -51,7 +51,7 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
     public let sessionID: SessionID
     public let source: FlowSource
     public let createdAt: Date
-    public let request: HTTPRequest
+    public private(set) var request: HTTPRequest
     public let connection: ConnectionInfo?
     public private(set) var response: HTTPResponse?
     public private(set) var timing: FlowTiming
@@ -88,6 +88,14 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
 
     public mutating func attachResponse(_ response: HTTPResponse) {
         self.response = response
+    }
+
+    public mutating func attachRequestBody(_ body: BodyReference) {
+        request.attachBody(body)
+    }
+
+    public mutating func attachResponseBody(_ body: BodyReference) {
+        response?.attachBody(body)
     }
 
     public mutating func appendRuleTrace(_ trace: RuleTrace) {

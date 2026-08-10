@@ -25,6 +25,10 @@ public struct Session: Codable, Equatable, Hashable, Sendable, Identifiable {
         flowCount += 1
     }
 
+    public mutating func unregisterFlow() {
+        flowCount = max(0, flowCount - 1)
+    }
+
     public mutating func stop(at date: Date = Date()) {
         guard state == .recording else {
             return

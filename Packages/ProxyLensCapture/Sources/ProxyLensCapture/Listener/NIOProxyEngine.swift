@@ -9,7 +9,10 @@ import ProxyLensCore
 public actor NIOProxyEngine: ProxyEngine {
     private let eventLoopThreadCount: Int
     private let eventSink: any FlowEventSink
+    private let startupRecovery: (any CaptureStartupRecovery)?
     private let maxPendingRequestBytes: Int
+    private let bodyStore: (any BodyStore)?
+    private let maximumCapturedBodyBytes: Int64
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSConfiguration: UpstreamTLSConfiguration
 
@@ -21,13 +24,20 @@ public actor NIOProxyEngine: ProxyEngine {
     public init(
         eventLoopThreads: Int = 1,
         eventSink: any FlowEventSink = NoOpFlowEventSink(),
+        startupRecovery: (any CaptureStartupRecovery)? = nil,
         maxPendingRequestBytes: Int = 1_048_576,
+        bodyStore: (any BodyStore)? = nil,
+        maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration()
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
         self.eventSink = eventSink
+        self.startupRecovery =
+            startupRecovery ?? (eventSink as? any CaptureStartupRecovery)
         self.maxPendingRequestBytes = max(1, maxPendingRequestBytes)
+        self.bodyStore = bodyStore
+        self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
         self.certificateProvider = certificateProvider
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
     }
@@ -38,6 +48,12 @@ public actor NIOProxyEngine: ProxyEngine {
         }
 
         currentState = .starting
+        do {
+            try await startupRecovery?.prepareForCaptureStart()
+        } catch {
+            currentState = .failed(error.localizedDescription)
+            throw error
+        }
         sessionID = SessionID()
 
         if configuration.interceptHTTPS, certificateProvider == nil {
@@ -70,6 +86,8 @@ public actor NIOProxyEngine: ProxyEngine {
                         eventSink,
                         sessionID,
                         maxPendingRequestBytes,
+                        bodyStore,
+                        maximumCapturedBodyBytes,
                         certificateProvider,
                         upstreamTLSContext,
                     ] channel in
@@ -81,6 +99,8 @@ public actor NIOProxyEngine: ProxyEngine {
                                     sessionID: sessionID,
                                     eventSink: eventSink,
                                     maxPendingRequestBytes: maxPendingRequestBytes,
+                                    bodyStore: bodyStore,
+                                    maximumCapturedBodyBytes: maximumCapturedBodyBytes,
                                     interceptHTTPS: interceptHTTPS,
                                     certificateProvider: certificateProvider,
                                     upstreamTLSContext: upstreamTLSContext

@@ -6,6 +6,7 @@ import NIOPosix
 import NIOSSL
 import NIOTLS
 import ProxyLensCore
+import ProxyLensPersistence
 import ProxyLensPlatform
 import XCTest
 
@@ -80,6 +81,71 @@ final class ProxyLensCaptureTests: XCTestCase {
         XCTAssertEqual(stoppedState, .stopped)
     }
 
+    func testEngineStartPerformsPersistenceRecovery() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensStartupRecoveryTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies"),
+                inlineBodyThreshold: 4
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let sessionStore = GRDBSessionStore(database: database, bodyStore: bodyStore)
+        let session = Session()
+        try await sessionStore.saveSession(session)
+        var incompleteFlow = Flow(
+            sessionID: session.id,
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "http://example.test/incomplete")!
+            )
+        )
+        try incompleteFlow.transition(to: .receivingRequest)
+        try await sessionStore.save(incompleteFlow)
+        let orphanedBody = try await bodyStore.put(
+            Data("orphaned body".utf8),
+            metadata: BodyMetadata()
+        )
+        let persistenceSink = PersistingFlowEventSink(flowStore: sessionStore)
+        let engine = NIOProxyEngine(
+            eventSink: persistenceSink,
+            bodyStore: bodyStore
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                )
+            )
+            let loadedSession = try await sessionStore.loadSession(sessionID: session.id)
+            let loadedFlow = try await sessionStore.load(flowID: incompleteFlow.id)
+            let recoveredSession = try XCTUnwrap(loadedSession)
+            let recoveredFlow = try XCTUnwrap(loadedFlow)
+            XCTAssertEqual(recoveredSession.state, .interrupted)
+            guard case .failed(.persistenceError) = recoveredFlow.state else {
+                XCTFail("Expected engine startup to fail an incomplete persisted flow")
+                await engine.stop()
+                return
+            }
+            do {
+                _ = try await bodyStore.read(orphanedBody)
+                XCTFail("Expected engine startup to remove the orphaned body")
+            } catch {
+                XCTAssertEqual(error as? PersistenceError, .bodyNotFound(orphanedBody.id))
+            }
+        } catch {
+            await engine.stop()
+            throw error
+        }
+
+        await engine.stop()
+    }
+
     func testHTTPForwardingPublishesCompletedFlow() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
         let eventSink = RecordingFlowEventSink()
@@ -140,9 +206,31 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
-    func testHTTPForwardingStreamsRequestBody() async throws {
+    func testHTTPForwardingStreamsAndPersistsRawBodies() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
-        let engine = NIOProxyEngine()
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensCaptureTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies"),
+                inlineBodyThreshold: 4,
+                maximumCapturedBodyBytes: 1_024
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let sessionStore = GRDBSessionStore(database: database, bodyStore: bodyStore)
+        let eventRecorder = RecordingFlowEventSink()
+        let persistenceSink = PersistingFlowEventSink(
+            flowStore: sessionStore,
+            downstream: eventRecorder
+        )
+        let engine = NIOProxyEngine(
+            eventSink: persistenceSink,
+            bodyStore: bodyStore,
+            maximumCapturedBodyBytes: 1_024
+        )
 
         do {
             try await engine.start(
@@ -158,14 +246,39 @@ final class ProxyLensCaptureTests: XCTestCase {
                 return
             }
 
+            let requestBytes = Data("request body".utf8)
+            let expectedResponseBytes = Data("upstream response:request body".utf8)
             let response = try await HTTPTestClient.post(
                 url: "http://127.0.0.1:\(upstream.endpoint.port)/echo",
-                body: Data("request body".utf8),
+                body: requestBytes,
                 through: proxyEndpoint
             )
 
             XCTAssertEqual(response.statusCode, 200)
-            XCTAssertEqual(response.body, Data("upstream response:request body".utf8))
+            XCTAssertEqual(response.body, expectedResponseBytes)
+
+            await eventRecorder.waitForFinished()
+            let events = await eventRecorder.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                events.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            let loadedFlow = try await sessionStore.load(flowID: finishedFlow.id)
+            let persistedFlow = try XCTUnwrap(loadedFlow)
+            let requestBody = try XCTUnwrap(persistedFlow.request.body)
+            let responseBody = try XCTUnwrap(persistedFlow.response?.body)
+            let persistedRequestBytes = try await bodyStore.read(requestBody)
+            let persistedResponseBytes = try await bodyStore.read(responseBody)
+
+            XCTAssertEqual(persistedFlow.state, .completed)
+            XCTAssertEqual(persistedRequestBytes, requestBytes)
+            XCTAssertEqual(persistedResponseBytes, expectedResponseBytes)
+            XCTAssertFalse(requestBody.isTruncated)
+            XCTAssertFalse(responseBody.isTruncated)
         } catch {
             await engine.stop()
             await upstream.stop()
@@ -176,7 +289,51 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
-    func testHTTPSConnectInterceptionPublishesCompletedFlow() async throws {
+    func testClientDisconnectAfterRequestEndPreservesIncompleteFlow() async throws {
+        let upstream = try await TestHTTPServer.startHanging()
+        let eventSink = RecordingFlowEventSink()
+        let engine = NIOProxyEngine(eventSink: eventSink)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                )
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            try await HTTPTestClient.postThenDisconnect(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/hang",
+                body: Data("complete request".utf8),
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFinished()
+            let events = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                events.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(finishedFlow.state, .failed(.clientDisconnected))
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPSConnectInterceptionPersistsCompletedFlowAcrossReopen() async throws {
         let certificateProvider = KeychainCertificateProvider(
             configuration: .init(
                 keychainNamespace: "com.proxylens.capture-tests.\(UUID().uuidString)"
@@ -188,9 +345,25 @@ final class ProxyLensCaptureTests: XCTestCase {
             responseBody: "secure upstream response",
             identity: upstreamIdentity
         )
-        let eventSink = RecordingFlowEventSink()
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensHTTPSCaptureTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let persistenceConfiguration = DatabaseConfiguration(
+            databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+            bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies"),
+            inlineBodyThreshold: 4
+        )
+        let database = try DatabaseController(configuration: persistenceConfiguration)
+        let bodyStore = FileBodyStore(database: database)
+        let sessionStore = GRDBSessionStore(database: database, bodyStore: bodyStore)
+        let eventRecorder = RecordingFlowEventSink()
+        let persistenceSink = PersistingFlowEventSink(
+            flowStore: sessionStore,
+            downstream: eventRecorder
+        )
         let engine = NIOProxyEngine(
-            eventSink: eventSink,
+            eventSink: persistenceSink,
+            bodyStore: bodyStore,
             certificateProvider: certificateProvider,
             upstreamTLSConfiguration: UpstreamTLSConfiguration(
                 additionalTrustRootCertificates: [rootCertificate]
@@ -212,6 +385,7 @@ final class ProxyLensCaptureTests: XCTestCase {
                 return
             }
 
+            let expectedResponseBytes = Data("secure upstream response".utf8)
             let response = try await HTTPSTestClient.get(
                 url: "https://localhost:\(upstream.endpoint.port)/secure?from=proxy",
                 through: proxyEndpoint,
@@ -219,10 +393,10 @@ final class ProxyLensCaptureTests: XCTestCase {
             )
 
             XCTAssertEqual(response.statusCode, 200)
-            XCTAssertEqual(response.body, Data("secure upstream response".utf8))
+            XCTAssertEqual(response.body, expectedResponseBytes)
 
-            await eventSink.waitForFinished()
-            let events = await eventSink.snapshot()
+            await eventRecorder.waitForFinished()
+            let events = await eventRecorder.snapshot()
             let finishedFlow = try XCTUnwrap(
                 events.compactMap { event -> Flow? in
                     if case .finished(let flow) = event {
@@ -231,13 +405,26 @@ final class ProxyLensCaptureTests: XCTestCase {
                     return nil
                 }.first
             )
+            let reopenedDatabase = try DatabaseController(
+                configuration: persistenceConfiguration
+            )
+            let reopenedBodyStore = FileBodyStore(database: reopenedDatabase)
+            let reopenedSessionStore = GRDBSessionStore(
+                database: reopenedDatabase,
+                bodyStore: reopenedBodyStore
+            )
+            let loadedFlow = try await reopenedSessionStore.load(flowID: finishedFlow.id)
+            let persistedFlow = try XCTUnwrap(loadedFlow)
+            let responseBody = try XCTUnwrap(persistedFlow.response?.body)
+            let persistedResponseBytes = try await reopenedBodyStore.read(responseBody)
 
-            XCTAssertEqual(finishedFlow.state, .completed)
-            XCTAssertEqual(finishedFlow.request.url.scheme, "https")
-            XCTAssertEqual(finishedFlow.request.url.host, "localhost")
-            XCTAssertEqual(finishedFlow.response?.statusCode, 200)
-            XCTAssertEqual(finishedFlow.connection?.protocolKind, .https)
-            XCTAssertEqual(finishedFlow.connection?.tlsIntercepted, true)
+            XCTAssertEqual(persistedFlow.state, .completed)
+            XCTAssertEqual(persistedFlow.request.url.scheme, "https")
+            XCTAssertEqual(persistedFlow.request.url.host, "localhost")
+            XCTAssertEqual(persistedFlow.response?.statusCode, 200)
+            XCTAssertEqual(persistedFlow.connection?.protocolKind, .https)
+            XCTAssertEqual(persistedFlow.connection?.tlsIntercepted, true)
+            XCTAssertEqual(persistedResponseBytes, expectedResponseBytes)
         } catch {
             await engine.stop()
             await upstream.stop()
@@ -521,6 +708,51 @@ private enum HTTPTestClient {
         try await request(method: .POST, url: url, body: body, through: proxy)
     }
 
+    static func postThenDisconnect(
+        url: String,
+        body: Data,
+        through proxy: NetworkEndpoint
+    ) async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        do {
+            let channel = try await ClientBootstrap(group: group)
+                .channelInitializer { channel in
+                    channel.pipeline.addHTTPClientHandlers()
+                }
+                .connect(host: proxy.host, port: Int(proxy.port))
+                .get()
+
+            var headers = NIOHTTP1.HTTPHeaders()
+            if let targetURL = URL(string: url), let host = targetURL.host {
+                let port = targetURL.port.map { ":\($0)" } ?? ""
+                headers.add(name: "Host", value: "\(host)\(port)")
+            }
+            headers.add(name: "Content-Length", value: "\(body.count)")
+            headers.add(name: "Content-Type", value: "text/plain")
+
+            channel.write(
+                HTTPClientRequestPart.head(
+                    HTTPRequestHead(
+                        version: .http1_1,
+                        method: .POST,
+                        uri: url,
+                        headers: headers
+                    )
+                ),
+                promise: nil
+            )
+            var buffer = channel.allocator.buffer(capacity: body.count)
+            buffer.writeBytes(body)
+            channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer)), promise: nil)
+            try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+            try await channel.close().get()
+            await shutdown(group)
+        } catch {
+            await shutdown(group)
+            throw error
+        }
+    }
+
     private static func request(
         method: NIOHTTP1.HTTPMethod,
         url: String,
@@ -634,6 +866,10 @@ private final class TestHTTPServer {
         try await start(responseBody: responseBody, tlsContext: nil)
     }
 
+    static func startHanging() async throws -> TestHTTPServer {
+        try await start(responseBody: "", tlsContext: nil, responds: false)
+    }
+
     static func startHTTPS(
         responseBody: String,
         identity: CertificateIdentity
@@ -646,7 +882,8 @@ private final class TestHTTPServer {
 
     private static func start(
         responseBody: String,
-        tlsContext: NIOSSLContext?
+        tlsContext: NIOSSLContext?,
+        responds: Bool = true
     ) async throws -> TestHTTPServer {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
@@ -667,7 +904,10 @@ private final class TestHTTPServer {
                                 withErrorHandling: true
                             )
                             try operations.addHandler(
-                                TestHTTPServerHandler(responseBody: responseBody)
+                                TestHTTPServerHandler(
+                                    responseBody: responseBody,
+                                    responds: responds
+                                )
                             )
                         }
                     )
@@ -692,10 +932,12 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
     typealias OutboundOut = HTTPServerResponsePart
 
     private let responseBody: String
+    private let responds: Bool
     private var requestBody = Data()
 
-    init(responseBody: String) {
+    init(responseBody: String, responds: Bool) {
         self.responseBody = responseBody
+        self.responds = responds
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -707,6 +949,9 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
                 requestBody.append(contentsOf: bytes)
             }
         case .end:
+            guard responds else {
+                return
+            }
             let bodySuffix =
                 requestBody.isEmpty
                 ? ""

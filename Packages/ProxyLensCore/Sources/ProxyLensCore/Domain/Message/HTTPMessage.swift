@@ -34,7 +34,7 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
     public let method: HTTPMethod
     public let url: URL
     public let headers: HTTPHeaders
-    public let body: BodyReference?
+    public private(set) var body: BodyReference?
     public let version: HTTPVersion
     public let rawTarget: String?
 
@@ -53,13 +53,17 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
         self.version = version
         self.rawTarget = rawTarget
     }
+
+    public mutating func attachBody(_ body: BodyReference) {
+        self.body = body
+    }
 }
 
 public struct HTTPResponse: Codable, Equatable, Hashable, Sendable {
     public let statusCode: Int
     public let reasonPhrase: String?
     public let headers: HTTPHeaders
-    public let body: BodyReference?
+    public private(set) var body: BodyReference?
     public let version: HTTPVersion
 
     public init(
@@ -78,5 +82,9 @@ public struct HTTPResponse: Codable, Equatable, Hashable, Sendable {
         self.headers = headers
         self.body = body
         self.version = version
+    }
+
+    public mutating func attachBody(_ body: BodyReference) {
+        self.body = body
     }
 }

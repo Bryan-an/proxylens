@@ -13,6 +13,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private let sessionID: SessionID
     private let eventSink: any FlowEventSink
     private let maxPendingRequestBytes: Int
+    private let bodyStore: (any BodyStore)?
+    private let maximumCapturedBodyBytes: Int64
     private let interceptHTTPS: Bool
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSContext: NIOSSLContext?
@@ -23,15 +25,22 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private var pendingRequestParts: [HTTPClientRequestPart] = []
     private var pendingRequestBytes = 0
     private var requestEnded = false
+    private var responseEnded = false
     private var responseStarted = false
     private var transaction: FlowTransaction?
     private var pendingConnectTarget: ConnectTarget?
     private var isPreparingTLSIntercept = false
+    private var requestBodyRecorder: StreamingBodyRecorder?
+    private var requestBodyWriteTask: Task<Void, Error>?
+    private var captureWritesInFlight = 0
+    private var captureFailureHandled = false
 
     init(
         sessionID: SessionID,
         eventSink: any FlowEventSink,
         maxPendingRequestBytes: Int,
+        bodyStore: (any BodyStore)? = nil,
+        maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
         interceptHTTPS: Bool = false,
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSContext: NIOSSLContext? = nil,
@@ -40,6 +49,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.sessionID = sessionID
         self.eventSink = eventSink
         self.maxPendingRequestBytes = max(1, maxPendingRequestBytes)
+        self.bodyStore = bodyStore
+        self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
         self.interceptHTTPS = interceptHTTPS
         self.certificateProvider = certificateProvider
         self.upstreamTLSContext = upstreamTLSContext
@@ -69,7 +80,13 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
 
         let upstreamChannel = self.upstreamChannel
+        if responseEnded {
+            upstreamChannel?.close(promise: nil)
+            return
+        }
+        let requestBodyRecorder = self.requestBodyRecorder
         Task {
+            await requestBodyRecorder?.cancel()
             await transaction.fail(.clientDisconnected)
             upstreamChannel?.close(promise: nil)
         }
@@ -77,8 +94,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         let upstreamChannel = self.upstreamChannel
+        let requestBodyRecorder = self.requestBodyRecorder
         if let transaction {
             Task {
+                await requestBodyRecorder?.cancel()
                 await transaction.fail(.protocolError(error.localizedDescription))
                 upstreamChannel?.close(promise: nil)
             }
@@ -154,6 +173,16 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         )
         let flow = Flow(sessionID: sessionID, request: request, connection: connection)
         let transaction = FlowTransaction(flow: flow, eventSink: eventSink)
+        if let bodyStore {
+            requestBodyRecorder = StreamingBodyRecorder(
+                bodyStore: bodyStore,
+                metadata: BodyMetadata(
+                    contentType: coreHeaders.firstValue(for: "Content-Type"),
+                    contentEncoding: coreHeaders.firstValue(for: "Content-Encoding")
+                ),
+                maximumByteCount: maximumCapturedBodyBytes
+            )
+        }
 
         self.requestHead = head
         self.transaction = transaction
@@ -270,6 +299,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         let sessionID = self.sessionID
         let eventSink = self.eventSink
         let maxPendingRequestBytes = self.maxPendingRequestBytes
+        let bodyStore = self.bodyStore
+        let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
         let certificateProvider = self.certificateProvider
         channel.writeAndFlush(HTTPServerResponsePart.end(nil)).flatMap {
             HTTPServerPipeline.removePlaintextHTTPHandlers(from: channel)
@@ -285,6 +316,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     sessionID: sessionID,
                     eventSink: eventSink,
                     maxPendingRequestBytes: maxPendingRequestBytes,
+                    bodyStore: bodyStore,
+                    maximumCapturedBodyBytes: maximumCapturedBodyBytes,
                     interceptHTTPS: false,
                     certificateProvider: certificateProvider,
                     upstreamTLSContext: upstreamTLSContext,
@@ -321,6 +354,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             }
             return
         }
+        recordRequestBody(buffer, context: context)
 
         if let upstreamChannel {
             upstreamChannel.write(
@@ -355,11 +389,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
 
         requestEnded = true
-        if let transaction {
-            Task {
-                await transaction.markRequestBodyCompleted(at: Date())
-            }
-        }
+        finishRequestBodyCapture(context: context)
 
         let endPart = HTTPClientRequestPart.end(trailers)
         if let upstreamChannel {
@@ -373,15 +403,103 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
     }
 
+    private func recordRequestBody(_ buffer: ByteBuffer, context: ChannelHandlerContext) {
+        guard buffer.readableBytes > 0, let requestBodyRecorder else {
+            return
+        }
+
+        let data = Data(buffer.readableBytesView)
+        let previousTask = requestBodyWriteTask
+        let writeTask = Task<Void, Error> {
+            try await previousTask?.value
+            try await requestBodyRecorder.append(data)
+        }
+        requestBodyWriteTask = writeTask
+        captureWritesInFlight += 1
+
+        let channel = context.channel
+        if captureWritesInFlight == 1 {
+            channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
+                channel.close(promise: nil)
+            }
+        }
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        Task {
+            let result = await writeTask.result
+            channel.eventLoop.execute {
+                loopBoundSelf.value.completeRequestBodyWrite(result, channel: channel)
+            }
+        }
+    }
+
+    private func completeRequestBodyWrite(
+        _ result: Result<Void, Error>,
+        channel: Channel
+    ) {
+        captureWritesInFlight = max(0, captureWritesInFlight - 1)
+        if case .failure(let error) = result, !captureFailureHandled {
+            captureFailureHandled = true
+            let transaction = self.transaction
+            let requestBodyRecorder = self.requestBodyRecorder
+            let upstreamChannel = self.upstreamChannel
+            Task {
+                await requestBodyRecorder?.cancel()
+                await transaction?.fail(.persistenceError(error.localizedDescription))
+            }
+            upstreamChannel?.close(promise: nil)
+            channel.close(promise: nil)
+            return
+        }
+
+        if captureWritesInFlight == 0, !captureFailureHandled {
+            channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { _ in
+                channel.close(promise: nil)
+            }
+        }
+    }
+
+    private func finishRequestBodyCapture(context: ChannelHandlerContext) {
+        guard let transaction else {
+            return
+        }
+
+        let writeTask = requestBodyWriteTask
+        let recorder = requestBodyRecorder
+        let channel = context.channel
+        let upstreamChannel = self.upstreamChannel
+        let completedAt = Date()
+        Task {
+            do {
+                try await writeTask?.value
+                let reference = try await recorder?.finalize()
+                await transaction.finishRequestBody(reference, at: completedAt)
+            } catch {
+                await recorder?.cancel()
+                await transaction.fail(.persistenceError(error.localizedDescription))
+                upstreamChannel?.close(promise: nil)
+                channel.close(promise: nil)
+            }
+        }
+    }
+
+    fileprivate func markResponseEnded() {
+        responseEnded = true
+    }
+
     private func connectUpstream(
         target: ProxyTarget,
         requestHead: HTTPRequestHead,
         clientChannel: Channel,
         transaction: FlowTransaction
     ) {
+        let bodyStore = self.bodyStore
+        let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
         let bootstrap = ClientBootstrap(group: clientChannel.eventLoop)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelInitializer { [upstreamTLSContext] channel in
+            .channelInitializer {
+                [upstreamTLSContext, bodyStore, maximumCapturedBodyBytes, loopBoundSelf] channel in
                 let tlsFuture: EventLoopFuture<Void>
                 if target.usesTLS {
                     do {
@@ -407,14 +525,16 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     try channel.pipeline.syncOperations.addHandler(
                         UpstreamResponseHandler(
                             clientChannel: clientChannel,
+                            clientHandler: loopBoundSelf,
                             transaction: transaction,
-                            usesTLS: target.usesTLS
+                            usesTLS: target.usesTLS,
+                            bodyStore: bodyStore,
+                            maximumCapturedBodyBytes: maximumCapturedBodyBytes
                         )
                     )
                 }
             }
 
-        let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
         bootstrap.connect(host: target.host, port: target.port).whenComplete {
             [loopBoundSelf] (result: Result<Channel, Error>) in
             clientChannel.eventLoop.execute {
@@ -500,14 +620,32 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
     typealias OutboundOut = HTTPClientRequestPart
 
     private let clientChannel: Channel
+    private let clientHandler: NIOLoopBound<HTTPProxyHandler>
     private let transaction: FlowTransaction
     private let usesTLS: Bool
+    private let bodyStore: (any BodyStore)?
+    private let maximumCapturedBodyBytes: Int64
     private var responseStarted = false
+    private var responseBodyRecorder: StreamingBodyRecorder?
+    private var responseHeadTask: Task<Void, Never>?
+    private var responseBodyWriteTask: Task<Void, Error>?
+    private var captureWritesInFlight = 0
+    private var captureFailureHandled = false
 
-    init(clientChannel: Channel, transaction: FlowTransaction, usesTLS: Bool) {
+    init(
+        clientChannel: Channel,
+        clientHandler: NIOLoopBound<HTTPProxyHandler>,
+        transaction: FlowTransaction,
+        usesTLS: Bool,
+        bodyStore: (any BodyStore)?,
+        maximumCapturedBodyBytes: Int64
+    ) {
         self.clientChannel = clientChannel
+        self.clientHandler = clientHandler
         self.transaction = transaction
         self.usesTLS = usesTLS
+        self.bodyStore = bodyStore
+        self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -518,15 +656,27 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             responseStarted = true
             let forwardedHead = HTTPConversion.sanitizedResponseHead(head)
             do {
+                let coreHeaders = try HTTPConversion.coreHeaders(from: head.headers)
                 let response = try HTTPResponse(
                     statusCode: Int(head.status.code),
                     reasonPhrase: head.status.reasonPhrase,
-                    headers: HTTPConversion.coreHeaders(from: head.headers),
+                    headers: coreHeaders,
                     version: HTTPConversion.coreVersion(from: head.version)
                 )
+                if let bodyStore {
+                    responseBodyRecorder = StreamingBodyRecorder(
+                        bodyStore: bodyStore,
+                        metadata: BodyMetadata(
+                            contentType: coreHeaders.firstValue(for: "Content-Type"),
+                            contentEncoding: coreHeaders.firstValue(for: "Content-Encoding")
+                        ),
+                        maximumByteCount: maximumCapturedBodyBytes
+                    )
+                }
                 let transaction = self.transaction
-                Task { [transaction] in
-                    await transaction.receiveResponse(response, at: Date())
+                let receivedAt = Date()
+                responseHeadTask = Task { [transaction] in
+                    await transaction.receiveResponse(response, at: receivedAt)
                 }
             } catch {
                 let transaction = self.transaction
@@ -541,18 +691,96 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
 
             clientChannel.write(HTTPServerResponsePart.head(forwardedHead), promise: nil)
         case .body(let buffer):
+            recordResponseBody(buffer, context: context)
             clientChannel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
         case .end(let trailers):
+            clientHandler.value.markResponseEnded()
+            finishResponseBodyCapture(context: context)
             let forwardedTrailers = HTTPConversion.sanitizedTrailers(trailers)
             clientChannel.writeAndFlush(HTTPServerResponsePart.end(forwardedTrailers)).whenComplete
             {
-                [clientChannel, transaction] _ in
-                Task {
-                    await transaction.finishResponse(at: Date())
-                }
+                [clientChannel] _ in
                 clientChannel.close(promise: nil)
             }
             context.close(promise: nil)
+        }
+    }
+
+    private func recordResponseBody(_ buffer: ByteBuffer, context: ChannelHandlerContext) {
+        guard buffer.readableBytes > 0, let responseBodyRecorder else {
+            return
+        }
+
+        let data = Data(buffer.readableBytesView)
+        let previousTask = responseBodyWriteTask
+        let writeTask = Task<Void, Error> {
+            try await previousTask?.value
+            try await responseBodyRecorder.append(data)
+        }
+        responseBodyWriteTask = writeTask
+        captureWritesInFlight += 1
+
+        let channel = context.channel
+        if captureWritesInFlight == 1 {
+            channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
+                channel.close(promise: nil)
+            }
+        }
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        Task {
+            let result = await writeTask.result
+            channel.eventLoop.execute {
+                loopBoundSelf.value.completeResponseBodyWrite(result, channel: channel)
+            }
+        }
+    }
+
+    private func completeResponseBodyWrite(
+        _ result: Result<Void, Error>,
+        channel: Channel
+    ) {
+        captureWritesInFlight = max(0, captureWritesInFlight - 1)
+        if case .failure(let error) = result, !captureFailureHandled {
+            captureFailureHandled = true
+            let transaction = self.transaction
+            let responseBodyRecorder = self.responseBodyRecorder
+            Task {
+                await responseBodyRecorder?.cancel()
+                await transaction.fail(.persistenceError(error.localizedDescription))
+            }
+            clientChannel.close(promise: nil)
+            channel.close(promise: nil)
+            return
+        }
+
+        if captureWritesInFlight == 0, !captureFailureHandled {
+            channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { _ in
+                channel.close(promise: nil)
+            }
+        }
+    }
+
+    private func finishResponseBodyCapture(context: ChannelHandlerContext) {
+        let writeTask = responseBodyWriteTask
+        let headTask = responseHeadTask
+        let recorder = responseBodyRecorder
+        let transaction = self.transaction
+        let completedAt = Date()
+        let upstreamChannel = context.channel
+        let clientChannel = self.clientChannel
+        Task {
+            await headTask?.value
+            do {
+                try await writeTask?.value
+                let reference = try await recorder?.finalize()
+                await transaction.finishResponse(reference, at: completedAt)
+            } catch {
+                await recorder?.cancel()
+                await transaction.fail(.persistenceError(error.localizedDescription))
+                clientChannel.close(promise: nil)
+                upstreamChannel.close(promise: nil)
+            }
         }
     }
 
@@ -572,6 +800,8 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         let transaction = self.transaction
+        let responseBodyRecorder = self.responseBodyRecorder
+        let responseHeadTask = self.responseHeadTask
         let failure: FlowFailure =
             if usesTLS, let sslError = error as? NIOSSLError,
                 case .handshakeFailed = sslError
@@ -582,7 +812,9 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             } else {
                 .upstreamUnavailable
             }
-        Task { [transaction, failure] in
+        Task { [transaction, responseBodyRecorder, responseHeadTask, failure] in
+            await responseHeadTask?.value
+            await responseBodyRecorder?.cancel()
             await transaction.fail(failure)
         }
 
