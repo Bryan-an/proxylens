@@ -78,6 +78,50 @@ final class ProxyLensPlatformTests: XCTestCase {
         try await provider.removeCertificateAuthority()
     }
 
+    func testSystemProxyRecoveryIsNoOpWithoutSnapshot() async throws {
+        let snapshotURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensSystemProxyTests-\(UUID().uuidString)")
+            .appendingPathComponent("PreviousConfiguration.plist")
+        let controller = MacOSSystemProxyController(snapshotURL: snapshotURL)
+
+        try await controller.recoverInterruptedConfiguration()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: snapshotURL.path))
+    }
+
+    func testSystemProxyRecoveryFailsClosedForCorruptSnapshot() async throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensSystemProxyTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let snapshotURL = rootURL.appendingPathComponent("PreviousConfiguration.plist")
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: true
+        )
+        try Data([0xFF]).write(to: snapshotURL)
+        let controller = MacOSSystemProxyController(snapshotURL: snapshotURL)
+
+        await assertThrowsErrorAsync(
+            try await controller.recoverInterruptedConfiguration()
+        ) { error in
+            XCTAssertEqual(error as? SystemProxyControllerError, .invalidSnapshot)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: snapshotURL.path))
+    }
+
+    func testSystemProxyRestoreRequiresDurableSnapshot() async {
+        let snapshotURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensSystemProxyTests-\(UUID().uuidString)")
+            .appendingPathComponent("PreviousConfiguration.plist")
+        let controller = MacOSSystemProxyController(snapshotURL: snapshotURL)
+
+        await assertThrowsErrorAsync(
+            try await controller.restorePreviousConfiguration()
+        ) { error in
+            XCTAssertEqual(error as? SystemProxyControllerError, .snapshotMissing)
+        }
+    }
+
     private func makeProvider() -> KeychainCertificateProvider {
         KeychainCertificateProvider(
             configuration: .init(

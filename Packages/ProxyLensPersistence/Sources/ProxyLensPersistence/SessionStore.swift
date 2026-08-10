@@ -11,7 +11,7 @@ public struct StartupRecoveryReport: Equatable, Sendable {
     }
 }
 
-public actor GRDBSessionStore: FlowStore {
+public actor GRDBSessionStore: SessionStore {
     private let database: DatabaseController
     private let bodyStore: (any BodyStore)?
 
@@ -169,7 +169,7 @@ public actor GRDBSessionStore: FlowStore {
     }
 }
 
-extension GRDBSessionStore: CaptureStartupRecovery {
+extension GRDBSessionStore {
     public func prepareForCaptureStart() async throws {
         _ = try await performStartupRecovery()
     }

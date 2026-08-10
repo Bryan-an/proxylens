@@ -236,6 +236,49 @@ final class ProxyLensPersistenceTests: XCTestCase {
         XCTAssertTrue(failures.isEmpty)
     }
 
+    func testPersistingEventSinkForwardsOnlyAfterSuccessfulSave() async throws {
+        let flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(method: .get, url: URL(string: "http://example.test/")!)
+        )
+        let event = FlowEvent.started(flow)
+
+        let successRecorder = SinkCallRecorder()
+        let successStore = OrderedFlowStore(recorder: successRecorder)
+        let successDownstream = OrderedFlowEventSink(recorder: successRecorder)
+        let successSink = PersistingFlowEventSink(
+            flowStore: successStore,
+            downstream: successDownstream
+        )
+        await successSink.publish(event)
+
+        let successCalls = await successRecorder.snapshot()
+        XCTAssertEqual(successCalls, ["save", "publish"])
+        let forwardedEvents = await successDownstream.events()
+        XCTAssertEqual(forwardedEvents, [event])
+        let successFailures = await successSink.failures()
+        XCTAssertTrue(successFailures.isEmpty)
+
+        let failureRecorder = SinkCallRecorder()
+        let failureStore = OrderedFlowStore(
+            recorder: failureRecorder,
+            failsSave: true
+        )
+        let failureDownstream = OrderedFlowEventSink(recorder: failureRecorder)
+        let failureSink = PersistingFlowEventSink(
+            flowStore: failureStore,
+            downstream: failureDownstream
+        )
+        await failureSink.publish(event)
+
+        let failureCalls = await failureRecorder.snapshot()
+        XCTAssertEqual(failureCalls, ["save"])
+        let eventsAfterFailure = await failureDownstream.events()
+        XCTAssertTrue(eventsAfterFailure.isEmpty)
+        let retainedFailures = await failureSink.failures()
+        XCTAssertEqual(retainedFailures.map(\.flowID), [flow.id])
+    }
+
     private static func makeCompletedFlow(
         sessionID: SessionID,
         index: Int,
@@ -307,6 +350,67 @@ private final class PersistenceFixture: @unchecked Sendable {
 
     func remove() {
         try? FileManager.default.removeItem(at: rootURL)
+    }
+}
+
+private enum SinkTestFailure: Error {
+    case expected
+}
+
+private actor SinkCallRecorder {
+    private var calls: [String] = []
+
+    func append(_ call: String) {
+        calls.append(call)
+    }
+
+    func snapshot() -> [String] {
+        calls
+    }
+}
+
+private actor OrderedFlowStore: FlowStore {
+    private let recorder: SinkCallRecorder
+    private let failsSave: Bool
+
+    init(recorder: SinkCallRecorder, failsSave: Bool = false) {
+        self.recorder = recorder
+        self.failsSave = failsSave
+    }
+
+    func save(_: Flow) async throws {
+        await recorder.append("save")
+        if failsSave {
+            throw SinkTestFailure.expected
+        }
+    }
+
+    func load(flowID _: FlowID) -> Flow? {
+        nil
+    }
+
+    func listSummaries(in _: SessionID) -> [FlowSummary] {
+        []
+    }
+
+    func remove(flowID _: FlowID) {}
+}
+
+private actor OrderedFlowEventSink: FlowEventSink {
+    private let recorder: SinkCallRecorder
+    private var recordedEvents: [FlowEvent] = []
+
+    init(recorder: SinkCallRecorder) {
+        self.recorder = recorder
+    }
+
+    func publish(_ event: FlowEvent) async {
+        await recorder.append("publish")
+        recordedEvents.append(event)
+    }
+
+    func events() -> [FlowEvent] {
+        recordedEvents
     }
 }
 

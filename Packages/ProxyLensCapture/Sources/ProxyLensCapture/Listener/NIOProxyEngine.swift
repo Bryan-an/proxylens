@@ -9,7 +9,6 @@ import ProxyLensCore
 public actor NIOProxyEngine: ProxyEngine {
     private let eventLoopThreadCount: Int
     private let eventSink: any FlowEventSink
-    private let startupRecovery: (any CaptureStartupRecovery)?
     private let maxPendingRequestBytes: Int
     private let bodyStore: (any BodyStore)?
     private let maximumCapturedBodyBytes: Int64
@@ -19,12 +18,10 @@ public actor NIOProxyEngine: ProxyEngine {
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
     private var serverChannel: Channel?
     private var currentState: ProxyEngineState = .stopped
-    private var sessionID = SessionID()
 
     public init(
         eventLoopThreads: Int = 1,
         eventSink: any FlowEventSink = NoOpFlowEventSink(),
-        startupRecovery: (any CaptureStartupRecovery)? = nil,
         maxPendingRequestBytes: Int = 1_048_576,
         bodyStore: (any BodyStore)? = nil,
         maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
@@ -33,8 +30,6 @@ public actor NIOProxyEngine: ProxyEngine {
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
         self.eventSink = eventSink
-        self.startupRecovery =
-            startupRecovery ?? (eventSink as? any CaptureStartupRecovery)
         self.maxPendingRequestBytes = max(1, maxPendingRequestBytes)
         self.bodyStore = bodyStore
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
@@ -42,19 +37,12 @@ public actor NIOProxyEngine: ProxyEngine {
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
     }
 
-    public func start(configuration: ProxyConfiguration) async throws {
+    public func start(configuration: ProxyConfiguration, sessionID: SessionID) async throws {
         guard serverChannel == nil else {
             throw ProxyLensError.unsupportedOperation("The proxy is already running")
         }
 
         currentState = .starting
-        do {
-            try await startupRecovery?.prepareForCaptureStart()
-        } catch {
-            currentState = .failed(error.localizedDescription)
-            throw error
-        }
-        sessionID = SessionID()
 
         if configuration.interceptHTTPS, certificateProvider == nil {
             currentState = .failed(

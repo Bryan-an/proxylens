@@ -10,6 +10,7 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../ProxyLensCore"),
+        .package(path: "../ProxyLensApplication"),
         .package(path: "../ProxyLensPlatform"),
         .package(path: "../ProxyLensPersistence"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.101.3"),
@@ -31,6 +32,7 @@ let package = Package(
             name: "ProxyLensCaptureTests",
             dependencies: [
                 "ProxyLensCapture",
+                .product(name: "ProxyLensApplication", package: "ProxyLensApplication"),
                 .product(name: "ProxyLensPersistence", package: "ProxyLensPersistence"),
                 .product(name: "ProxyLensPlatform", package: "ProxyLensPlatform"),
                 .product(name: "NIOCore", package: "swift-nio"),

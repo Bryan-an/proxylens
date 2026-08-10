@@ -17,7 +17,15 @@ public struct SystemProxyConfiguration: Codable, Equatable, Hashable, Sendable {
 }
 
 public protocol SystemProxyController: Sendable {
-    func currentConfiguration() async throws -> SystemProxyConfiguration
+    /// Restores a proxy configuration left active by an interrupted capture.
+    func recoverInterruptedConfiguration() async throws
+
+    /// Durably snapshots the current proxy configuration before it is changed.
+    func prepareForProxyActivation() async throws
+
+    /// Applies ProxyLens endpoints after a restorable snapshot has been saved.
     func apply(_ configuration: SystemProxyConfiguration) async throws
-    func restore(_ configuration: SystemProxyConfiguration) async throws
+
+    /// Restores the durable snapshot and removes it after a successful restore.
+    func restorePreviousConfiguration() async throws
 }

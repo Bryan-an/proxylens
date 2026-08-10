@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		02AA3E5CF2D3A84FDEDDA24C /* ProxyLensIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */; };
 		373B10301985160C7CE114CD /* ProxyLensPlatform in Frameworks */ = {isa = PBXBuildFile; productRef = 18B3570142EE7D25C687F016 /* ProxyLensPlatform */; };
+		4ACD51C43F2085541678203F /* CompositionRoot.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD55B533219D6E951D93154C /* CompositionRoot.swift */; };
 		82E9F96DC626E6ECD9CC4E77 /* AppRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFDFBB4A0E109EE410B35366 /* AppRootView.swift */; };
 		85D80C4974F4313825EF6297 /* ProxyLensCore in Frameworks */ = {isa = PBXBuildFile; productRef = 708F2844C30F68CD32CA2B79 /* ProxyLensCore */; };
 		8F716C718834177D066B5E10 /* ProxyLensUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D5BA0765D03EAF524893CFC /* ProxyLensUITests.swift */; };
@@ -45,6 +46,7 @@
 		B56F3F9C9B942B5BC3B2D5B1 /* ProxyLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProxyLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C0611AF5853FFCC3AA99B0E1 /* ProxyLensCapture */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensCapture; path = Packages/ProxyLensCapture; sourceTree = SOURCE_ROOT; };
 		C19617C5B9D59052C996587E /* ProxyLensPersistence */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensPersistence; path = Packages/ProxyLensPersistence; sourceTree = SOURCE_ROOT; };
+		CD55B533219D6E951D93154C /* CompositionRoot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompositionRoot.swift; sourceTree = "<group>"; };
 		D2705B7CDD7A834453F4309F /* ProxyLensPlatform */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensPlatform; path = Packages/ProxyLensPlatform; sourceTree = SOURCE_ROOT; };
 		EFDFBB4A0E109EE410B35366 /* AppRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRootView.swift; sourceTree = "<group>"; };
 		F30393A0CEF1F447D93AAB87 /* ProxyLensCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensCore; path = Packages/ProxyLensCore; sourceTree = SOURCE_ROOT; };
@@ -113,6 +115,7 @@
 		9654A61E86909CD5A9BA4DB3 /* App */ = {
 			isa = PBXGroup;
 			children = (
+				CD55B533219D6E951D93154C /* CompositionRoot.swift */,
 				743A909ABF3FCA97B1C842A4 /* ProxyLensApp.swift */,
 			);
 			path = App;
@@ -282,6 +285,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				82E9F96DC626E6ECD9CC4E77 /* AppRootView.swift in Sources */,
+				4ACD51C43F2085541678203F /* CompositionRoot.swift in Sources */,
 				CB41E5410231F1DF25E24FB3 /* ProxyLensApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

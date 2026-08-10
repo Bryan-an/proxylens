@@ -22,6 +22,9 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "SwiftASN1", package: "swift-asn1"),
                 .product(name: "X509", package: "swift-certificates")
+            ],
+            linkerSettings: [
+                .linkedFramework("SystemConfiguration")
             ]
         ),
         .testTarget(

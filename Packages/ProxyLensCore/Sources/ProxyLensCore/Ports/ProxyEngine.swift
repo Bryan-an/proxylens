@@ -29,7 +29,7 @@ public enum ProxyEngineState: Codable, Equatable, Hashable, Sendable {
 }
 
 public protocol ProxyEngine: Sendable {
-    func start(configuration: ProxyConfiguration) async throws
+    func start(configuration: ProxyConfiguration, sessionID: SessionID) async throws
     func stop() async
     func state() async -> ProxyEngineState
 }

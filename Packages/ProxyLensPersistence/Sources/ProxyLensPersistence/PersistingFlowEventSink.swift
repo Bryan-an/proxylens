@@ -34,6 +34,9 @@ public actor PersistingFlowEventSink: FlowEventSink, CaptureStartupRecovery {
         let flow = event.flow
         do {
             try await flowStore.save(flow)
+            if let downstream {
+                await downstream.publish(event)
+            }
         } catch {
             retainedFailures.append(
                 FlowPersistenceFailure(
@@ -44,10 +47,6 @@ public actor PersistingFlowEventSink: FlowEventSink, CaptureStartupRecovery {
             if retainedFailures.count > maximumRetainedFailures {
                 retainedFailures.removeFirst(retainedFailures.count - maximumRetainedFailures)
             }
-        }
-
-        if let downstream {
-            await downstream.publish(event)
         }
     }
 
