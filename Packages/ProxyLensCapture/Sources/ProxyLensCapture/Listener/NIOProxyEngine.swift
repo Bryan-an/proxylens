@@ -89,7 +89,7 @@ public actor NIOProxyEngine: ProxyEngine {
                         bodyStore,
                         maximumCapturedBodyBytes,
                         certificateProvider,
-                        upstreamTLSContext,
+                        upstreamTLSContext
                     ] channel in
                     channel.eventLoop.makeCompletedFuture(
                         Result {
