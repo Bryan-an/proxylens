@@ -2,46 +2,24 @@ import SwiftUI
 
 struct AppRootView: View {
     let compositionRoot: Result<CompositionRoot, any Error>
-    @State private var recoveryFailure: String?
 
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "network")
-                .font(.system(size: 42))
-
-            Text("ProxyLens")
-                .font(.title)
-
+        Group {
             switch compositionRoot {
-            case .success:
-                if let recoveryFailure {
-                    Text("ProxyLens could not restore the previous capture state")
-                        .foregroundStyle(.red)
-                    Text(recoveryFailure)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Capture control plane ready")
-                        .foregroundStyle(.secondary)
-                }
+            case .success(let compositionRoot):
+                TrafficConsoleView(viewModel: compositionRoot.trafficConsoleViewModel)
+                    .task {
+                        await compositionRoot.trafficConsoleViewModel.prepare()
+                    }
             case .failure(let error):
-                Text("ProxyLens could not initialize")
-                    .foregroundStyle(.red)
-                Text(error.localizedDescription)
-                    .foregroundStyle(.secondary)
+                ContentUnavailableView {
+                    Label("ProxyLens could not initialize", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(error.localizedDescription)
+                }
             }
         }
-        .frame(minWidth: 960, minHeight: 640)
-        .padding()
-        .task {
-            guard case .success(let compositionRoot) = compositionRoot else {
-                return
-            }
-            do {
-                try await compositionRoot.captureCoordinator.recoverInterruptedCapture()
-            } catch {
-                recoveryFailure = error.localizedDescription
-            }
-        }
+        .frame(minWidth: 1_100, minHeight: 680)
     }
 }
 

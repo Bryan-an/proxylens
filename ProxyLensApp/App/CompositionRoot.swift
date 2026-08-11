@@ -9,6 +9,7 @@ import ProxyLensPlatform
 final class CompositionRoot {
     let captureCoordinator: CaptureCoordinator
     let flowEvents: FlowEventBus
+    let trafficConsoleViewModel: TrafficConsoleViewModel
 
     init(fileManager: FileManager = .default) throws {
         let applicationSupportURL = try fileManager.url(
@@ -46,11 +47,25 @@ final class CompositionRoot {
                 .appendingPathComponent("PreviousConfiguration.plist", isDirectory: false)
         )
 
-        self.flowEvents = flowEvents
-        self.captureCoordinator = CaptureCoordinator(
+        let captureCoordinator = CaptureCoordinator(
             proxyEngine: proxyEngine,
             sessionStore: sessionStore,
             systemProxyController: systemProxyController
+        )
+        let bodyReader = FlowBodyReader(bodyStore: bodyStore)
+
+        self.flowEvents = flowEvents
+        self.captureCoordinator = captureCoordinator
+        self.trafficConsoleViewModel = TrafficConsoleViewModel(
+            captureController: captureCoordinator,
+            eventSource: flowEvents,
+            bodyReader: bodyReader,
+            captureConfiguration: CaptureConfiguration(
+                proxy: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 9_090),
+                    interceptHTTPS: true
+                )
+            )
         )
     }
 }

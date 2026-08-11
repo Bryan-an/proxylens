@@ -174,8 +174,9 @@ run_ui_tests() {
         -scheme ProxyLens \
         -destination 'platform=macOS' \
         -only-testing:ProxyLensUITests \
-        -derivedDataPath "$REPO_ROOT/.build/DerivedData" \
-        CODE_SIGNING_ALLOWED=NO \
+        -derivedDataPath "$REPO_ROOT/.build/DerivedDataUI" \
+        CODE_SIGNING_ALLOWED=YES \
+        CODE_SIGN_IDENTITY=- \
         test
 }
 
