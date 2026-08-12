@@ -4,13 +4,17 @@ import ProxyLensCore
 @MainActor
 final class FlowTableViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let viewModel: TrafficConsoleViewModel
-    private let tableView = NSTableView()
+    private let tableView: NSTableView
     private let emptyLabel = NSTextField(labelWithString: "No traffic captured yet")
     private var rows: [TrafficFlowRow] = []
     private var isRendering = false
 
-    init(viewModel: TrafficConsoleViewModel) {
+    init(
+        viewModel: TrafficConsoleViewModel,
+        tableView: NSTableView = NSTableView()
+    ) {
         self.viewModel = viewModel
+        self.tableView = tableView
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -77,30 +81,23 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         let oldIDs = oldRows.map(\.id)
         let newRows = snapshot.visibleRows
         let newIDs = newRows.map(\.id)
-        rows = newRows
 
         if oldIDs == newIDs {
+            rows = newRows
             let changed = IndexSet(newRows.indices.filter { oldRows[$0] != newRows[$0] })
-            if !changed.isEmpty {
-                tableView.reloadData(
-                    forRowIndexes: changed,
-                    columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns)
-                )
-            }
-        } else if newIDs.count > oldIDs.count, Array(newIDs.prefix(oldIDs.count)) == oldIDs {
-            tableView.beginUpdates()
-            let inserted = IndexSet(integersIn: oldIDs.count..<newIDs.count)
-            tableView.insertRows(at: inserted, withAnimation: [])
-            let changed = IndexSet(oldRows.indices.filter { oldRows[$0] != newRows[$0] })
-            if !changed.isEmpty {
-                tableView.reloadData(
-                    forRowIndexes: changed,
-                    columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns)
-                )
-            }
-            tableView.endUpdates()
+            reloadRows(changed)
         } else {
-            tableView.reloadData()
+            applyStructuralChanges(from: oldRows, to: newRows)
+            let oldRowsByID = Dictionary(uniqueKeysWithValues: oldRows.map { ($0.id, $0) })
+            let changed = IndexSet(
+                newRows.indices.filter { index in
+                    guard let oldRow = oldRowsByID[newRows[index].id] else {
+                        return false
+                    }
+                    return oldRow != newRows[index]
+                }
+            )
+            reloadRows(changed)
         }
 
         emptyLabel.isHidden = !rows.isEmpty
@@ -124,6 +121,57 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         }
     }
 
+    private func applyStructuralChanges(
+        from oldRows: [TrafficFlowRow],
+        to newRows: [TrafficFlowRow]
+    ) {
+        let oldIDs = oldRows.map(\.id)
+        let newIDs = newRows.map(\.id)
+        precondition(Set(oldIDs).count == oldIDs.count)
+        precondition(Set(newIDs).count == newIDs.count)
+
+        var working = oldRows
+        let newIDSet = Set(newIDs)
+        tableView.beginUpdates()
+
+        for index in working.indices.reversed()
+        where !newIDSet.contains(working[index].id) {
+            working.remove(at: index)
+            rows = working
+            tableView.removeRows(at: IndexSet(integer: index), withAnimation: [])
+        }
+
+        for (targetIndex, newRow) in newRows.enumerated() {
+            if targetIndex < working.count, working[targetIndex].id == newRow.id {
+                continue
+            }
+            if let currentIndex = working.firstIndex(where: { $0.id == newRow.id }) {
+                let row = working.remove(at: currentIndex)
+                working.insert(row, at: targetIndex)
+                rows = working
+                tableView.moveRow(at: currentIndex, to: targetIndex)
+            } else {
+                working.insert(newRow, at: targetIndex)
+                rows = working
+                tableView.insertRows(at: IndexSet(integer: targetIndex), withAnimation: [])
+            }
+        }
+
+        rows = newRows
+        tableView.endUpdates()
+        precondition(working.map(\.id) == newIDs)
+    }
+
+    private func reloadRows(_ rowIndexes: IndexSet) {
+        guard !rowIndexes.isEmpty else {
+            return
+        }
+        tableView.reloadData(
+            forRowIndexes: rowIndexes,
+            columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns)
+        )
+    }
+
     func numberOfRows(in tableView: NSTableView) -> Int {
         rows.count
     }
@@ -134,7 +182,8 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         row: Int
     ) -> NSView? {
         guard let tableColumn,
-            let column = FlowColumn(rawValue: tableColumn.identifier.rawValue)
+            let column = FlowColumn(rawValue: tableColumn.identifier.rawValue),
+            rows.indices.contains(row)
         else {
             return nil
         }

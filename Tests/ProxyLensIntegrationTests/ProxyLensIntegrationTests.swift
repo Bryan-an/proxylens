@@ -171,6 +171,241 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.displayFilter, filter)
     }
 
+    func testActiveFilterIncrementallyProjectsLiveInsertionsAndUpdates() throws {
+        let matching = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200,
+            requestHeaderValue: "needle"
+        )
+        var promoted = try Self.makeFlow(
+            index: 2,
+            host: "promoted.example.com",
+            statusCode: 404,
+            requestHeaderValue: "needle"
+        )
+        let hidden = try Self.makeFlow(
+            index: 3,
+            host: "hidden.example.com",
+            statusCode: 200,
+            requestHeaderValue: "haystack"
+        )
+        let liveMatching = try Self.makeFlow(
+            index: 4,
+            host: "live.example.com",
+            statusCode: 204,
+            requestHeaderValue: "needle"
+        )
+
+        var store = TrafficConsoleStore()
+        store.setDisplayFilter(
+            TrafficDisplayFilter(searchText: "needle", status: .success)
+        )
+        store.apply([.finished(matching), .finished(promoted), .finished(hidden)])
+        XCTAssertEqual(
+            store.snapshot(capture: .stopped, inspection: .empty).visibleRows.map(\.id),
+            [matching.id]
+        )
+
+        store.apply([.finished(liveMatching)])
+        XCTAssertEqual(
+            store.snapshot(capture: .stopped, inspection: .empty).visibleRows.map(\.id),
+            [matching.id, liveMatching.id]
+        )
+
+        promoted.attachResponse(
+            try HTTPResponse(
+                statusCode: 202,
+                reasonPhrase: "Accepted",
+                headers: promoted.response?.headers ?? HTTPHeaders()
+            )
+        )
+        store.apply([.updated(promoted)])
+        XCTAssertEqual(
+            store.snapshot(capture: .stopped, inspection: .empty).visibleRows.map(\.id),
+            [matching.id, promoted.id, liveMatching.id]
+        )
+
+        store.selectFlow(promoted.id)
+        promoted.attachResponse(
+            try HTTPResponse(
+                statusCode: 503,
+                reasonPhrase: "Unavailable",
+                headers: promoted.response?.headers ?? HTTPHeaders()
+            )
+        )
+        store.apply([.updated(promoted)])
+        let snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [matching.id, liveMatching.id])
+        XCTAssertNil(snapshot.selectedFlowID)
+        XCTAssertEqual(snapshot.allFlowCount, 4)
+    }
+
+    func testFlowTableInsertsPromotedFilteredRowWithoutFullReload() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        let first = try Self.makeFlow(
+            index: 1,
+            host: "first.example.com",
+            statusCode: 200,
+            requestHeaderValue: "needle"
+        )
+        var promoted = try Self.makeFlow(
+            index: 2,
+            host: "promoted.example.com",
+            statusCode: 404,
+            requestHeaderValue: "needle"
+        )
+        let last = try Self.makeFlow(
+            index: 3,
+            host: "last.example.com",
+            statusCode: 204,
+            requestHeaderValue: "needle"
+        )
+
+        var store = TrafficConsoleStore()
+        store.setDisplayFilter(
+            TrafficDisplayFilter(searchText: "needle", status: .success)
+        )
+        store.apply([.finished(first), .finished(promoted), .finished(last)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        tableView.resetRecordedUpdates()
+
+        promoted.attachResponse(
+            try HTTPResponse(
+                statusCode: 202,
+                reasonPhrase: "Accepted",
+                headers: promoted.response?.headers ?? HTTPHeaders()
+            )
+        )
+        store.apply([.updated(promoted)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+
+        XCTAssertEqual(tableView.insertedRowIndexes, [IndexSet(integer: 1)])
+        XCTAssertEqual(tableView.fullReloadCount, 0)
+        XCTAssertEqual(tableView.numberOfRows, 3)
+    }
+
+    func testFlowTableMovesSortedLiveUpdatesWithoutFullReload() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        var first = try Self.makeFlow(
+            index: 1,
+            host: "first.example.com",
+            statusCode: 200,
+            requestHeaderValue: "needle"
+        )
+        let second = try Self.makeFlow(
+            index: 2,
+            host: "second.example.com",
+            statusCode: 300,
+            requestHeaderValue: "needle"
+        )
+        let third = try Self.makeFlow(
+            index: 3,
+            host: "third.example.com",
+            statusCode: 400,
+            requestHeaderValue: "needle"
+        )
+
+        var store = TrafficConsoleStore()
+        store.setDisplayFilter(TrafficDisplayFilter(searchText: "needle"))
+        store.setSort(TrafficConsoleSort(key: .status, ascending: true))
+        store.apply([.finished(first), .finished(second), .finished(third)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        tableView.resetRecordedUpdates()
+
+        first.attachResponse(
+            try HTTPResponse(
+                statusCode: 500,
+                reasonPhrase: "Server Error",
+                headers: first.response?.headers ?? HTTPHeaders()
+            )
+        )
+        store.apply([.updated(first)])
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [second.id, third.id, first.id])
+        controller.render(snapshot)
+        XCTAssertFalse(tableView.movedRows.isEmpty)
+        XCTAssertEqual(tableView.fullReloadCount, 0)
+
+        tableView.resetRecordedUpdates()
+        first.attachResponse(
+            try HTTPResponse(
+                statusCode: 100,
+                reasonPhrase: "Continue",
+                headers: first.response?.headers ?? HTTPHeaders()
+            )
+        )
+        store.apply([.updated(first)])
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [first.id, second.id, third.id])
+        controller.render(snapshot)
+        XCTAssertEqual(tableView.movedRows.count, 1)
+        XCTAssertEqual(tableView.movedRows.first?.from, 2)
+        XCTAssertEqual(tableView.movedRows.first?.to, 0)
+        XCTAssertEqual(tableView.fullReloadCount, 0)
+        XCTAssertEqual(tableView.numberOfRows, 3)
+    }
+
+    func testFlowTableKeepsDataSourceInSyncWhenRemovingMultipleRows() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        let kept = try Self.makeFlow(index: 1, host: "keep.example.com", statusCode: 200)
+        let droppedA = try Self.makeFlow(index: 2, host: "drop-a.example.com", statusCode: 404)
+        let droppedB = try Self.makeFlow(index: 3, host: "drop-b.example.com", statusCode: 500)
+        let droppedC = try Self.makeFlow(index: 4, host: "drop-c.example.com", statusCode: 204)
+
+        var store = TrafficConsoleStore()
+        store.apply([
+            .finished(kept),
+            .finished(droppedA),
+            .finished(droppedB),
+            .finished(droppedC)
+        ])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        XCTAssertEqual(tableView.numberOfRows, 4)
+        tableView.resetRecordedUpdates()
+
+        store.selectSource(.domain("keep.example.com"))
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+
+        XCTAssertEqual(
+            tableView.removedRowIndexes,
+            [
+                IndexSet(integer: 3),
+                IndexSet(integer: 2),
+                IndexSet(integer: 1)
+            ])
+        XCTAssertEqual(tableView.dataSourceRowCountsDuringRemovals, [3, 2, 1])
+        XCTAssertEqual(tableView.fullReloadCount, 0)
+        XCTAssertEqual(tableView.numberOfRows, 1)
+    }
+
     func testViewModelBatchesLargeFlowListsAndLoadsAuthoritativeBodies() async throws {
         let captureController = RecordingCaptureController()
         let viewModel = TrafficConsoleViewModel(
@@ -576,6 +811,52 @@ final class ProxyLensIntegrationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Condition was not satisfied before timeout")
+    }
+}
+
+@MainActor
+private final class RecordingTableView: NSTableView {
+    private(set) var fullReloadCount = 0
+    private(set) var insertedRowIndexes: [IndexSet] = []
+    private(set) var removedRowIndexes: [IndexSet] = []
+    private(set) var movedRows: [(from: Int, to: Int)] = []
+    private(set) var dataSourceRowCountsDuringRemovals: [Int] = []
+
+    override func reloadData() {
+        fullReloadCount += 1
+        super.reloadData()
+    }
+
+    override func insertRows(
+        at indexes: IndexSet,
+        withAnimation animationOptions: NSTableView.AnimationOptions
+    ) {
+        insertedRowIndexes.append(indexes)
+        super.insertRows(at: indexes, withAnimation: animationOptions)
+    }
+
+    override func removeRows(
+        at indexes: IndexSet,
+        withAnimation animationOptions: NSTableView.AnimationOptions
+    ) {
+        if let numberOfRows = dataSource?.numberOfRows {
+            dataSourceRowCountsDuringRemovals.append(numberOfRows(self))
+        }
+        removedRowIndexes.append(indexes)
+        super.removeRows(at: indexes, withAnimation: animationOptions)
+    }
+
+    override func moveRow(at oldIndex: Int, to newIndex: Int) {
+        movedRows.append((from: oldIndex, to: newIndex))
+        super.moveRow(at: oldIndex, to: newIndex)
+    }
+
+    func resetRecordedUpdates() {
+        fullReloadCount = 0
+        insertedRowIndexes = []
+        removedRowIndexes = []
+        movedRows = []
+        dataSourceRowCountsDuringRemovals = []
     }
 }
 

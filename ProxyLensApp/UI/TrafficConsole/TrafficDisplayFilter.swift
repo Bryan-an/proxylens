@@ -159,24 +159,33 @@ struct TrafficDisplayFilter: Equatable, Sendable {
     }
 
     func matches(_ flow: Flow) -> Bool {
+        matches(
+            flow,
+            searchableText: Self.searchableText(for: flow),
+            searchTokens: normalizedSearchTokens
+        )
+    }
+
+    var normalizedSearchTokens: [String] {
+        searchText
+            .split(whereSeparator: \.isWhitespace)
+            .map { Self.normalized(String($0)) }
+    }
+
+    func matches(
+        _ flow: Flow,
+        searchableText: String,
+        searchTokens: [String]
+    ) -> Bool {
         method.matches(flow.request.method)
             && status.matches(flow.response?.statusCode)
             && contentType.matches(Self.contentType(for: flow))
             && origin.matches(flow.source.kind)
-            && matchesSearch(flow)
+            && searchTokens.allSatisfy(searchableText.contains)
     }
 
-    private func matchesSearch(_ flow: Flow) -> Bool {
-        let tokens =
-            searchText
-            .split(whereSeparator: \.isWhitespace)
-            .map { Self.normalized(String($0)) }
-        guard !tokens.isEmpty else {
-            return true
-        }
-
-        let searchableText = Self.normalized(Self.searchFields(for: flow).joined(separator: "\n"))
-        return tokens.allSatisfy(searchableText.contains)
+    static func searchableText(for flow: Flow) -> String {
+        normalized(searchFields(for: flow).joined(separator: "\n"))
     }
 
     private static func contentType(for flow: Flow) -> String? {

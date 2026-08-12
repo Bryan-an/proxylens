@@ -142,9 +142,16 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
 struct TrafficConsoleStore {
     private var flowsByID: [FlowID: Flow] = [:]
     private var orderedFlowIDs: [FlowID] = []
+    private var orderIndexByID: [FlowID: Int] = [:]
+    private var searchableTextByID: [FlowID: String] = [:]
+    private var domainCounts: [String: Int] = [:]
+    private var domainSummaries: [TrafficDomainSummary] = []
+    private var visibleRows: [TrafficFlowRow] = []
+    private var visibleFlowIDs: Set<FlowID> = []
     private(set) var selectedSource: TrafficSourceSelection = .allTraffic
     private(set) var selectedFlowID: FlowID?
     private(set) var displayFilter: TrafficDisplayFilter = .all
+    private var searchTokens: [String] = []
     private var sort: TrafficConsoleSort?
 
     var selectedFlow: Flow? {
@@ -152,29 +159,88 @@ struct TrafficConsoleStore {
     }
 
     mutating func apply(_ events: [FlowEvent]) {
+        var domainProjectionChanged = false
+        var needsSort = false
+
         for event in events {
             let flow = event.flow
-            if flowsByID[flow.id] == nil {
+            let previousFlow = flowsByID[flow.id]
+            if previousFlow == nil {
+                orderIndexByID[flow.id] = orderedFlowIDs.count
                 orderedFlowIDs.append(flow.id)
             }
+
             flowsByID[flow.id] = flow
+            searchableTextByID[flow.id] = TrafficDisplayFilter.searchableText(for: flow)
+            domainProjectionChanged =
+                updateDomainCounts(previousFlow: previousFlow, currentFlow: flow)
+                || domainProjectionChanged
+
+            let wasVisible = visibleFlowIDs.contains(flow.id)
+            let isVisible = matchesCurrentProjection(flow)
+            switch (wasVisible, isVisible) {
+            case (true, true):
+                guard let index = visibleRows.firstIndex(where: { $0.id == flow.id }) else {
+                    rebuildVisibleProjection()
+                    continue
+                }
+                visibleRows[index] = TrafficFlowRow(flow: flow)
+                needsSort = needsSort || sort != nil
+            case (true, false):
+                visibleFlowIDs.remove(flow.id)
+                if let index = visibleRows.firstIndex(where: { $0.id == flow.id }) {
+                    visibleRows.remove(at: index)
+                }
+            case (false, true):
+                let row = TrafficFlowRow(flow: flow)
+                visibleFlowIDs.insert(flow.id)
+                if sort == nil {
+                    visibleRows.insert(row, at: captureOrderInsertionIndex(for: flow.id))
+                } else {
+                    visibleRows.append(row)
+                    needsSort = true
+                }
+            case (false, false):
+                break
+            }
+        }
+
+        if domainProjectionChanged {
+            rebuildDomainSummaries()
+        }
+        if needsSort {
+            restoreVisibleOrder()
         }
         clearSelectionIfHidden()
     }
 
     mutating func selectSource(_ source: TrafficSourceSelection) {
+        guard selectedSource != source else {
+            return
+        }
         selectedSource = source
+        rebuildVisibleProjection()
         clearSelectionIfHidden()
     }
 
     mutating func setDisplayFilter(_ filter: TrafficDisplayFilter) {
+        guard displayFilter != filter else {
+            return
+        }
         displayFilter = filter
+        searchTokens = filter.normalizedSearchTokens
+        rebuildVisibleProjection()
         clearSelectionIfHidden()
     }
 
     mutating func clearFilters() {
+        guard selectedSource != .allTraffic || displayFilter != .all else {
+            return
+        }
         selectedSource = .allTraffic
         displayFilter = .all
+        searchTokens = []
+        rebuildVisibleProjection()
     }
 
     mutating func selectFlow(_ flowID: FlowID?) {
@@ -182,50 +248,130 @@ struct TrafficConsoleStore {
             selectedFlowID = nil
             return
         }
-        selectedFlowID = visibleFlows().contains(where: { $0.id == flowID }) ? flowID : nil
+        selectedFlowID = visibleFlowIDs.contains(flowID) ? flowID : nil
     }
 
     mutating func setSort(_ sort: TrafficConsoleSort?) {
+        guard self.sort != sort else {
+            return
+        }
         self.sort = sort
+        restoreVisibleOrder()
     }
 
     func snapshot(
         capture: TrafficCapturePresentation,
         inspection: TrafficFlowInspection
     ) -> TrafficConsoleSnapshot {
-        let domainCounts = flowsByID.values.reduce(into: [String: Int]()) { counts, flow in
-            counts[TrafficFlowRow.host(for: flow), default: 0] += 1
-        }
-        let domains =
-            domainCounts
-            .map { TrafficDomainSummary(host: $0.key, flowCount: $0.value) }
-            .sorted { $0.host.localizedStandardCompare($1.host) == .orderedAscending }
-
-        return TrafficConsoleSnapshot(
+        TrafficConsoleSnapshot(
             capture: capture,
             allFlowCount: flowsByID.count,
-            domains: domains,
+            domains: domainSummaries,
             selectedSource: selectedSource,
             displayFilter: displayFilter,
-            visibleRows: visibleFlows().map(TrafficFlowRow.init),
+            visibleRows: visibleRows,
             selectedFlowID: selectedFlowID,
             inspection: inspection
         )
     }
 
-    private func visibleFlows() -> [Flow] {
-        var flows = orderedFlowIDs.compactMap { flowsByID[$0] }
-        if case .domain(let host) = selectedSource {
-            flows.removeAll { TrafficFlowRow.host(for: $0) != host }
+    private func matchesCurrentProjection(_ flow: Flow) -> Bool {
+        if case .domain(let host) = selectedSource,
+            TrafficFlowRow.host(for: flow) != host
+        {
+            return false
         }
-        flows.removeAll { !displayFilter.matches($0) }
+        return displayFilter.matches(
+            flow,
+            searchableText: searchableTextByID[flow.id]
+                ?? TrafficDisplayFilter.searchableText(for: flow),
+            searchTokens: searchTokens
+        )
+    }
+
+    private mutating func rebuildVisibleProjection() {
+        var rebuiltRows: [TrafficFlowRow] = []
+        rebuiltRows.reserveCapacity(visibleRows.count)
+        for flowID in orderedFlowIDs {
+            guard let flow = flowsByID[flowID], matchesCurrentProjection(flow) else {
+                continue
+            }
+            rebuiltRows.append(TrafficFlowRow(flow: flow))
+        }
+        visibleRows = rebuiltRows
+        visibleFlowIDs = Set(rebuiltRows.map(\.id))
+        restoreVisibleOrder()
+    }
+
+    private mutating func updateDomainCounts(
+        previousFlow: Flow?,
+        currentFlow: Flow
+    ) -> Bool {
+        let currentHost = TrafficFlowRow.host(for: currentFlow)
+        guard let previousFlow else {
+            domainCounts[currentHost, default: 0] += 1
+            return true
+        }
+
+        let previousHost = TrafficFlowRow.host(for: previousFlow)
+        guard previousHost != currentHost else {
+            return false
+        }
+        decrementDomainCount(previousHost)
+        domainCounts[currentHost, default: 0] += 1
+        return true
+    }
+
+    private mutating func decrementDomainCount(_ host: String) {
+        guard let count = domainCounts[host] else {
+            return
+        }
+        if count == 1 {
+            domainCounts.removeValue(forKey: host)
+        } else {
+            domainCounts[host] = count - 1
+        }
+    }
+
+    private mutating func rebuildDomainSummaries() {
+        domainSummaries =
+            domainCounts
+            .map { TrafficDomainSummary(host: $0.key, flowCount: $0.value) }
+            .sorted { $0.host.localizedStandardCompare($1.host) == .orderedAscending }
+    }
+
+    private func captureOrderInsertionIndex(for flowID: FlowID) -> Int {
+        let targetOrder = orderIndexByID[flowID] ?? Int.max
+        var lowerBound = 0
+        var upperBound = visibleRows.count
+        while lowerBound < upperBound {
+            let midpoint = lowerBound + (upperBound - lowerBound) / 2
+            let midpointOrder = orderIndexByID[visibleRows[midpoint].id] ?? Int.max
+            if midpointOrder < targetOrder {
+                lowerBound = midpoint + 1
+            } else {
+                upperBound = midpoint
+            }
+        }
+        return lowerBound
+    }
+
+    private mutating func restoreVisibleOrder() {
+        let orderIndices = orderIndexByID
         guard let sort else {
-            return flows
+            visibleRows.sort {
+                (orderIndices[$0.id] ?? Int.max) < (orderIndices[$1.id] ?? Int.max)
+            }
+            return
         }
-        return flows.sorted { lhs, rhs in
+
+        visibleRows.sort { lhs, rhs in
             let comparison = Self.compare(lhs, rhs, key: sort.key)
             if comparison == .orderedSame {
-                return lhs.createdAt < rhs.createdAt
+                if lhs.startedAt != rhs.startedAt {
+                    return lhs.startedAt < rhs.startedAt
+                }
+                return (orderIndices[lhs.id] ?? Int.max) < (orderIndices[rhs.id] ?? Int.max)
             }
             return sort.ascending
                 ? comparison == .orderedAscending : comparison == .orderedDescending
@@ -236,33 +382,31 @@ struct TrafficConsoleStore {
         guard let selectedFlowID else {
             return
         }
-        if !visibleFlows().contains(where: { $0.id == selectedFlowID }) {
+        if !visibleFlowIDs.contains(selectedFlowID) {
             self.selectedFlowID = nil
         }
     }
 
     private static func compare(
-        _ lhs: Flow,
-        _ rhs: Flow,
+        _ lhs: TrafficFlowRow,
+        _ rhs: TrafficFlowRow,
         key: TrafficConsoleSortKey
     ) -> ComparisonResult {
-        let left = TrafficFlowRow(flow: lhs)
-        let right = TrafficFlowRow(flow: rhs)
         switch key {
         case .method:
-            return left.method.localizedStandardCompare(right.method)
+            return lhs.method.localizedStandardCompare(rhs.method)
         case .host:
-            return left.host.localizedStandardCompare(right.host)
+            return lhs.host.localizedStandardCompare(rhs.host)
         case .path:
-            return left.path.localizedStandardCompare(right.path)
+            return lhs.path.localizedStandardCompare(rhs.path)
         case .status:
-            return compare(left.statusCode ?? -1, right.statusCode ?? -1)
+            return compare(lhs.statusCode ?? -1, rhs.statusCode ?? -1)
         case .startedAt:
-            return compare(left.startedAt, right.startedAt)
+            return compare(lhs.startedAt, rhs.startedAt)
         case .duration:
-            return compare(left.duration ?? -1, right.duration ?? -1)
+            return compare(lhs.duration ?? -1, rhs.duration ?? -1)
         case .size:
-            return compare(left.byteCount, right.byteCount)
+            return compare(lhs.byteCount, rhs.byteCount)
         }
     }
 

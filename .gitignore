@@ -17,6 +17,7 @@ xcuserdata/
 # Swift Package Manager
 .build/
 .swiftpm/
+ProxyLens.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
 
 # Build and release output
 *.dSYM
