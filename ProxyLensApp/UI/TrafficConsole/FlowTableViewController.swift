@@ -105,10 +105,13 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 
         emptyLabel.isHidden = !rows.isEmpty
         if rows.isEmpty {
-            emptyLabel.stringValue =
-                snapshot.allFlowCount == 0
-                ? "No traffic captured yet"
-                : "No flows in this source"
+            if snapshot.allFlowCount == 0 {
+                emptyLabel.stringValue = "No traffic captured yet"
+            } else if snapshot.displayFilter.isActive {
+                emptyLabel.stringValue = "No flows match the active filters"
+            } else {
+                emptyLabel.stringValue = "No flows in this source"
+            }
         }
 
         if let selectedFlowID = snapshot.selectedFlowID,

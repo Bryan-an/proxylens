@@ -113,6 +113,31 @@ final class TrafficConsoleViewModel: ObservableObject {
         publishSnapshot()
     }
 
+    func setSearchText(_ searchText: String) {
+        updateDisplayFilter { $0.searchText = searchText }
+    }
+
+    func setMethodFilter(_ method: TrafficMethodFilter) {
+        updateDisplayFilter { $0.method = method }
+    }
+
+    func setStatusFilter(_ status: TrafficStatusFilter) {
+        updateDisplayFilter { $0.status = status }
+    }
+
+    func setContentTypeFilter(_ contentType: TrafficContentTypeFilter) {
+        updateDisplayFilter { $0.contentType = contentType }
+    }
+
+    func setOriginFilter(_ origin: TrafficOriginFilter) {
+        updateDisplayFilter { $0.origin = origin }
+    }
+
+    func clearDisplayFilters() {
+        store.clearFilters()
+        publishSnapshot()
+    }
+
     func selectFlow(_ flowID: FlowID?) {
         store.selectFlow(flowID)
         refreshInspection()
@@ -125,6 +150,17 @@ final class TrafficConsoleViewModel: ObservableObject {
 
     func clearSort() {
         store.setSort(nil)
+        publishSnapshot()
+    }
+
+    private func updateDisplayFilter(_ update: (inout TrafficDisplayFilter) -> Void) {
+        var filter = store.displayFilter
+        update(&filter)
+        store.setDisplayFilter(filter)
+        if store.selectedFlowID == nil {
+            bodyTask?.cancel()
+            inspection = .empty
+        }
         publishSnapshot()
     }
 

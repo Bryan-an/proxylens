@@ -46,6 +46,131 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.visibleRows.map(\.id), [second.id])
     }
 
+    func testDisplayFilterComposesSearchFacetsAndDomainSelection() throws {
+        let matching = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 201,
+            method: .post,
+            responseContentType: "application/problem+json; charset=utf-8",
+            requestHeaderValue: "Blue Café"
+        )
+        let wrongOrigin = try Self.makeFlow(
+            index: 2,
+            host: "api.example.com",
+            statusCode: 201,
+            method: .post,
+            responseContentType: "application/json",
+            source: FlowSource(kind: .importedSession, label: "Blue Cafe archive"),
+            requestHeaderValue: "Blue Cafe"
+        )
+        let wrongStatus = try Self.makeFlow(
+            index: 3,
+            host: "api.example.com",
+            statusCode: 404,
+            method: .post,
+            responseContentType: "application/json",
+            requestHeaderValue: "Blue Cafe"
+        )
+        let wrongDomain = try Self.makeFlow(
+            index: 4,
+            host: "cdn.example.com",
+            statusCode: 200,
+            method: .post,
+            responseContentType: "application/json",
+            requestHeaderValue: "Blue Cafe"
+        )
+        var store = TrafficConsoleStore()
+        store.apply([
+            .finished(matching),
+            .finished(wrongOrigin),
+            .finished(wrongStatus),
+            .finished(wrongDomain)
+        ])
+        store.selectSource(.domain("api.example.com"))
+        store.setDisplayFilter(
+            TrafficDisplayFilter(
+                searchText: "blue cafe",
+                method: .post,
+                status: .success,
+                contentType: .json,
+                origin: .desktopProxy
+            )
+        )
+
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [matching.id])
+        XCTAssertEqual(snapshot.allFlowCount, 4)
+        XCTAssertTrue(snapshot.displayFilter.isActive)
+
+        store.selectFlow(matching.id)
+        store.setDisplayFilter(
+            TrafficDisplayFilter(
+                searchText: "missing",
+                method: .post,
+                status: .success,
+                contentType: .json,
+                origin: .desktopProxy
+            )
+        )
+        XCTAssertNil(store.selectedFlowID)
+
+        store.clearFilters()
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.count, 4)
+        XCTAssertEqual(snapshot.selectedSource, .allTraffic)
+        XCTAssertEqual(snapshot.displayFilter, .all)
+    }
+
+    func testDisplayFilterPersistsAcrossLargeLiveUpdatesAndSelectionChanges() throws {
+        var flows: [Flow] = []
+        flows.reserveCapacity(2_000)
+        for index in 0..<2_000 {
+            flows.append(
+                try Self.makeFlow(
+                    index: index,
+                    host: "host-\(index % 25).example.com",
+                    statusCode: 200 + (index % 5)
+                )
+            )
+        }
+
+        let filter = TrafficDisplayFilter(
+            searchText: "host-7.example.com",
+            method: .get,
+            status: .success,
+            contentType: .binary,
+            origin: .desktopProxy
+        )
+        var store = TrafficConsoleStore()
+        store.setDisplayFilter(filter)
+        store.apply(flows.map(FlowEvent.finished))
+
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.displayFilter, filter)
+        XCTAssertEqual(snapshot.visibleRows.count, 40)
+
+        let selectedID = try XCTUnwrap(snapshot.visibleRows.first?.id)
+        store.selectFlow(selectedID)
+        var selectedUpdate = try XCTUnwrap(flows.first { $0.id == selectedID })
+        selectedUpdate.markTLSHandshakeCompleted(at: Date(timeIntervalSince1970: 2_100))
+        store.apply([.updated(selectedUpdate)])
+        XCTAssertEqual(store.selectedFlowID, selectedID)
+
+        selectedUpdate.attachResponse(
+            try HTTPResponse(
+                statusCode: 404,
+                reasonPhrase: "Not Found",
+                headers: selectedUpdate.response?.headers ?? HTTPHeaders()
+            )
+        )
+        store.apply([.updated(selectedUpdate)])
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertNil(snapshot.selectedFlowID)
+        XCTAssertEqual(snapshot.visibleRows.count, 39)
+        XCTAssertEqual(snapshot.displayFilter, filter)
+    }
+
     func testViewModelBatchesLargeFlowListsAndLoadsAuthoritativeBodies() async throws {
         let captureController = RecordingCaptureController()
         let viewModel = TrafficConsoleViewModel(
@@ -267,11 +392,52 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
         let inspector = try XCTUnwrap(
-            Self.descendant(of: NSTextView.self, in: controller.view)
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+            )
         )
+        let searchField = try XCTUnwrap(
+            Self.descendant(
+                of: NSSearchField.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.search" }
+            )
+        )
+        let clearButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.filter.clear" }
+            )
+        )
+        for identifier in [
+            "traffic.filter.method",
+            "traffic.filter.status",
+            "traffic.filter.contentType",
+            "traffic.filter.source"
+        ] {
+            XCTAssertNotNil(
+                Self.descendant(
+                    of: NSPopUpButton.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == identifier }
+                )
+            )
+        }
         XCTAssertEqual(sourceOutline.numberOfRows, 5)
         XCTAssertEqual(flowTable.numberOfRows, flows.count)
         XCTAssertTrue(inspector.string.contains("POST /v1/items/3?source=test HTTP/1.1"))
+
+        searchField.stringValue = "api.example.com"
+        XCTAssertTrue(searchField.sendAction(searchField.action, to: searchField.target))
+        XCTAssertEqual(viewModel.snapshot.visibleRows.count, 2)
+        XCTAssertEqual(flowTable.numberOfRows, 2)
+
+        clearButton.performClick(nil)
+        XCTAssertEqual(viewModel.snapshot.displayFilter, .all)
+        XCTAssertEqual(flowTable.numberOfRows, flows.count)
 
         let representation = try XCTUnwrap(
             controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds)
@@ -303,13 +469,20 @@ final class ProxyLensIntegrationTests: XCTestCase {
         host: String,
         statusCode: Int,
         requestBody: Data? = nil,
-        responseBody: Data? = nil
+        responseBody: Data? = nil,
+        method: HTTPMethod? = nil,
+        responseContentType: String = "application/octet-stream",
+        source: FlowSource = .desktopProxy,
+        requestHeaderValue: String? = nil
     ) throws -> Flow {
         var requestHeaders = HTTPHeaders()
         try requestHeaders.append(name: "Host", value: host)
         try requestHeaders.append(name: "Accept", value: "application/json")
+        if let requestHeaderValue {
+            try requestHeaders.append(name: "X-Debug-Label", value: requestHeaderValue)
+        }
         var request = HTTPRequest(
-            method: index.isMultiple(of: 2) ? .get : .post,
+            method: method ?? (index.isMultiple(of: 2) ? .get : .post),
             url: try XCTUnwrap(URL(string: "https://\(host)/v1/items/\(index)?source=test")),
             headers: requestHeaders
         )
@@ -323,7 +496,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
 
         var responseHeaders = HTTPHeaders()
-        try responseHeaders.append(name: "Content-Type", value: "application/octet-stream")
+        try responseHeaders.append(name: "Content-Type", value: responseContentType)
         var response = try HTTPResponse(
             statusCode: statusCode,
             reasonPhrase: "Result",
@@ -333,13 +506,14 @@ final class ProxyLensIntegrationTests: XCTestCase {
             response.attachBody(
                 BodyReference(
                     inline: responseBody,
-                    metadata: BodyMetadata(contentType: "application/octet-stream")
+                    metadata: BodyMetadata(contentType: responseContentType)
                 )
             )
         }
 
         var flow = Flow(
             sessionID: SessionID(),
+            source: source,
             request: request,
             connection: ConnectionInfo(
                 protocolKind: .https,

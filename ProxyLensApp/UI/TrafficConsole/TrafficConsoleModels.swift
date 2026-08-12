@@ -122,6 +122,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
     let allFlowCount: Int
     let domains: [TrafficDomainSummary]
     let selectedSource: TrafficSourceSelection
+    let displayFilter: TrafficDisplayFilter
     let visibleRows: [TrafficFlowRow]
     let selectedFlowID: FlowID?
     let inspection: TrafficFlowInspection
@@ -131,6 +132,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
         allFlowCount: 0,
         domains: [],
         selectedSource: .allTraffic,
+        displayFilter: .all,
         visibleRows: [],
         selectedFlowID: nil,
         inspection: .empty
@@ -142,6 +144,7 @@ struct TrafficConsoleStore {
     private var orderedFlowIDs: [FlowID] = []
     private(set) var selectedSource: TrafficSourceSelection = .allTraffic
     private(set) var selectedFlowID: FlowID?
+    private(set) var displayFilter: TrafficDisplayFilter = .all
     private var sort: TrafficConsoleSort?
 
     var selectedFlow: Flow? {
@@ -162,6 +165,16 @@ struct TrafficConsoleStore {
     mutating func selectSource(_ source: TrafficSourceSelection) {
         selectedSource = source
         clearSelectionIfHidden()
+    }
+
+    mutating func setDisplayFilter(_ filter: TrafficDisplayFilter) {
+        displayFilter = filter
+        clearSelectionIfHidden()
+    }
+
+    mutating func clearFilters() {
+        selectedSource = .allTraffic
+        displayFilter = .all
     }
 
     mutating func selectFlow(_ flowID: FlowID?) {
@@ -193,6 +206,7 @@ struct TrafficConsoleStore {
             allFlowCount: flowsByID.count,
             domains: domains,
             selectedSource: selectedSource,
+            displayFilter: displayFilter,
             visibleRows: visibleFlows().map(TrafficFlowRow.init),
             selectedFlowID: selectedFlowID,
             inspection: inspection
@@ -204,6 +218,7 @@ struct TrafficConsoleStore {
         if case .domain(let host) = selectedSource {
             flows.removeAll { TrafficFlowRow.host(for: $0) != host }
         }
+        flows.removeAll { !displayFilter.matches($0) }
         guard let sort else {
             return flows
         }

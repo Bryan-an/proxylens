@@ -11,6 +11,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let captureButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
+    private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
     private var snapshotCancellable: AnyCancellable?
 
     init(viewModel: TrafficConsoleViewModel) {
@@ -72,6 +73,10 @@ final class TrafficConsoleViewController: NSViewController {
             captureButton.centerYAnchor.constraint(equalTo: header.centerYAnchor)
         ])
 
+        let headerSeparator = NSBox()
+        headerSeparator.translatesAutoresizingMaskIntoConstraints = false
+        headerSeparator.boxType = .separator
+
         let separator = NSBox()
         separator.translatesAutoresizingMaskIntoConstraints = false
         separator.boxType = .separator
@@ -82,6 +87,8 @@ final class TrafficConsoleViewController: NSViewController {
         splitView.translatesAutoresizingMaskIntoConstraints = false
 
         container.addSubview(header)
+        container.addSubview(headerSeparator)
+        container.addSubview(filterBar)
         container.addSubview(separator)
         container.addSubview(splitView)
         NSLayoutConstraint.activate([
@@ -89,9 +96,16 @@ final class TrafficConsoleViewController: NSViewController {
             header.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             header.topAnchor.constraint(equalTo: container.topAnchor),
             header.heightAnchor.constraint(equalToConstant: 44),
+            headerSeparator.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            headerSeparator.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            headerSeparator.topAnchor.constraint(equalTo: header.bottomAnchor),
+            filterBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            filterBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            filterBar.topAnchor.constraint(equalTo: headerSeparator.bottomAnchor),
+            filterBar.heightAnchor.constraint(equalToConstant: 40),
             separator.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            separator.topAnchor.constraint(equalTo: header.bottomAnchor),
+            separator.topAnchor.constraint(equalTo: filterBar.bottomAnchor),
             splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             splitView.topAnchor.constraint(equalTo: separator.bottomAnchor),
@@ -141,6 +155,7 @@ final class TrafficConsoleViewController: NSViewController {
             systemSymbolName: "circle.fill",
             accessibilityDescription: presentation.status
         )
+        filterBar.render(snapshot)
         statusImage.contentTintColor = presentation.color
         statusField.stringValue = presentation.status
         statusField.toolTip = presentation.status
