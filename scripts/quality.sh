@@ -23,7 +23,7 @@ Usage: scripts/quality.sh <mode>
 Modes:
   staged       Check staged whitespace and staged Swift files.
   full         Check the worktree, project generation, packages, and app tests.
-  ci           Run the full checks plus CI-only project synchronization checks.
+  ci           Like full, but check committed whitespace instead of the worktree.
   format       Format all Swift source files in place.
   ui           Run the macOS UI test target explicitly.
 EOF
@@ -208,7 +208,13 @@ check_xcodegen_sync() {
         fail "XcodeGen could not regenerate the project"
     fi
 
-    if ! diff -ruN "$REPO_ROOT/ProxyLens.xcodeproj" "$temporary_directory/ProxyLens.xcodeproj"; then
+    if ! diff -ruN \
+        --exclude=.DS_Store \
+        --exclude=xcuserdata \
+        --exclude=swiftpm \
+        --exclude='*.xcuserstate' \
+        "$REPO_ROOT/ProxyLens.xcodeproj" \
+        "$temporary_directory/ProxyLens.xcodeproj"; then
         rm -rf -- "$temporary_directory"
         fail "ProxyLens.xcodeproj is out of sync with project.yml"
     fi

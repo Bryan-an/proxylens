@@ -27,6 +27,9 @@ The `core.hooksPath` setting belongs to the local clone and is not transferred t
 # Full local checks; normally run by pre-push.
 ./scripts/quality.sh full
 
+# Reproduce the GitHub Actions quality job.
+./scripts/quality.sh ci
+
 # Format Swift sources explicitly when needed.
 ./scripts/quality.sh format
 
