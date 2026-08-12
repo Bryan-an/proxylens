@@ -14,6 +14,7 @@ public actor NIOProxyEngine: ProxyEngine {
     private let maximumCapturedBodyBytes: Int64
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSConfiguration: UpstreamTLSConfiguration
+    private let ruleSnapshot: (any RuleSnapshotSource)?
 
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
     private var serverChannel: Channel?
@@ -26,7 +27,8 @@ public actor NIOProxyEngine: ProxyEngine {
         bodyStore: (any BodyStore)? = nil,
         maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
         certificateProvider: (any CertificateProvider)? = nil,
-        upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration()
+        upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration(),
+        ruleSnapshot: (any RuleSnapshotSource)? = nil
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
         self.eventSink = eventSink
@@ -35,6 +37,7 @@ public actor NIOProxyEngine: ProxyEngine {
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
         self.certificateProvider = certificateProvider
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
+        self.ruleSnapshot = ruleSnapshot
     }
 
     public func start(configuration: ProxyConfiguration, sessionID: SessionID) async throws {
@@ -77,7 +80,8 @@ public actor NIOProxyEngine: ProxyEngine {
                         bodyStore,
                         maximumCapturedBodyBytes,
                         certificateProvider,
-                        upstreamTLSContext
+                        upstreamTLSContext,
+                        ruleSnapshot
                     ] channel in
                     channel.eventLoop.makeCompletedFuture(
                         Result {
@@ -91,7 +95,8 @@ public actor NIOProxyEngine: ProxyEngine {
                                     maximumCapturedBodyBytes: maximumCapturedBodyBytes,
                                     interceptHTTPS: interceptHTTPS,
                                     certificateProvider: certificateProvider,
-                                    upstreamTLSContext: upstreamTLSContext
+                                    upstreamTLSContext: upstreamTLSContext,
+                                    ruleSnapshot: ruleSnapshot
                                 )
                             )
                         }

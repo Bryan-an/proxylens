@@ -39,9 +39,9 @@ public enum FlowState: Codable, Equatable, Hashable, Sendable {
             }
         case .receivingRequest:
             switch nextState {
-            case .connectingUpstream, .cancelled, .failed:
+            case .connectingUpstream, .receivingResponse, .cancelled, .failed:
                 true
-            case .created, .receivingRequest, .receivingResponse, .completed:
+            case .created, .receivingRequest, .completed:
                 false
             }
         case .connectingUpstream:

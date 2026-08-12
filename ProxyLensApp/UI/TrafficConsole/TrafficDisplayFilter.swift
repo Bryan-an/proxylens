@@ -224,6 +224,11 @@ struct TrafficDisplayFilter: Equatable, Sendable {
             fields.append(contentsOf: headerFields(response.headers))
             appendBodyMetadata(response.body, to: &fields)
         }
+        for trace in flow.ruleTraces {
+            fields.append(trace.ruleName ?? "")
+            fields.append(trace.phase.rawValue)
+            fields.append(String(describing: trace.outcome))
+        }
         return fields
     }
 

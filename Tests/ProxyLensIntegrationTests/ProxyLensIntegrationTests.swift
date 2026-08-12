@@ -689,6 +689,59 @@ final class ProxyLensIntegrationTests: XCTestCase {
         window.contentViewController = nil
     }
 
+    func testInspectorShowsAppliedRuleTraces() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        var flow = try Self.makeFlow(index: 7, host: "ads.example.com", statusCode: 403)
+        flow.appendRuleTrace(
+            RuleTrace(
+                ruleID: RuleID(),
+                phase: .requestHeaders,
+                outcome: .applied,
+                ruleName: "Block ads.example.com"
+            )
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        XCTAssertTrue(viewModel.snapshot.inspection.rules.contains("Block ads.example.com"))
+        XCTAssertTrue(viewModel.snapshot.inspection.rules.contains("applied"))
+
+        var filter = TrafficDisplayFilter()
+        filter.searchText = "Block ads.example.com"
+        XCTAssertTrue(filter.matches(flow))
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let messageSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.message" }
+            )
+        )
+        messageSelector.selectedSegment = 2
+        messageSelector.sendAction(messageSelector.action, to: messageSelector.target)
+        let inspector = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+            )
+        )
+        XCTAssertTrue(inspector.string.contains("Block ads.example.com"))
+        XCTAssertTrue(inspector.string.contains("requestHeaders"))
+    }
+
     private static var captureConfiguration: CaptureConfiguration {
         CaptureConfiguration(
             proxy: ProxyConfiguration(

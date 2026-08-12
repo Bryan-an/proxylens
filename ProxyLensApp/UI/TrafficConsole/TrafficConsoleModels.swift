@@ -108,12 +108,14 @@ struct TrafficFlowInspection: Equatable, Sendable {
     let title: String
     let request: TrafficMessageInspection?
     let response: TrafficMessageInspection?
+    let rules: String
 
     static let empty = TrafficFlowInspection(
         flowID: nil,
         title: "No Flow Selected",
         request: nil,
-        response: nil
+        response: nil,
+        rules: "Select a captured flow to inspect applied rules."
     )
 }
 

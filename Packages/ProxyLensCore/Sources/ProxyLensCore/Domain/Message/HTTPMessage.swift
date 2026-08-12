@@ -57,6 +57,17 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
     public mutating func attachBody(_ body: BodyReference) {
         self.body = body
     }
+
+    public func replacingHeaders(_ headers: HTTPHeaders) -> HTTPRequest {
+        HTTPRequest(
+            method: method,
+            url: url,
+            headers: headers,
+            body: body,
+            version: version,
+            rawTarget: rawTarget
+        )
+    }
 }
 
 public struct HTTPResponse: Codable, Equatable, Hashable, Sendable {
@@ -86,5 +97,19 @@ public struct HTTPResponse: Codable, Equatable, Hashable, Sendable {
 
     public mutating func attachBody(_ body: BodyReference) {
         self.body = body
+    }
+
+    public func replacingHeaders(_ headers: HTTPHeaders) -> HTTPResponse {
+        do {
+            return try HTTPResponse(
+                statusCode: statusCode,
+                reasonPhrase: reasonPhrase,
+                headers: headers,
+                body: body,
+                version: version
+            )
+        } catch {
+            preconditionFailure("Replacing headers must preserve a valid HTTP status code")
+        }
     }
 }

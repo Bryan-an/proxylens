@@ -34,11 +34,13 @@ final class CompositionRoot {
             downstream: flowEvents
         )
         let certificateProvider = KeychainCertificateProvider()
+        let ruleEngine = RuleEngine()
         let proxyEngine = NIOProxyEngine(
             eventSink: persistenceSink,
             bodyStore: bodyStore,
             maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes,
-            certificateProvider: certificateProvider
+            certificateProvider: certificateProvider,
+            ruleSnapshot: ruleEngine.snapshot
         )
         let systemProxyController = MacOSSystemProxyController(
             snapshotURL:
@@ -65,7 +67,8 @@ final class CompositionRoot {
                     listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 9_090),
                     interceptHTTPS: true
                 )
-            )
+            ),
+            ruleEngine: ruleEngine
         )
     }
 }

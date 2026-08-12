@@ -461,16 +461,19 @@ Matcher + phase + action
 
 Keep matching and rule planning in `ProxyLensCore`. Keep file reads, breakpoint waits, and other asynchronous work in `ProxyLensApplication` or an adapter.
 
-P0 rules:
+P0 rules currently implemented in the shared pipeline:
 
+- Block and Allow, evaluated during request headers. The first matching allow or block terminates later block/allow rules in that phase.
+- No-cache request and response header rewriting.
 - Display/filter matching.
+
+Still to implement on the same pipeline:
+
 - Map Local.
 - Map Remote.
 - Breakpoint for request and response editing.
-- Block/Allow.
-- No-cache response behavior.
 
-The same pipeline should support future throttling and scripting rather than creating independent special-case systems.
+Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.
 
 ## Security and platform boundaries
 

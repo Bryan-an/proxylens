@@ -208,6 +208,265 @@ final class ProxyLensCoreTests: XCTestCase {
         )
     }
 
+    func testRulePlannerAppliesBlockAllowAndNoCacheInPriorityOrder() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://ads.example.com/pixel.gif")!
+        )
+        let context = RuleMatchContext(request: request)
+        let recordedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let allowID = RuleID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
+        let blockID = RuleID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!)
+        let noCacheID = RuleID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!)
+        let mapLocalID = RuleID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!)
+        let rules = RuleSet(rules: [
+            Rule(
+                id: noCacheID,
+                name: "No cache ads",
+                priority: 0,
+                phase: .requestHeaders,
+                matcher: .host(.exact("ads.example.com")),
+                action: .noCache
+            ),
+            Rule(
+                id: allowID,
+                name: "Allow ads",
+                priority: 10,
+                phase: .requestHeaders,
+                matcher: .host(.exact("ads.example.com")),
+                action: .allow
+            ),
+            Rule(
+                id: blockID,
+                name: "Block ads",
+                priority: 20,
+                phase: .requestHeaders,
+                matcher: .any,
+                action: .block(reason: "blocked by default")
+            ),
+            Rule(
+                id: mapLocalID,
+                name: "Map local ads",
+                priority: 30,
+                phase: .requestHeaders,
+                matcher: .host(.exact("ads.example.com")),
+                action: .mapLocal(resourceID: "pixel.json")
+            )
+        ])
+
+        let plan = RulePlanner.plan(
+            rules: rules,
+            context: context,
+            phase: .requestHeaders,
+            recordedAt: recordedAt
+        )
+
+        XCTAssertFalse(plan.shouldBlock)
+        XCTAssertNil(plan.blockReason)
+        XCTAssertTrue(plan.applyNoCache)
+        XCTAssertEqual(plan.traces.map(\.ruleID), [noCacheID, allowID, blockID, mapLocalID])
+        XCTAssertEqual(
+            plan.traces.map(\.ruleName),
+            ["No cache ads", "Allow ads", "Block ads", "Map local ads"]
+        )
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [
+                .applied,
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason),
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+        XCTAssertTrue(plan.traces.allSatisfy { $0.recordedAt == recordedAt })
+        XCTAssertTrue(plan.traces.allSatisfy { $0.phase == .requestHeaders })
+    }
+
+    func testRulePlannerAppliesNoCacheAfterAllowOrBlock() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://cdn.example.com/app.js")!
+        )
+        let context = RuleMatchContext(request: request)
+        let allowThenNoCache = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow cdn",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("cdn.example.com")),
+                    action: .allow
+                ),
+                Rule(
+                    name: "No cache cdn",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("cdn.example.com")),
+                    action: .noCache
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(allowThenNoCache.shouldBlock)
+        XCTAssertTrue(allowThenNoCache.applyNoCache)
+        XCTAssertEqual(
+            allowThenNoCache.traces.map(\.outcome),
+            [.applied, .applied]
+        )
+
+        let blockThenNoCache = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block cdn",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("cdn.example.com")),
+                    action: .block(reason: "blocked host")
+                ),
+                Rule(
+                    name: "No cache cdn",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("cdn.example.com")),
+                    action: .noCache
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertTrue(blockThenNoCache.shouldBlock)
+        XCTAssertTrue(blockThenNoCache.applyNoCache)
+        XCTAssertEqual(
+            blockThenNoCache.traces.map(\.outcome),
+            [.applied, .applied]
+        )
+    }
+
+    func testRulePlannerSkipsUnimplementedActions() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
+        let rule = Rule(
+            name: "Map remote",
+            phase: .requestHeaders,
+            action: .mapRemote(url: URL(string: "https://other.example.com/")!)
+        )
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [rule]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(plan.shouldBlock)
+        XCTAssertFalse(plan.applyNoCache)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [.skipped(reason: RulePlanner.Decision.unimplementedActionReason)]
+        )
+    }
+
+    func testRulePlannerBlocksWhenNoAllowRuleMatchesFirst() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://tracker.example.com/collect")!
+        )
+        let block = Rule(
+            name: "Block tracker",
+            priority: 0,
+            phase: .requestHeaders,
+            matcher: .host(.exact("tracker.example.com")),
+            action: .block(reason: "tracker")
+        )
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [block]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertTrue(plan.shouldBlock)
+        XCTAssertEqual(plan.blockReason, "tracker")
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied])
+    }
+
+    func testRulePlannerSkipsBlockAllowOutsideRequestHeaders() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
+        let response = try HTTPResponse(statusCode: 200)
+        let block = Rule(
+            name: "Late block",
+            phase: .responseHeaders,
+            action: .block(reason: "too late")
+        )
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [block]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseHeaders
+        )
+
+        XCTAssertFalse(plan.shouldBlock)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [.skipped(reason: RulePlanner.Decision.blockAllowPhaseReason)]
+        )
+    }
+
+    func testNoCacheHeadersRewriteRequestAndResponse() throws {
+        let requestHeaders = HTTPHeaders([
+            try HTTPHeader(name: "Accept", value: "text/html"),
+            try HTTPHeader(name: "If-None-Match", value: "\"abc\""),
+            try HTTPHeader(name: "If-Modified-Since", value: "Wed, 21 Oct 2015 07:28:00 GMT"),
+            try HTTPHeader(name: "Cache-Control", value: "max-age=60")
+        ])
+        let rewrittenRequest = try NoCacheHeaders.applyingToRequest(requestHeaders)
+        XCTAssertEqual(rewrittenRequest.firstValue(for: "Accept"), "text/html")
+        XCTAssertEqual(rewrittenRequest.firstValue(for: "Cache-Control"), "no-cache")
+        XCTAssertEqual(rewrittenRequest.firstValue(for: "Pragma"), "no-cache")
+        XCTAssertFalse(rewrittenRequest.contains(name: "If-None-Match"))
+        XCTAssertFalse(rewrittenRequest.contains(name: "If-Modified-Since"))
+
+        let responseHeaders = HTTPHeaders([
+            try HTTPHeader(name: "Content-Type", value: "text/html"),
+            try HTTPHeader(name: "ETag", value: "\"abc\""),
+            try HTTPHeader(name: "Age", value: "12"),
+            try HTTPHeader(name: "Last-Modified", value: "Wed, 21 Oct 2015 07:28:00 GMT"),
+            try HTTPHeader(name: "Cache-Control", value: "public, max-age=3600")
+        ])
+        let rewrittenResponse = try NoCacheHeaders.applyingToResponse(responseHeaders)
+        XCTAssertEqual(rewrittenResponse.firstValue(for: "Content-Type"), "text/html")
+        XCTAssertEqual(
+            rewrittenResponse.firstValue(for: "Cache-Control"),
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
+        XCTAssertEqual(rewrittenResponse.firstValue(for: "Pragma"), "no-cache")
+        XCTAssertEqual(rewrittenResponse.firstValue(for: "Expires"), "0")
+        XCTAssertFalse(rewrittenResponse.contains(name: "ETag"))
+        XCTAssertFalse(rewrittenResponse.contains(name: "Age"))
+        XCTAssertFalse(rewrittenResponse.contains(name: "Last-Modified"))
+    }
+
+    func testFlowCanServeALocalResponseWithoutConnectingUpstream() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "http://blocked.example.com/")!)
+        var flow = Flow(sessionID: SessionID(), request: request)
+        try flow.transition(to: .receivingRequest)
+        try flow.transition(to: .receivingResponse)
+
+        let response = try HTTPResponse(statusCode: 403, reasonPhrase: "Forbidden")
+        flow.attachResponse(response)
+        try flow.transition(to: .completed)
+
+        XCTAssertEqual(flow.state, .completed)
+        XCTAssertEqual(flow.response?.statusCode, 403)
+    }
+
+    func testMutableRuleSnapshotPublishesReplacements() {
+        let snapshot = MutableRuleSnapshot()
+        XCTAssertEqual(snapshot.currentRules(), RuleSet())
+
+        let rule = Rule(name: "Block ads", phase: .requestHeaders, action: .block(reason: "ads"))
+        snapshot.replace(RuleSet(rules: [rule]))
+        XCTAssertEqual(snapshot.currentRules().rules.map(\.name), ["Block ads"])
+    }
+
     func testFlowRoundTripsThroughCodable() throws {
         let request = HTTPRequest(
             method: .get,

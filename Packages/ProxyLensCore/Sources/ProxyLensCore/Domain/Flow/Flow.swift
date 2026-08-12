@@ -102,6 +102,14 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
         ruleTraces.append(trace)
     }
 
+    public mutating func appendRuleTraces(_ traces: [RuleTrace]) {
+        ruleTraces.append(contentsOf: traces)
+    }
+
+    public mutating func replaceRequest(_ request: HTTPRequest) {
+        self.request = request
+    }
+
     public mutating func markRequestHeadersReceived(at date: Date) {
         timing.markRequestHeadersReceived(at: date)
     }

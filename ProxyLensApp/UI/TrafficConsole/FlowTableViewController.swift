@@ -2,7 +2,9 @@ import AppKit
 import ProxyLensCore
 
 @MainActor
-final class FlowTableViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+final class FlowTableViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate,
+    NSMenuDelegate
+{
     private let viewModel: TrafficConsoleViewModel
     private let tableView: NSTableView
     private let emptyLabel = NSTextField(labelWithString: "No traffic captured yet")
@@ -32,6 +34,10 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         tableView.dataSource = self
         tableView.delegate = self
         tableView.setAccessibilityIdentifier("traffic.flows")
+
+        let menu = NSMenu()
+        menu.delegate = self
+        tableView.menu = menu
 
         for column in FlowColumn.allCases {
             let tableColumn = NSTableColumn(
@@ -220,6 +226,53 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             return
         }
         viewModel.sortRows(by: key, ascending: descriptor.ascending)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let rowIndex = tableView.clickedRow
+        guard rows.indices.contains(rowIndex) else {
+            return
+        }
+
+        let host = rows[rowIndex].host
+        menu.addItem(ruleMenuItem(title: "Block \(host)", host: host, action: #selector(blockHost)))
+        menu.addItem(ruleMenuItem(title: "Allow \(host)", host: host, action: #selector(allowHost)))
+        menu.addItem(
+            ruleMenuItem(
+                title: "Disable Caching for \(host)",
+                host: host,
+                action: #selector(disableCaching)
+            )
+        )
+    }
+
+    private func ruleMenuItem(title: String, host: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = host
+        return item
+    }
+
+    @objc private func blockHost(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        viewModel.blockHost(host)
+    }
+
+    @objc private func allowHost(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        viewModel.allowHost(host)
+    }
+
+    @objc private func disableCaching(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        viewModel.disableCaching(forHost: host)
     }
 }
 

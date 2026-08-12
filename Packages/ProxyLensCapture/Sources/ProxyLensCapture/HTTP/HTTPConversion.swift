@@ -13,6 +13,14 @@ enum HTTPConversion {
         return result
     }
 
+    static func nioHeaders(from headers: ProxyLensCore.HTTPHeaders) -> NIOHTTP1.HTTPHeaders {
+        var result = NIOHTTP1.HTTPHeaders()
+        for field in headers {
+            result.add(name: field.name, value: field.value)
+        }
+        return result
+    }
+
     static func coreVersion(from version: NIOHTTP1.HTTPVersion) throws -> ProxyLensCore.HTTPVersion
     {
         guard version.major == 1, version.minor == 0 || version.minor == 1 else {

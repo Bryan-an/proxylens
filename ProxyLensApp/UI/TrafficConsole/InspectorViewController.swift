@@ -4,7 +4,7 @@ import AppKit
 final class InspectorViewController: NSViewController {
     private let titleField = NSTextField(labelWithString: "No Flow Selected")
     private let messageSelector = NSSegmentedControl(
-        labels: ["Request", "Response"],
+        labels: ["Request", "Response", "Rules"],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -92,9 +92,12 @@ final class InspectorViewController: NSViewController {
     func render(_ snapshot: TrafficConsoleSnapshot) {
         inspection = snapshot.inspection
         titleField.stringValue = inspection.title
-        messageSelector.isEnabled = inspection.request != nil
+        messageSelector.isEnabled = inspection.flowID != nil
+        messageSelector.setEnabled(inspection.request != nil, forSegment: 0)
         messageSelector.setEnabled(inspection.response != nil, forSegment: 1)
-        sectionSelector.isEnabled = inspection.request != nil
+        messageSelector.setEnabled(inspection.flowID != nil, forSegment: 2)
+        sectionSelector.isEnabled =
+            inspection.request != nil && messageSelector.selectedSegment != 2
         if inspection.response == nil, messageSelector.selectedSegment == 1 {
             messageSelector.selectedSegment = 0
         }
@@ -106,6 +109,12 @@ final class InspectorViewController: NSViewController {
     }
 
     private func updateContent() {
+        sectionSelector.isEnabled = inspection.flowID != nil && messageSelector.selectedSegment != 2
+        if messageSelector.selectedSegment == 2 {
+            textView.string = inspection.rules
+            textView.scrollToBeginningOfDocument(nil)
+            return
+        }
         guard let message = selectedMessage else {
             textView.string = "Select a captured flow to inspect its request and response."
             return

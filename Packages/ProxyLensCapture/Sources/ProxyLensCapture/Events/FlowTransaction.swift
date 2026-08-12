@@ -45,6 +45,48 @@ actor FlowTransaction {
         }
     }
 
+    func appendRuleTraces(_ traces: [RuleTrace]) async {
+        guard !isFinished, !traces.isEmpty else {
+            return
+        }
+
+        flow.appendRuleTraces(traces)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func replaceRequest(_ request: HTTPRequest) async {
+        guard !isFinished else {
+            return
+        }
+
+        flow.replaceRequest(request)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func serveLocalResponse(_ response: HTTPResponse, at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+
+        if flow.state == .created {
+            try? flow.transition(to: .receivingRequest)
+            flow.markRequestHeadersReceived(at: date)
+        }
+        if !requestBodyIsComplete {
+            flow.markRequestBodyCompleted(at: date)
+            requestBodyIsComplete = true
+        }
+        if flow.state == .receivingRequest {
+            try? flow.transition(to: .receivingResponse)
+        }
+
+        flow.attachResponse(response)
+        flow.markResponseHeadersReceived(at: date)
+        flow.markResponseBodyCompleted(at: date)
+        responseBodyIsComplete = true
+        await complete(at: date)
+    }
+
     func markUpstreamConnected(at date: Date) async {
         guard !isFinished else {
             return
@@ -105,7 +147,7 @@ actor FlowTransaction {
 
     private func complete(at date: Date) async {
         if flow.state == .receivingRequest {
-            try? flow.transition(to: .connectingUpstream)
+            try? flow.transition(to: .receivingResponse)
         }
         if flow.state == .connectingUpstream {
             try? flow.transition(to: .receivingResponse)

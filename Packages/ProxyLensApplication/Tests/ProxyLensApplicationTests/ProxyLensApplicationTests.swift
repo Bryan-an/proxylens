@@ -5,6 +5,54 @@ import XCTest
 @testable import ProxyLensApplication
 
 final class ProxyLensApplicationTests: XCTestCase {
+    func testRuleEnginePublishesHostRulesToTheSharedSnapshot() async {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+
+        let blocked = await engine.blockHost("ads.example.com", reason: "tracker")
+        let allowed = await engine.allowHost("api.example.com")
+        let noCache = await engine.disableCaching(forHost: "cdn.example.com")
+
+        let rules = snapshot.currentRules()
+        XCTAssertEqual(rules.rules.map(\.id), [blocked.id, allowed.id] + noCache.map(\.id))
+        XCTAssertEqual(
+            rules.matchingRules(
+                for: RuleMatchContext(
+                    request: HTTPRequest(
+                        method: .get,
+                        url: URL(string: "https://ads.example.com/pixel")!
+                    )
+                ),
+                phase: .requestHeaders
+            ).map(\.action),
+            [.block(reason: "tracker")]
+        )
+        XCTAssertEqual(
+            rules.matchingRules(
+                for: RuleMatchContext(
+                    request: HTTPRequest(
+                        method: .get,
+                        url: URL(string: "https://api.example.com/v1")!
+                    )
+                ),
+                phase: .requestHeaders
+            ).map(\.action),
+            [.allow]
+        )
+        XCTAssertEqual(
+            rules.matchingRules(
+                for: RuleMatchContext(
+                    request: HTTPRequest(
+                        method: .get,
+                        url: URL(string: "https://cdn.example.com/app.js")!
+                    )
+                ),
+                phase: .responseHeaders
+            ).map(\.action),
+            [.noCache]
+        )
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()

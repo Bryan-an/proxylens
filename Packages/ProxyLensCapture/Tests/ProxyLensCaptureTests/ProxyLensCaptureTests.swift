@@ -145,6 +145,236 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
+    func testHTTPBlockRuleReturnsForbiddenWithoutConnectingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block fixture",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .block(reason: "blocked fixture")
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+        let sessionID = SessionID()
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: sessionID
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/blocked",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 403)
+            XCTAssertEqual(String(data: response.body, encoding: .utf8), "blocked fixture\n")
+            XCTAssertEqual(upstream.requestCount, 0)
+
+            await eventSink.waitForFinished()
+            let blockedEvents = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                blockedEvents.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(finishedFlow.state, .completed)
+            XCTAssertEqual(finishedFlow.response?.statusCode, 403)
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Block fixture"])
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertNil(finishedFlow.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPAllowRuleOverridesLaterCatchAllBlock() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "allowed upstream")
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow fixture",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .allow
+                ),
+                Rule(
+                    name: "Block all",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .block(reason: "blocked by default")
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/allowed",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("allowed upstream".utf8))
+            XCTAssertEqual(upstream.requestCount, 1)
+
+            await eventSink.waitForFinished()
+            let allowedEvents = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                allowedEvents.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Allow fixture", "Block all"])
+            XCTAssertEqual(
+                finishedFlow.ruleTraces.map(\.outcome),
+                [
+                    .applied,
+                    .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+                ]
+            )
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPNoCacheRuleRewritesRequestAndResponseHeaders() async throws {
+        let upstream = try await TestHTTPServer.start(
+            responseBody: "cached asset",
+            extraResponseHeaders: [
+                ("Cache-Control", "public, max-age=3600"),
+                ("ETag", "\"abc\""),
+                ("Age", "12")
+            ]
+        )
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "No cache request",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .noCache
+                ),
+                Rule(
+                    name: "No cache response",
+                    phase: .responseHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .noCache
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/asset.js",
+                through: proxyEndpoint,
+                extraHeaders: [("If-None-Match", "\"abc\"")]
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(upstream.requestHeader("Cache-Control"), "no-cache")
+            XCTAssertEqual(upstream.requestHeader("Pragma"), "no-cache")
+            XCTAssertNil(upstream.requestHeader("If-None-Match"))
+            XCTAssertEqual(
+                response.header("Cache-Control"),
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            XCTAssertEqual(response.header("Pragma"), "no-cache")
+            XCTAssertEqual(response.header("Expires"), "0")
+            XCTAssertNil(response.header("ETag"))
+            XCTAssertNil(response.header("Age"))
+
+            await eventSink.waitForFinished()
+            let noCacheEvents = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                noCacheEvents.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(
+                finishedFlow.request.headers.firstValue(for: "Cache-Control"),
+                "no-cache"
+            )
+            XCTAssertEqual(
+                finishedFlow.response?.headers.firstValue(for: "Cache-Control"),
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            XCTAssertEqual(
+                finishedFlow.ruleTraces.map(\.ruleName),
+                ["No cache request", "No cache response"]
+            )
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
     func testHTTPForwardingStreamsAndPersistsRawBodies() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
         let storageRoot = FileManager.default.temporaryDirectory
@@ -497,7 +727,12 @@ private actor RecordingFlowEventSink: FlowEventSink {
 
 private struct HTTPTestResponse: Sendable {
     let statusCode: UInt
+    let headers: [(String, String)]
     let body: Data
+
+    func header(_ name: String) -> String? {
+        headers.first { $0.0.lowercased() == name.lowercased() }?.1
+    }
 }
 
 private enum HTTPSTestClient {
@@ -718,8 +953,18 @@ private final class TLSHandshakeHandler: ChannelInboundHandler {
 }
 
 private enum HTTPTestClient {
-    static func get(url: String, through proxy: NetworkEndpoint) async throws -> HTTPTestResponse {
-        try await request(method: .GET, url: url, body: nil, through: proxy)
+    static func get(
+        url: String,
+        through proxy: NetworkEndpoint,
+        extraHeaders: [(String, String)] = []
+    ) async throws -> HTTPTestResponse {
+        try await request(
+            method: .GET,
+            url: url,
+            body: nil,
+            through: proxy,
+            extraHeaders: extraHeaders
+        )
     }
 
     static func post(
@@ -779,7 +1024,8 @@ private enum HTTPTestClient {
         method: NIOHTTP1.HTTPMethod,
         url: String,
         body: Data?,
-        through proxy: NetworkEndpoint
+        through proxy: NetworkEndpoint,
+        extraHeaders: [(String, String)] = []
     ) async throws -> HTTPTestResponse {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
@@ -801,6 +1047,9 @@ private enum HTTPTestClient {
                 headers.add(name: "Host", value: "\(host)\(port)")
             }
             headers.add(name: "Connection", value: "close")
+            for (name, value) in extraHeaders {
+                headers.add(name: name, value: value)
+            }
             if let body {
                 headers.add(name: "Content-Length", value: "\(body.count)")
                 headers.add(name: "Content-Type", value: "text/plain")
@@ -836,6 +1085,7 @@ private final class HTTPTestResponseHandler: ChannelInboundHandler {
 
     private let promise: EventLoopPromise<HTTPTestResponse>
     private var statusCode: UInt = 0
+    private var headers: [(String, String)] = []
     private var body = Data()
 
     init(promise: EventLoopPromise<HTTPTestResponse>) {
@@ -846,12 +1096,15 @@ private final class HTTPTestResponseHandler: ChannelInboundHandler {
         switch Self.unwrapInboundIn(data) {
         case .head(let head):
             statusCode = head.status.code
+            headers = head.headers.map { ($0.0, $0.1) }
         case .body(var buffer):
             if let bytes = buffer.readBytes(length: buffer.readableBytes) {
                 body.append(contentsOf: bytes)
             }
         case .end:
-            promise.succeed(HTTPTestResponse(statusCode: statusCode, body: body))
+            promise.succeed(
+                HTTPTestResponse(statusCode: statusCode, headers: headers, body: body)
+            )
             context.close(promise: nil)
         }
     }
@@ -867,8 +1120,21 @@ private final class TestHTTPServer {
 
     private let group: MultiThreadedEventLoopGroup
     private let channel: Channel
+    private let state: TestHTTPServerState
 
-    private init(group: MultiThreadedEventLoopGroup, channel: Channel) throws {
+    var requestCount: Int {
+        state.requestCount
+    }
+
+    func requestHeader(_ name: String) -> String? {
+        state.headerValue(name)
+    }
+
+    private init(
+        group: MultiThreadedEventLoopGroup,
+        channel: Channel,
+        state: TestHTTPServerState
+    ) throws {
         guard let address = channel.localAddress,
             let port = address.port,
             let boundPort = UInt16(exactly: port)
@@ -878,14 +1144,22 @@ private final class TestHTTPServer {
 
         self.group = group
         self.channel = channel
+        self.state = state
         self.endpoint = NetworkEndpoint(
             host: address.ipAddress ?? "127.0.0.1",
             port: boundPort
         )
     }
 
-    static func start(responseBody: String) async throws -> TestHTTPServer {
-        try await start(responseBody: responseBody, tlsContext: nil)
+    static func start(
+        responseBody: String,
+        extraResponseHeaders: [(String, String)] = []
+    ) async throws -> TestHTTPServer {
+        try await start(
+            responseBody: responseBody,
+            tlsContext: nil,
+            extraResponseHeaders: extraResponseHeaders
+        )
     }
 
     static func startHanging() async throws -> TestHTTPServer {
@@ -905,9 +1179,11 @@ private final class TestHTTPServer {
     private static func start(
         responseBody: String,
         tlsContext: NIOSSLContext?,
-        responds: Bool = true
+        responds: Bool = true,
+        extraResponseHeaders: [(String, String)] = []
     ) async throws -> TestHTTPServer {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let state = TestHTTPServerState()
         do {
             let channel = try await ServerBootstrap(group: group)
                 .serverChannelOption(ChannelOptions.backlog, value: 16)
@@ -928,7 +1204,9 @@ private final class TestHTTPServer {
                             try operations.addHandler(
                                 TestHTTPServerHandler(
                                     responseBody: responseBody,
-                                    responds: responds
+                                    responds: responds,
+                                    extraResponseHeaders: extraResponseHeaders,
+                                    state: state
                                 )
                             )
                         }
@@ -936,7 +1214,7 @@ private final class TestHTTPServer {
                 }
                 .bind(host: "127.0.0.1", port: 0)
                 .get()
-            return try TestHTTPServer(group: group, channel: channel)
+            return try TestHTTPServer(group: group, channel: channel, state: state)
         } catch {
             await shutdown(group)
             throw error
@@ -949,23 +1227,57 @@ private final class TestHTTPServer {
     }
 }
 
+private final class TestHTTPServerState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requestCountValue = 0
+    private var lastRequestHeaders: [(String, String)] = []
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestCountValue
+    }
+
+    func recordRequest(headers: NIOHTTP1.HTTPHeaders) {
+        lock.lock()
+        defer { lock.unlock() }
+        requestCountValue += 1
+        lastRequestHeaders = headers.map { ($0.0, $0.1) }
+    }
+
+    func headerValue(_ name: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastRequestHeaders.first { $0.0.lowercased() == name.lowercased() }?.1
+    }
+}
+
 private final class TestHTTPServerHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
     private let responseBody: String
     private let responds: Bool
+    private let extraResponseHeaders: [(String, String)]
+    private let state: TestHTTPServerState
     private var requestBody = Data()
 
-    init(responseBody: String, responds: Bool) {
+    init(
+        responseBody: String,
+        responds: Bool,
+        extraResponseHeaders: [(String, String)],
+        state: TestHTTPServerState
+    ) {
         self.responseBody = responseBody
         self.responds = responds
+        self.extraResponseHeaders = extraResponseHeaders
+        self.state = state
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch Self.unwrapInboundIn(data) {
-        case .head:
-            break
+        case .head(let head):
+            state.recordRequest(headers: head.headers)
         case .body(var buffer):
             if let bytes = buffer.readBytes(length: buffer.readableBytes) {
                 requestBody.append(contentsOf: bytes)
@@ -987,6 +1299,9 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
             headers.add(name: "Content-Type", value: "text/plain")
             headers.add(name: "Content-Length", value: "\(body.readableBytes)")
             headers.add(name: "Connection", value: "close")
+            for (name, value) in extraResponseHeaders {
+                headers.add(name: name, value: value)
+            }
 
             let head = HTTPResponseHead(
                 version: .http1_1,

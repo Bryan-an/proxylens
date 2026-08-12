@@ -36,6 +36,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let bodyReader: any TrafficBodyReading
     private let captureConfiguration: CaptureConfiguration
     private let eventBatchDelay: Duration
+    private let ruleEngine: RuleEngine?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -52,13 +53,15 @@ final class TrafficConsoleViewModel: ObservableObject {
         eventSource: any TrafficFlowEventStreaming,
         bodyReader: any TrafficBodyReading,
         captureConfiguration: CaptureConfiguration,
-        eventBatchDelay: Duration = .milliseconds(40)
+        eventBatchDelay: Duration = .milliseconds(40),
+        ruleEngine: RuleEngine? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
         self.bodyReader = bodyReader
         self.captureConfiguration = captureConfiguration
         self.eventBatchDelay = eventBatchDelay
+        self.ruleEngine = ruleEngine
     }
 
     deinit {
@@ -151,6 +154,18 @@ final class TrafficConsoleViewModel: ObservableObject {
     func clearSort() {
         store.setSort(nil)
         publishSnapshot()
+    }
+
+    func blockHost(_ host: String) {
+        Task { await ruleEngine?.blockHost(host) }
+    }
+
+    func allowHost(_ host: String) {
+        Task { await ruleEngine?.allowHost(host) }
+    }
+
+    func disableCaching(forHost host: String) {
+        Task { await ruleEngine?.disableCaching(forHost: host) }
     }
 
     private func updateDisplayFilter(_ update: (inout TrafficDisplayFilter) -> Void) {
@@ -297,7 +312,8 @@ final class TrafficConsoleViewModel: ObservableObject {
             },
             response: inspection.response.map {
                 TrafficMessageInspection(title: $0.title, headers: $0.headers, body: response)
-            }
+            },
+            rules: inspection.rules
         )
         publishSnapshot()
     }
@@ -321,7 +337,8 @@ final class TrafficConsoleViewModel: ObservableObject {
                     headers: responseHeadersText($0),
                     body: initialBody($0.body, emptyMessage: "This response has no body.")
                 )
-            }
+            },
+            rules: rulesText(flow.ruleTraces)
         )
     }
 
@@ -344,6 +361,33 @@ final class TrafficConsoleViewModel: ObservableObject {
     private static func messageText(firstLine: String, headers: HTTPHeaders) -> String {
         let fields = headers.map { "\($0.name): \($0.value)" }
         return ([firstLine] + fields).joined(separator: "\n")
+    }
+
+    private static func rulesText(_ traces: [RuleTrace]) -> String {
+        guard !traces.isEmpty else {
+            return "No rules applied to this flow."
+        }
+
+        return traces.map { trace in
+            let name: String
+            if let ruleName = trace.ruleName, !ruleName.isEmpty {
+                name = ruleName
+            } else {
+                name = trace.ruleID.description
+            }
+            let result: String
+            switch trace.outcome {
+            case .matched:
+                result = "matched"
+            case .applied:
+                result = "applied"
+            case .skipped(let reason):
+                result = "skipped (\(reason))"
+            case .failed(let message):
+                result = "failed (\(message))"
+            }
+            return "\(name)\nphase: \(trace.phase.rawValue)\noutcome: \(result)"
+        }.joined(separator: "\n\n")
     }
 
     private static func initialBody(
