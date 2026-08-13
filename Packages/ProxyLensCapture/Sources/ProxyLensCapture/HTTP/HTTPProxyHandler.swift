@@ -234,14 +234,42 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 return
             }
 
-            didFinishLocally = true
-            responseEnded = true
-            Task {
-                await transaction.start(at: Date())
-                await transaction.appendRuleTraces(requestPlan.traces)
-                await transaction.serveLocalResponse(blockedResponse, at: Date())
+            finishWithLocalResponse(
+                blockedResponse,
+                traces: requestPlan.traces,
+                transaction: transaction,
+                channel: context.channel
+            )
+            return
+        }
+
+        if let resourceID = requestPlan.mapLocalResourceID {
+            let mappedResponse: HTTPResponse
+            do {
+                let spec = try unwrapMappedLocalSpec(resourceID)
+                var response = try MappedLocalHTTPResponse.make(spec: spec, version: coreVersion)
+                if requestPlan.applyNoCache {
+                    response = response.replacingHeaders(
+                        try NoCacheHeaders.applyingToResponse(response.headers)
+                    )
+                }
+                mappedResponse = response
+            } catch {
+                sendError(
+                    statusCode: 500,
+                    reason: "Internal Server Error",
+                    message: error.localizedDescription,
+                    context: context
+                )
+                return
             }
-            sendLocalResponse(blockedResponse, channel: context.channel)
+
+            finishWithLocalResponse(
+                mappedResponse,
+                traces: requestPlan.traces,
+                transaction: transaction,
+                channel: context.channel
+            )
             return
         }
 
@@ -665,13 +693,39 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         )
     }
 
+    private func finishWithLocalResponse(
+        _ response: HTTPResponse,
+        traces: [RuleTrace],
+        transaction: FlowTransaction,
+        channel: Channel
+    ) {
+        didFinishLocally = true
+        responseEnded = true
+        Task {
+            await transaction.start(at: Date())
+            await transaction.appendRuleTraces(traces)
+            await transaction.serveLocalResponse(response, at: Date())
+        }
+        sendLocalResponse(response, channel: channel)
+    }
+
+    private func unwrapMappedLocalSpec(_ resourceID: String) throws -> MapLocalSpec {
+        guard let spec = ruleSnapshot?.mappedLocal(for: resourceID) else {
+            throw ProxyLensError.unsupportedOperation(
+                "Mapped local resource is unavailable: \(resourceID)"
+            )
+        }
+        return spec
+    }
+
     private func sendLocalResponse(_ response: HTTPResponse, channel: Channel) {
         let headers = HTTPConversion.nioHeaders(from: response.headers)
+        let status = HTTPResponseStatus(statusCode: response.statusCode)
         let head = HTTPResponseHead(
             version: response.version == .http10 ? .http1_0 : .http1_1,
             status: HTTPResponseStatus(
                 statusCode: response.statusCode,
-                reasonPhrase: response.reasonPhrase ?? BlockedHTTPResponse.reasonPhrase
+                reasonPhrase: response.reasonPhrase ?? status.reasonPhrase
             ),
             headers: headers
         )

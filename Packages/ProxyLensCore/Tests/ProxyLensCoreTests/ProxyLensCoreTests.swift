@@ -264,6 +264,7 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertFalse(plan.shouldBlock)
         XCTAssertNil(plan.blockReason)
         XCTAssertTrue(plan.applyNoCache)
+        XCTAssertEqual(plan.mapLocalResourceID, "pixel.json")
         XCTAssertEqual(plan.traces.map(\.ruleID), [noCacheID, allowID, blockID, mapLocalID])
         XCTAssertEqual(
             plan.traces.map(\.ruleName),
@@ -275,7 +276,7 @@ final class ProxyLensCoreTests: XCTestCase {
                 .applied,
                 .applied,
                 .skipped(reason: RulePlanner.Decision.alreadyDecidedReason),
-                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+                .applied
             ]
         )
         XCTAssertTrue(plan.traces.allSatisfy { $0.recordedAt == recordedAt })
@@ -343,6 +344,172 @@ final class ProxyLensCoreTests: XCTestCase {
             blockThenNoCache.traces.map(\.outcome),
             [.applied, .applied]
         )
+    }
+
+    func testRulePlannerAppliesMapLocalAfterAllowAndSkipsAfterBlock() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let context = RuleMatchContext(request: request)
+        let allowThenMap = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow api",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("api.example.com")),
+                    action: .allow
+                ),
+                Rule(
+                    name: "Map local users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapLocal(resourceID: "users.json")
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(allowThenMap.shouldBlock)
+        XCTAssertEqual(allowThenMap.mapLocalResourceID, "users.json")
+        XCTAssertEqual(allowThenMap.traces.map(\.outcome), [.applied, .applied])
+
+        let mapThenBlock = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local users",
+                    priority: 5,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapLocal(resourceID: "users.json")
+                ),
+                Rule(
+                    name: "Block all",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .block(reason: "blocked by default")
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(mapThenBlock.shouldBlock)
+        XCTAssertEqual(mapThenBlock.mapLocalResourceID, "users.json")
+        XCTAssertEqual(
+            mapThenBlock.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+
+        let blockThenMap = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block api",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("api.example.com")),
+                    action: .block(reason: "blocked host")
+                ),
+                Rule(
+                    name: "Map local users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapLocal(resourceID: "users.json")
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertTrue(blockThenMap.shouldBlock)
+        XCTAssertNil(blockThenMap.mapLocalResourceID)
+        XCTAssertEqual(
+            blockThenMap.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+
+        let firstMapWins = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local first",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .mapLocal(resourceID: "first.json")
+                ),
+                Rule(
+                    name: "Map local second",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .mapLocal(resourceID: "second.json")
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(firstMapWins.mapLocalResourceID, "first.json")
+        XCTAssertEqual(
+            firstMapWins.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyMappedReason)
+            ]
+        )
+    }
+
+    func testRulePlannerSkipsMapLocalOutsideRequestHeaders() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/users")!)
+        let response = try HTTPResponse(statusCode: 200)
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Late map local",
+                    phase: .responseHeaders,
+                    action: .mapLocal(resourceID: "users.json")
+                )
+            ]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseHeaders
+        )
+
+        XCTAssertNil(plan.mapLocalResourceID)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [.skipped(reason: RulePlanner.Decision.mapLocalPhaseReason)]
+        )
+    }
+
+    func testMappedLocalHTTPResponseUsesFileBodyAndHeaders() throws {
+        let body = BodyReference(
+            inline: Data(#"{"ok":true}"#.utf8),
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        let spec = MapLocalSpec(
+            resourceID: "users.json",
+            filePath: "/tmp/users.json",
+            statusCode: 201,
+            reasonPhrase: "Created",
+            headers: HTTPHeaders([try HTTPHeader(name: "X-Mapped", value: "local")]),
+            body: body
+        )
+        let response = try MappedLocalHTTPResponse.make(spec: spec)
+
+        XCTAssertEqual(response.statusCode, 201)
+        XCTAssertEqual(response.reasonPhrase, "Created")
+        XCTAssertEqual(response.headers.firstValue(for: "Content-Type"), "application/json")
+        XCTAssertEqual(response.headers.firstValue(for: "Content-Length"), "11")
+        XCTAssertEqual(response.headers.firstValue(for: "Connection"), "close")
+        XCTAssertEqual(response.headers.firstValue(for: "X-Mapped"), "local")
+        XCTAssertEqual(response.body, body)
     }
 
     func testRulePlannerSkipsUnimplementedActions() throws {
@@ -465,6 +632,24 @@ final class ProxyLensCoreTests: XCTestCase {
         let rule = Rule(name: "Block ads", phase: .requestHeaders, action: .block(reason: "ads"))
         snapshot.replace(RuleSet(rules: [rule]))
         XCTAssertEqual(snapshot.currentRules().rules.map(\.name), ["Block ads"])
+    }
+
+    func testMutableRuleSnapshotPublishesMappedLocalResources() {
+        let spec = MapLocalSpec(
+            resourceID: "users.json",
+            body: BodyReference(
+                inline: Data(#"{"ok":true}"#.utf8),
+                metadata: BodyMetadata(contentType: "application/json")
+            )
+        )
+        let snapshot = MutableRuleSnapshot(mappedLocals: [spec])
+        XCTAssertEqual(snapshot.mappedLocal(for: "users.json"), spec)
+
+        snapshot.retainMappedLocals([])
+        XCTAssertNil(snapshot.mappedLocal(for: "users.json"))
+
+        snapshot.replaceMappedLocal(spec)
+        XCTAssertEqual(snapshot.mappedLocal(for: "users.json")?.body.byteCount, 11)
     }
 
     func testFlowRoundTripsThroughCodable() throws {

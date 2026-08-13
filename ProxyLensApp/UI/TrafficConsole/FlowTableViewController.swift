@@ -236,6 +236,7 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         }
 
         let host = rows[rowIndex].host
+        let path = Self.mappingPath(for: rows[rowIndex])
         menu.addItem(ruleMenuItem(title: "Block \(host)", host: host, action: #selector(blockHost)))
         menu.addItem(ruleMenuItem(title: "Allow \(host)", host: host, action: #selector(allowHost)))
         menu.addItem(
@@ -245,6 +246,15 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 action: #selector(disableCaching)
             )
         )
+        menu.addItem(.separator())
+        let mapLocalItem = NSMenuItem(
+            title: "Map Local \(host)\(path)…",
+            action: #selector(mapLocal),
+            keyEquivalent: ""
+        )
+        mapLocalItem.target = self
+        mapLocalItem.representedObject = MapLocalMenuTarget(host: host, path: path)
+        menu.addItem(mapLocalItem)
     }
 
     private func ruleMenuItem(title: String, host: String, action: Selector) -> NSMenuItem {
@@ -273,6 +283,57 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             return
         }
         viewModel.disableCaching(forHost: host)
+    }
+
+    @objc private func mapLocal(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? MapLocalMenuTarget else {
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Map Local"
+        panel.message = "Choose a file to return for \(target.host)\(target.path)"
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.mapLocal(
+                        host: target.host,
+                        path: target.path,
+                        fileURL: url
+                    )
+                } catch {
+                    let alert = NSAlert(error: error)
+                    if let window = self.view.window {
+                        await alert.beginSheetModal(for: window)
+                    } else {
+                        alert.runModal()
+                    }
+                }
+            }
+        }
+    }
+
+    private static func mappingPath(for row: TrafficFlowRow) -> String {
+        let path =
+            row.path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: true)
+            .first.map(String.init) ?? "/"
+        return path.isEmpty ? "/" : path
+    }
+}
+
+private final class MapLocalMenuTarget: NSObject {
+    let host: String
+    let path: String
+
+    init(host: String, path: String) {
+        self.host = host
+        self.path = path
     }
 }
 

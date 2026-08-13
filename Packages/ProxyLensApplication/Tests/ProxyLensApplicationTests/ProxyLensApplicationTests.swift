@@ -53,6 +53,70 @@ final class ProxyLensApplicationTests: XCTestCase {
         )
     }
 
+    func testRuleEngineLoadsMapLocalFileIntoTheSharedSnapshot() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot, maximumMapLocalBytes: 1_024)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-map-local-\(UUID().uuidString).json")
+        let body = Data(#"{"mapped":true}"#.utf8)
+        try body.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let rule = try await engine.mapLocal(
+            host: "api.example.com",
+            path: "/users?unused=1",
+            fileURL: fileURL,
+            statusCode: 201
+        )
+
+        XCTAssertEqual(rule.name, "Map local api.example.com/users")
+        XCTAssertEqual(rule.priority, 15)
+        XCTAssertEqual(rule.phase, .requestHeaders)
+        guard case .mapLocal(let resourceID) = rule.action else {
+            return XCTFail("Expected a map local action")
+        }
+
+        let spec = try XCTUnwrap(snapshot.mappedLocal(for: resourceID))
+        XCTAssertEqual(spec.statusCode, 201)
+        XCTAssertEqual(spec.filePath, fileURL.path)
+        XCTAssertEqual(spec.body.contentType, "application/json")
+        XCTAssertEqual(spec.body.storage, .inline(body))
+
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .get,
+                    url: URL(string: "https://api.example.com/users")!
+                )
+            ),
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+
+        let tooLarge = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-map-local-too-large-\(UUID().uuidString).bin")
+        try Data(repeating: 0x61, count: 2_048).write(to: tooLarge)
+        defer { try? FileManager.default.removeItem(at: tooLarge) }
+
+        do {
+            _ = try await engine.mapLocal(
+                host: "api.example.com",
+                path: "/huge",
+                fileURL: tooLarge
+            )
+            XCTFail("Expected an oversized Map Local file to be rejected")
+        } catch let error as RuleEngineError {
+            XCTAssertEqual(
+                error,
+                .mapLocalFileTooLarge(byteCount: 2_048, maximumByteCount: 1_024)
+            )
+        }
+
+        await engine.remove(id: rule.id)
+        XCTAssertNil(snapshot.mappedLocal(for: resourceID))
+        XCTAssertTrue(snapshot.currentRules().rules.isEmpty)
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()

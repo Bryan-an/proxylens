@@ -209,6 +209,168 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
+    func testHTTPMapLocalRuleReturnsFileWithoutConnectingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
+        let eventSink = RecordingFlowEventSink()
+        let body = Data(#"{"mapped":true}"#.utf8)
+        let spec = MapLocalSpec(
+            resourceID: "users.json",
+            filePath: "/tmp/users.json",
+            statusCode: 201,
+            reasonPhrase: "Created",
+            body: BodyReference(
+                inline: body,
+                metadata: BodyMetadata(contentType: "application/json")
+            )
+        )
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .allOf([
+                        .host(.exact("127.0.0.1")),
+                        .path(.exact("/users"))
+                    ]),
+                    action: .mapLocal(resourceID: spec.resourceID)
+                )
+            ]),
+            mappedLocals: [spec]
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+        let sessionID = SessionID()
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: sessionID
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/users",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 201)
+            XCTAssertEqual(response.body, body)
+            XCTAssertEqual(response.header("Content-Type"), "application/json")
+            XCTAssertEqual(upstream.requestCount, 0)
+
+            await eventSink.waitForFinished()
+            let mappedEvents = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                mappedEvents.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(finishedFlow.state, .completed)
+            XCTAssertEqual(finishedFlow.response?.statusCode, 201)
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Map local users"])
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertNil(finishedFlow.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPMapLocalRuleAppliesNoCacheToTheMappedResponse() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
+        let eventSink = RecordingFlowEventSink()
+        let spec = MapLocalSpec(
+            resourceID: "asset.js",
+            statusCode: 200,
+            headers: HTTPHeaders([
+                try HTTPHeader(name: "Cache-Control", value: "public, max-age=3600"),
+                try HTTPHeader(name: "ETag", value: "\"abc\"")
+            ]),
+            body: BodyReference(
+                inline: Data("mapped asset".utf8),
+                metadata: BodyMetadata(contentType: "text/javascript")
+            )
+        )
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow fixture",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .allow
+                ),
+                Rule(
+                    name: "Map local asset",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/asset.js")),
+                    action: .mapLocal(resourceID: spec.resourceID)
+                ),
+                Rule(
+                    name: "No cache request",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .noCache
+                )
+            ]),
+            mappedLocals: [spec]
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/asset.js",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("mapped asset".utf8))
+            XCTAssertEqual(
+                response.header("Cache-Control"),
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            XCTAssertEqual(response.header("Pragma"), "no-cache")
+            XCTAssertNil(response.header("ETag"))
+            XCTAssertEqual(upstream.requestCount, 0)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
     func testHTTPAllowRuleOverridesLaterCatchAllBlock() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "allowed upstream")
         let eventSink = RecordingFlowEventSink()

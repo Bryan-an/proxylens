@@ -168,6 +168,13 @@ final class TrafficConsoleViewModel: ObservableObject {
         Task { await ruleEngine?.disableCaching(forHost: host) }
     }
 
+    func mapLocal(host: String, path: String, fileURL: URL) async throws {
+        guard let ruleEngine else {
+            return
+        }
+        try await ruleEngine.mapLocal(host: host, path: path, fileURL: fileURL)
+    }
+
     private func updateDisplayFilter(_ update: (inout TrafficDisplayFilter) -> Void) {
         var filter = store.displayFilter
         update(&filter)

@@ -465,11 +465,11 @@ P0 rules currently implemented in the shared pipeline:
 
 - Block and Allow, evaluated during request headers. The first matching allow or block terminates later block/allow rules in that phase.
 - No-cache request and response header rewriting.
+- Map Local, evaluated during request headers. The first matching map-local rule serves a preloaded local response and skips the upstream connection. File bytes are loaded in `RuleEngine` and published through `MutableRuleSnapshot`; NIO handlers only read the snapshot.
 - Display/filter matching.
 
 Still to implement on the same pipeline:
 
-- Map Local.
 - Map Remote.
 - Breakpoint for request and response editing.
 

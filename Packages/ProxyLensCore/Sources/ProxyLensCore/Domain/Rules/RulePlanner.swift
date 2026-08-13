@@ -6,19 +6,22 @@ public struct RulePlan: Equatable, Sendable {
     public let shouldBlock: Bool
     public let blockReason: String?
     public let applyNoCache: Bool
+    public let mapLocalResourceID: String?
 
     public init(
         phase: RulePhase,
         traces: [RuleTrace] = [],
         shouldBlock: Bool = false,
         blockReason: String? = nil,
-        applyNoCache: Bool = false
+        applyNoCache: Bool = false,
+        mapLocalResourceID: String? = nil
     ) {
         self.phase = phase
         self.traces = traces
         self.shouldBlock = shouldBlock
         self.blockReason = blockReason
         self.applyNoCache = applyNoCache
+        self.mapLocalResourceID = mapLocalResourceID
     }
 }
 
@@ -30,6 +33,10 @@ public enum RulePlanner: Sendable {
             "Block and allow currently apply during request headers"
         public static let noCachePhaseReason =
             "No-cache currently applies during request or response headers"
+        public static let mapLocalPhaseReason =
+            "Map Local currently applies during request headers"
+        public static let alreadyMappedReason =
+            "A previous map local rule already provided a response"
         public static let unimplementedActionReason = "Action is not implemented yet"
     }
 
@@ -44,6 +51,7 @@ public enum RulePlanner: Sendable {
         var shouldBlock = false
         var blockReason: String?
         var applyNoCache = false
+        var mapLocalResourceID: String?
 
         for rule in rules.matchingRules(for: context, phase: phase) {
             let outcome: RuleTraceOutcome
@@ -75,8 +83,19 @@ public enum RulePlanner: Sendable {
                 } else {
                     outcome = .skipped(reason: Decision.noCachePhaseReason)
                 }
-            case .mapLocal, .mapRemote, .breakpoint, .replaceBody, .throttle, .redirect,
-                .annotate:
+            case .mapLocal(let resourceID):
+                if shouldBlock {
+                    outcome = .skipped(reason: Decision.alreadyDecidedReason)
+                } else if mapLocalResourceID != nil {
+                    outcome = .skipped(reason: Decision.alreadyMappedReason)
+                } else if phase == .requestHeaders {
+                    outcome = .applied
+                    mapLocalResourceID = resourceID
+                    terminated = true
+                } else {
+                    outcome = .skipped(reason: Decision.mapLocalPhaseReason)
+                }
+            case .mapRemote, .breakpoint, .replaceBody, .throttle, .redirect, .annotate:
                 if terminated {
                     outcome = .skipped(reason: Decision.alreadyDecidedReason)
                 } else {
@@ -100,7 +119,8 @@ public enum RulePlanner: Sendable {
             traces: traces,
             shouldBlock: shouldBlock,
             blockReason: blockReason,
-            applyNoCache: applyNoCache
+            applyNoCache: applyNoCache,
+            mapLocalResourceID: mapLocalResourceID
         )
     }
 }
