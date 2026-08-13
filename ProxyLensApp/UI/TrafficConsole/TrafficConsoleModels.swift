@@ -109,14 +109,21 @@ struct TrafficFlowInspection: Equatable, Sendable {
     let request: TrafficMessageInspection?
     let response: TrafficMessageInspection?
     let rules: String
+    let breakpoint: TrafficBreakpointInspection?
 
     static let empty = TrafficFlowInspection(
         flowID: nil,
         title: "No Flow Selected",
         request: nil,
         response: nil,
-        rules: "Select a captured flow to inspect applied rules."
+        rules: "Select a captured flow to inspect applied rules.",
+        breakpoint: nil
     )
+}
+
+struct TrafficBreakpointInspection: Equatable, Sendable {
+    let phase: BreakpointPhase
+    let canEditBody: Bool
 }
 
 struct TrafficConsoleSnapshot: Equatable, Sendable {

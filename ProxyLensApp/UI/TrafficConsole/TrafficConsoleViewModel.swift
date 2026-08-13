@@ -37,6 +37,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let captureConfiguration: CaptureConfiguration
     private let eventBatchDelay: Duration
     private let ruleEngine: RuleEngine?
+    private let breakpointCoordinator: BreakpointCoordinator?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -54,7 +55,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         bodyReader: any TrafficBodyReading,
         captureConfiguration: CaptureConfiguration,
         eventBatchDelay: Duration = .milliseconds(40),
-        ruleEngine: RuleEngine? = nil
+        ruleEngine: RuleEngine? = nil,
+        breakpointCoordinator: BreakpointCoordinator? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -62,6 +64,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.captureConfiguration = captureConfiguration
         self.eventBatchDelay = eventBatchDelay
         self.ruleEngine = ruleEngine
+        self.breakpointCoordinator = breakpointCoordinator
     }
 
     deinit {
@@ -182,6 +185,65 @@ final class TrafficConsoleViewModel: ObservableObject {
         try await ruleEngine.mapRemote(host: host, path: path, destination: destination)
     }
 
+    func breakpoint(host: String, path: String, phase: RulePhase) {
+        Task { await ruleEngine?.breakpoint(host: host, path: path, phase: phase) }
+    }
+
+    func continueBreakpoint(headersText: String, bodyText: String?) async throws {
+        guard let flow = store.selectedFlow,
+            let coordinator = breakpointCoordinator,
+            let hit = await coordinator.hit(for: flow.id)
+        else {
+            return
+        }
+
+        switch hit.phase {
+        case .request:
+            let request = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: bodyText.map { Data($0.utf8) },
+                original: hit.request
+            )
+            await coordinator.resume(
+                flowID: hit.flowID,
+                decision: .continue(
+                    BreakpointHit(
+                        flowID: hit.flowID,
+                        phase: .request,
+                        request: request
+                    )
+                )
+            )
+        case .response:
+            guard let original = hit.response else {
+                throw ProxyLensError.unsupportedOperation("The paused response is unavailable")
+            }
+            let response = try HTTPMessageText.parseResponse(
+                headersText: headersText,
+                body: bodyText.map { Data($0.utf8) },
+                original: original
+            )
+            await coordinator.resume(
+                flowID: hit.flowID,
+                decision: .continue(
+                    BreakpointHit(
+                        flowID: hit.flowID,
+                        phase: .response,
+                        request: hit.request,
+                        response: response
+                    )
+                )
+            )
+        }
+    }
+
+    func abortBreakpoint() {
+        guard let flowID = store.selectedFlowID else {
+            return
+        }
+        Task { await breakpointCoordinator?.abort(flowID: flowID) }
+    }
+
     private func updateDisplayFilter(_ update: (inout TrafficDisplayFilter) -> Void) {
         var filter = store.displayFilter
         update(&filter)
@@ -263,6 +325,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
         capturePresentation = .stopping
         publishSnapshot()
+        await breakpointCoordinator?.abortAll()
         do {
             try await captureController.stop()
             capturePresentation = .stopped
@@ -327,7 +390,14 @@ final class TrafficConsoleViewModel: ObservableObject {
             response: inspection.response.map {
                 TrafficMessageInspection(title: $0.title, headers: $0.headers, body: response)
             },
-            rules: inspection.rules
+            rules: inspection.rules,
+            breakpoint: inspection.breakpoint.map { breakpoint in
+                let body = breakpoint.phase == .response ? response : request
+                return TrafficBreakpointInspection(
+                    phase: breakpoint.phase,
+                    canEditBody: Self.bodyIsEditable(body)
+                )
+            }
         )
         publishSnapshot()
     }
@@ -352,29 +422,30 @@ final class TrafficConsoleViewModel: ObservableObject {
                     body: initialBody($0.body, emptyMessage: "This response has no body.")
                 )
             },
-            rules: rulesText(flow.ruleTraces)
+            rules: rulesText(flow.ruleTraces),
+            breakpoint: flow.state.breakpointPhase.map {
+                TrafficBreakpointInspection(phase: $0, canEditBody: false)
+            }
         )
     }
 
     private static func requestHeadersText(_ request: HTTPRequest) -> String {
-        let target = request.rawTarget ?? request.url.pathAndQuery
-        return messageText(
-            firstLine: "\(request.method.rawValue) \(target) \(request.version.rawValue)",
-            headers: request.headers
-        )
+        HTTPMessageText.requestHeaders(request)
     }
 
     private static func responseHeadersText(_ response: HTTPResponse) -> String {
-        let reason = response.reasonPhrase.map { " \($0)" } ?? ""
-        return messageText(
-            firstLine: "\(response.version.rawValue) \(response.statusCode)\(reason)",
-            headers: response.headers
-        )
+        HTTPMessageText.responseHeaders(response)
     }
 
-    private static func messageText(firstLine: String, headers: HTTPHeaders) -> String {
-        let fields = headers.map { "\($0.name): \($0.value)" }
-        return ([firstLine] + fields).joined(separator: "\n")
+    private static func bodyIsEditable(_ body: TrafficBodyPresentation) -> Bool {
+        switch body {
+        case .none:
+            true
+        case .content(_, let value):
+            !value.hasPrefix("00000000  ")
+        case .loading, .failed:
+            false
+        }
     }
 
     private static func rulesText(_ traces: [RuleTrace]) -> String {
@@ -549,15 +620,5 @@ private enum BodyDisplayFormatter {
             return "\(count) B"
         }
         return String(format: "%.1f %@", value, units[unitIndex])
-    }
-}
-
-extension URL {
-    fileprivate var pathAndQuery: String {
-        var result = path.isEmpty ? "/" : path
-        if let query, !query.isEmpty {
-            result += "?\(query)"
-        }
-        return result
     }
 }

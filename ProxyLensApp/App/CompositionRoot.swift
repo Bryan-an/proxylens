@@ -35,12 +35,14 @@ final class CompositionRoot {
         )
         let certificateProvider = KeychainCertificateProvider()
         let ruleEngine = RuleEngine()
+        let breakpointCoordinator = BreakpointCoordinator()
         let proxyEngine = NIOProxyEngine(
             eventSink: persistenceSink,
             bodyStore: bodyStore,
             maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes,
             certificateProvider: certificateProvider,
-            ruleSnapshot: ruleEngine.snapshot
+            ruleSnapshot: ruleEngine.snapshot,
+            breakpointGate: breakpointCoordinator
         )
         let systemProxyController = MacOSSystemProxyController(
             snapshotURL:
@@ -68,7 +70,8 @@ final class CompositionRoot {
                     interceptHTTPS: true
                 )
             ),
-            ruleEngine: ruleEngine
+            ruleEngine: ruleEngine,
+            breakpointCoordinator: breakpointCoordinator
         )
     }
 }

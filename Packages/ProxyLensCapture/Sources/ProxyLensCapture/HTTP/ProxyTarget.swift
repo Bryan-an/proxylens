@@ -9,6 +9,15 @@ struct ProxyTarget: Sendable {
     let originForm: String
     let usesTLS: Bool
 
+    var hostHeader: String {
+        let formattedHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        let defaultPort = usesTLS ? 443 : 80
+        if port == defaultPort {
+            return formattedHost
+        }
+        return "\(formattedHost):\(port)"
+    }
+
     init(
         uri: String,
         headers: NIOHTTP1.HTTPHeaders,
@@ -73,6 +82,32 @@ struct ProxyTarget: Sendable {
             port: mapped.port,
             originForm: mapped.originForm,
             usesTLS: mapped.usesTLS
+        )
+    }
+
+    init(url: URL) throws {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw ProxyTargetError.unsupportedScheme(url.scheme ?? "")
+        }
+        guard let host = url.host, !host.isEmpty else {
+            throw ProxyTargetError.missingHost
+        }
+        guard url.user == nil, url.password == nil, url.fragment == nil else {
+            throw ProxyTargetError.invalidURI(url.absoluteString)
+        }
+
+        let usesTLS = scheme == "https"
+        let port = url.port ?? (usesTLS ? 443 : 80)
+        guard (1...65_535).contains(port) else {
+            throw ProxyTargetError.invalidPort(port)
+        }
+
+        self.init(
+            url: url,
+            host: host,
+            port: port,
+            originForm: Self.originForm(for: url),
+            usesTLS: usesTLS
         )
     }
 

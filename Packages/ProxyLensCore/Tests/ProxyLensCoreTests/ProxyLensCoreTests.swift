@@ -106,6 +106,27 @@ final class ProxyLensCoreTests: XCTestCase {
         }
     }
 
+    func testFlowCanPauseAtRequestAndResponseBreakpoints() throws {
+        var flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(method: .get, url: URL(string: "http://localhost:8080/")!)
+        )
+
+        try flow.transition(to: .receivingRequest)
+        try flow.transition(to: .paused(.request))
+        XCTAssertEqual(flow.state.breakpointPhase, .request)
+        XCTAssertFalse(flow.state.isTerminal)
+
+        try flow.transition(to: .connectingUpstream)
+        try flow.transition(to: .receivingResponse)
+        try flow.transition(to: .paused(.response))
+        XCTAssertEqual(flow.state.breakpointPhase, .response)
+
+        try flow.transition(to: .cancelled)
+        XCTAssertEqual(flow.state, .cancelled)
+        XCTAssertTrue(flow.state.isTerminal)
+    }
+
     func testFlowCanPreserveAnIncompleteFailure() throws {
         let request = HTTPRequest(method: .get, url: URL(string: "http://localhost:8080/")!)
         var flow = Flow(sessionID: SessionID(), request: request)
@@ -266,6 +287,7 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertTrue(plan.applyNoCache)
         XCTAssertEqual(plan.mapLocalResourceID, "pixel.json")
         XCTAssertNil(plan.mapRemoteURL)
+        XCTAssertFalse(plan.shouldBreakpoint)
         XCTAssertEqual(plan.traces.map(\.ruleID), [noCacheID, allowID, blockID, mapLocalID])
         XCTAssertEqual(
             plan.traces.map(\.ruleName),
@@ -740,6 +762,63 @@ final class ProxyLensCoreTests: XCTestCase {
         )
     }
 
+    func testHTTPMessageTextRoundTripsRequestAndResponseEdits() throws {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/v1/users?x=1")!,
+            headers: HTTPHeaders([
+                try HTTPHeader(name: "Host", value: "api.example.com"),
+                try HTTPHeader(name: "Content-Type", value: "application/json")
+            ]),
+            body: BodyReference(inline: Data(#"{"name":"ada"}"#.utf8)),
+            rawTarget: "/v1/users?x=1"
+        )
+        let parsedRequest = try HTTPMessageText.parseRequest(
+            headersText: """
+                PATCH /v1/users/1 HTTP/1.1
+                Host: api.example.com
+                Content-Type: application/json
+                X-Debug: 1
+                """,
+            body: Data(#"{"name":"grace"}"#.utf8),
+            original: request
+        )
+
+        XCTAssertEqual(parsedRequest.method, .patch)
+        XCTAssertEqual(parsedRequest.url.absoluteString, "https://api.example.com/v1/users/1")
+        XCTAssertEqual(parsedRequest.headers.firstValue(for: "X-Debug"), "1")
+        XCTAssertEqual(parsedRequest.headers.firstValue(for: "Content-Length"), "16")
+        XCTAssertEqual(parsedRequest.body?.inlineData, Data(#"{"name":"grace"}"#.utf8))
+
+        let unchanged = try HTTPMessageText.parseRequest(
+            headersText: HTTPMessageText.requestHeaders(request),
+            body: nil,
+            original: request
+        )
+        XCTAssertEqual(unchanged.method, .post)
+        XCTAssertEqual(unchanged.body, request.body)
+        XCTAssertNil(unchanged.headers.firstValue(for: "Content-Length"))
+
+        let response = try HTTPResponse(
+            statusCode: 200,
+            reasonPhrase: "OK",
+            headers: HTTPHeaders([try HTTPHeader(name: "Content-Type", value: "text/plain")]),
+            body: BodyReference(inline: Data("hello".utf8))
+        )
+        let parsedResponse = try HTTPMessageText.parseResponse(
+            headersText: """
+                HTTP/1.1 201 Created
+                Content-Type: text/plain
+                """,
+            body: Data("created".utf8),
+            original: response
+        )
+        XCTAssertEqual(parsedResponse.statusCode, 201)
+        XCTAssertEqual(parsedResponse.reasonPhrase, "Created")
+        XCTAssertEqual(parsedResponse.headers.firstValue(for: "Content-Length"), "7")
+        XCTAssertEqual(parsedResponse.body?.inlineData, Data("created".utf8))
+    }
+
     func testMappedLocalHTTPResponseUsesFileBodyAndHeaders() throws {
         let body = BodyReference(
             inline: Data(#"{"ok":true}"#.utf8),
@@ -764,12 +843,203 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertEqual(response.body, body)
     }
 
+    func testRulePlannerAppliesBreakpointOnRequestAndResponseHeaders() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let requestPlan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint users",
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .breakpoint
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertTrue(requestPlan.shouldBreakpoint)
+        XCTAssertEqual(requestPlan.traces.map(\.outcome), [.applied])
+
+        let response = try HTTPResponse(statusCode: 200)
+        let responsePlan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint users response",
+                    phase: .responseHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .breakpoint
+                )
+            ]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseHeaders
+        )
+
+        XCTAssertTrue(responsePlan.shouldBreakpoint)
+        XCTAssertEqual(responsePlan.traces.map(\.outcome), [.applied])
+    }
+
+    func testRulePlannerSkipsBreakpointAfterBlockOrMapLocal() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let context = RuleMatchContext(request: request)
+        let blocked = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block users",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    action: .block(reason: "blocked")
+                ),
+                Rule(
+                    name: "Breakpoint users",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .breakpoint
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+        XCTAssertTrue(blocked.shouldBlock)
+        XCTAssertFalse(blocked.shouldBreakpoint)
+        XCTAssertEqual(
+            blocked.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+
+        let mapped = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local users",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    action: .mapLocal(resourceID: "users.json")
+                ),
+                Rule(
+                    name: "Breakpoint users",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .breakpoint
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(mapped.mapLocalResourceID, "users.json")
+        XCTAssertFalse(mapped.shouldBreakpoint)
+        XCTAssertEqual(
+            mapped.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyMappedReason)
+            ]
+        )
+    }
+
+    func testRulePlannerAppliesBreakpointAfterAllowAndMapRemote() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let staging = URL(string: "http://staging.example.com/")!
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow api",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    action: .allow
+                ),
+                Rule(
+                    name: "Map remote users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    action: .mapRemote(url: staging)
+                ),
+                Rule(
+                    name: "Breakpoint users",
+                    priority: 18,
+                    phase: .requestHeaders,
+                    action: .breakpoint
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(plan.shouldBlock)
+        XCTAssertEqual(plan.mapRemoteURL, staging)
+        XCTAssertTrue(plan.shouldBreakpoint)
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied, .applied, .applied])
+    }
+
+    func testRulePlannerKeepsTheFirstMatchingBreakpoint() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "First breakpoint",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .breakpoint
+                ),
+                Rule(
+                    name: "Second breakpoint",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .breakpoint
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertTrue(plan.shouldBreakpoint)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyPausedReason)
+            ]
+        )
+    }
+
+    func testRulePlannerSkipsBreakpointOutsideHeaderPhases() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Late breakpoint",
+                    phase: .requestBody,
+                    action: .breakpoint
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertFalse(plan.shouldBreakpoint)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [.skipped(reason: RulePlanner.Decision.breakpointPhaseReason)]
+        )
+    }
+
     func testRulePlannerSkipsUnimplementedActions() throws {
         let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
         let rule = Rule(
-            name: "Breakpoint",
+            name: "Throttle",
             phase: .requestHeaders,
-            action: .breakpoint
+            action: .throttle(ThrottleProfile(latency: 0.2))
         )
         let plan = RulePlanner.plan(
             rules: RuleSet(rules: [rule]),
@@ -779,6 +1049,7 @@ final class ProxyLensCoreTests: XCTestCase {
 
         XCTAssertFalse(plan.shouldBlock)
         XCTAssertFalse(plan.applyNoCache)
+        XCTAssertFalse(plan.shouldBreakpoint)
         XCTAssertEqual(
             plan.traces.map(\.outcome),
             [.skipped(reason: RulePlanner.Decision.unimplementedActionReason)]

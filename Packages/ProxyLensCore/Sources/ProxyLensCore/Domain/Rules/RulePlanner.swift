@@ -8,6 +8,7 @@ public struct RulePlan: Equatable, Sendable {
     public let applyNoCache: Bool
     public let mapLocalResourceID: String?
     public let mapRemoteURL: URL?
+    public let shouldBreakpoint: Bool
 
     public init(
         phase: RulePhase,
@@ -16,7 +17,8 @@ public struct RulePlan: Equatable, Sendable {
         blockReason: String? = nil,
         applyNoCache: Bool = false,
         mapLocalResourceID: String? = nil,
-        mapRemoteURL: URL? = nil
+        mapRemoteURL: URL? = nil,
+        shouldBreakpoint: Bool = false
     ) {
         self.phase = phase
         self.traces = traces
@@ -25,6 +27,7 @@ public struct RulePlan: Equatable, Sendable {
         self.applyNoCache = applyNoCache
         self.mapLocalResourceID = mapLocalResourceID
         self.mapRemoteURL = mapRemoteURL
+        self.shouldBreakpoint = shouldBreakpoint
     }
 }
 
@@ -42,6 +45,10 @@ public enum RulePlanner: Sendable {
             "Map Remote currently applies during request headers"
         public static let alreadyMappedReason =
             "A previous mapping rule already decided this request"
+        public static let breakpointPhaseReason =
+            "Breakpoint currently applies during request or response headers"
+        public static let alreadyPausedReason =
+            "A previous breakpoint rule already paused this phase"
         public static let unimplementedActionReason = "Action is not implemented yet"
     }
 
@@ -58,6 +65,7 @@ public enum RulePlanner: Sendable {
         var applyNoCache = false
         var mapLocalResourceID: String?
         var mapRemoteURL: URL?
+        var shouldBreakpoint = false
 
         for rule in rules.matchingRules(for: context, phase: phase) {
             let outcome: RuleTraceOutcome
@@ -113,7 +121,20 @@ public enum RulePlanner: Sendable {
                 } else {
                     outcome = .skipped(reason: Decision.mapRemotePhaseReason)
                 }
-            case .breakpoint, .replaceBody, .throttle, .redirect, .annotate:
+            case .breakpoint:
+                if shouldBlock {
+                    outcome = .skipped(reason: Decision.alreadyDecidedReason)
+                } else if mapLocalResourceID != nil {
+                    outcome = .skipped(reason: Decision.alreadyMappedReason)
+                } else if shouldBreakpoint {
+                    outcome = .skipped(reason: Decision.alreadyPausedReason)
+                } else if phase == .requestHeaders || phase == .responseHeaders {
+                    outcome = .applied
+                    shouldBreakpoint = true
+                } else {
+                    outcome = .skipped(reason: Decision.breakpointPhaseReason)
+                }
+            case .replaceBody, .throttle, .redirect, .annotate:
                 if terminated {
                     outcome = .skipped(reason: Decision.alreadyDecidedReason)
                 } else {
@@ -139,7 +160,8 @@ public enum RulePlanner: Sendable {
             blockReason: blockReason,
             applyNoCache: applyNoCache,
             mapLocalResourceID: mapLocalResourceID,
-            mapRemoteURL: mapRemoteURL
+            mapRemoteURL: mapRemoteURL,
+            shouldBreakpoint: shouldBreakpoint
         )
     }
 }

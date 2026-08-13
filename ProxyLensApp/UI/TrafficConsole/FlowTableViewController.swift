@@ -263,6 +263,23 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         mapRemoteItem.target = self
         mapRemoteItem.representedObject = HostPathMenuTarget(host: host, path: path)
         menu.addItem(mapRemoteItem)
+        menu.addItem(.separator())
+        let requestBreakpointItem = NSMenuItem(
+            title: "Breakpoint request \(host)\(path)",
+            action: #selector(breakpointRequest),
+            keyEquivalent: ""
+        )
+        requestBreakpointItem.target = self
+        requestBreakpointItem.representedObject = HostPathMenuTarget(host: host, path: path)
+        menu.addItem(requestBreakpointItem)
+        let responseBreakpointItem = NSMenuItem(
+            title: "Breakpoint response \(host)\(path)",
+            action: #selector(breakpointResponse),
+            keyEquivalent: ""
+        )
+        responseBreakpointItem.target = self
+        responseBreakpointItem.representedObject = HostPathMenuTarget(host: host, path: path)
+        menu.addItem(responseBreakpointItem)
     }
 
     private func ruleMenuItem(title: String, host: String, action: Selector) -> NSMenuItem {
@@ -335,6 +352,20 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         Task { @MainActor in
             await promptMapRemote(target: target)
         }
+    }
+
+    @objc private func breakpointRequest(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+        viewModel.breakpoint(host: target.host, path: target.path, phase: .requestHeaders)
+    }
+
+    @objc private func breakpointResponse(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+        viewModel.breakpoint(host: target.host, path: target.path, phase: .responseHeaders)
     }
 
     private func promptMapRemote(target: HostPathMenuTarget) async {
@@ -551,6 +582,7 @@ private enum FlowCellFormatter {
         switch flow.state {
         case .failed: return "Failed"
         case .cancelled: return "Cancelled"
+        case .paused: return "Paused"
         case .completed: return "Done"
         case .created, .receivingRequest, .connectingUpstream, .receivingResponse: return "Pending"
         }
@@ -567,6 +599,7 @@ private enum FlowCellFormatter {
         }
         switch flow.state {
         case .failed, .cancelled: return .systemRed
+        case .paused: return .systemOrange
         default: return .secondaryLabelColor
         }
     }

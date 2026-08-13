@@ -13,6 +13,18 @@ actor FlowTransaction {
         self.eventSink = eventSink
     }
 
+    func flowID() -> FlowID {
+        flow.id
+    }
+
+    func currentRequest() -> HTTPRequest {
+        flow.request
+    }
+
+    func currentResponse() -> HTTPResponse? {
+        flow.response
+    }
+
     func start(at date: Date) async {
         guard flow.state == .created else {
             return
@@ -92,7 +104,7 @@ actor FlowTransaction {
             return
         }
 
-        if flow.state == .receivingRequest {
+        if flow.state == .receivingRequest || flow.state == .paused(.request) {
             try? flow.transition(to: .connectingUpstream)
         }
 
@@ -114,7 +126,7 @@ actor FlowTransaction {
             return
         }
 
-        if flow.state == .receivingRequest {
+        if flow.state == .receivingRequest || flow.state == .paused(.request) {
             try? flow.transition(to: .connectingUpstream)
         }
 
@@ -138,6 +150,11 @@ actor FlowTransaction {
         flow.markResponseBodyCompleted(at: date)
         responseBodyIsComplete = true
 
+        if flow.state == .paused(.response) {
+            await eventSink.publish(.updated(flow))
+            return
+        }
+
         if requestBodyIsComplete {
             await complete(at: date)
         } else {
@@ -145,14 +162,59 @@ actor FlowTransaction {
         }
     }
 
+    func completePausedResponse(at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+
+        responseBodyIsComplete = true
+        await complete(at: date)
+    }
+
+    func pause(_ phase: BreakpointPhase) async {
+        guard !isFinished else {
+            return
+        }
+
+        let nextState = FlowState.paused(phase)
+        guard flow.state.canTransition(to: nextState) else {
+            return
+        }
+
+        try? flow.transition(to: nextState)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func replaceResponse(_ response: HTTPResponse) async {
+        guard !isFinished else {
+            return
+        }
+
+        flow.replaceResponse(response)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func cancel() async {
+        guard !isFinished else {
+            return
+        }
+
+        try? flow.transition(to: .cancelled)
+        isFinished = true
+        await eventSink.publish(.finished(flow))
+    }
+
     private func complete(at date: Date) async {
+        if flow.state == .paused(.request) {
+            try? flow.transition(to: .connectingUpstream)
+        }
         if flow.state == .receivingRequest {
             try? flow.transition(to: .receivingResponse)
         }
         if flow.state == .connectingUpstream {
             try? flow.transition(to: .receivingResponse)
         }
-        if !flow.state.isTerminal {
+        if flow.state == .paused(.response) || !flow.state.isTerminal {
             try? flow.transition(to: .completed)
         }
         flow.markCompleted(at: date)

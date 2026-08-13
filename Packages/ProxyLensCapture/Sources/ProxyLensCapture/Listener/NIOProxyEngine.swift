@@ -15,6 +15,7 @@ public actor NIOProxyEngine: ProxyEngine {
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSConfiguration: UpstreamTLSConfiguration
     private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let breakpointGate: any BreakpointGate
 
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
     private var serverChannel: Channel?
@@ -28,7 +29,8 @@ public actor NIOProxyEngine: ProxyEngine {
         maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration(),
-        ruleSnapshot: (any RuleSnapshotSource)? = nil
+        ruleSnapshot: (any RuleSnapshotSource)? = nil,
+        breakpointGate: any BreakpointGate = ImmediateBreakpointGate()
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
         self.eventSink = eventSink
@@ -38,6 +40,7 @@ public actor NIOProxyEngine: ProxyEngine {
         self.certificateProvider = certificateProvider
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
         self.ruleSnapshot = ruleSnapshot
+        self.breakpointGate = breakpointGate
     }
 
     public func start(configuration: ProxyConfiguration, sessionID: SessionID) async throws {
@@ -80,7 +83,8 @@ public actor NIOProxyEngine: ProxyEngine {
                         maximumCapturedBodyBytes,
                         certificateProvider,
                         upstreamTLSContext,
-                        ruleSnapshot
+                        ruleSnapshot,
+                        breakpointGate
                     ] channel in
                     channel.eventLoop.makeCompletedFuture(
                         Result {
@@ -95,7 +99,8 @@ public actor NIOProxyEngine: ProxyEngine {
                                     interceptHTTPS: interceptHTTPS,
                                     certificateProvider: certificateProvider,
                                     upstreamTLSContext: upstreamTLSContext,
-                                    ruleSnapshot: ruleSnapshot
+                                    ruleSnapshot: ruleSnapshot,
+                                    breakpointGate: breakpointGate
                                 )
                             )
                         }

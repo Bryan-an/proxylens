@@ -6,7 +6,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let viewModel: TrafficConsoleViewModel
     private let sourceController: SourceListViewController
     private let flowController: FlowTableViewController
-    private let inspectorController = InspectorViewController()
+    private let inspectorController: InspectorViewController
     private let splitViewController = NSSplitViewController()
     private let captureButton = NSButton()
     private let statusImage = NSImageView()
@@ -18,6 +18,7 @@ final class TrafficConsoleViewController: NSViewController {
         self.viewModel = viewModel
         self.sourceController = SourceListViewController(viewModel: viewModel)
         self.flowController = FlowTableViewController(viewModel: viewModel)
+        self.inspectorController = InspectorViewController(viewModel: viewModel)
         super.init(nibName: nil, bundle: nil)
     }
 

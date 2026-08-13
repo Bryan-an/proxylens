@@ -20,6 +20,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private let upstreamTLSContext: NIOSSLContext?
     private let tunnelTarget: ConnectTarget?
     private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let breakpointGate: any BreakpointGate
 
     private var requestHead: HTTPRequestHead?
     private var upstreamChannel: Channel?
@@ -36,6 +37,11 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private var captureWritesInFlight = 0
     private var captureFailureHandled = false
     private var didFinishLocally = false
+    private var pendingTarget: ProxyTarget?
+    private var pendingForwardedHead: HTTPRequestHead?
+    private var pendingRequest: HTTPRequest?
+    private var pendingRequestBreakpoint = false
+    fileprivate var breakpointTask: Task<Void, Never>?
 
     init(
         sessionID: SessionID,
@@ -47,7 +53,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSContext: NIOSSLContext? = nil,
         tunnelTarget: ConnectTarget? = nil,
-        ruleSnapshot: (any RuleSnapshotSource)? = nil
+        ruleSnapshot: (any RuleSnapshotSource)? = nil,
+        breakpointGate: any BreakpointGate = ImmediateBreakpointGate()
     ) {
         self.sessionID = sessionID
         self.eventSink = eventSink
@@ -59,6 +66,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.upstreamTLSContext = upstreamTLSContext
         self.tunnelTarget = tunnelTarget
         self.ruleSnapshot = ruleSnapshot
+        self.breakpointGate = breakpointGate
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -88,6 +96,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             upstreamChannel?.close(promise: nil)
             return
         }
+        breakpointTask?.cancel()
         let requestBodyRecorder = self.requestBodyRecorder
         Task {
             await requestBodyRecorder?.cancel()
@@ -104,6 +113,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
         let upstreamChannel = self.upstreamChannel
         let requestBodyRecorder = self.requestBodyRecorder
+        breakpointTask?.cancel()
         if let transaction {
             Task {
                 await requestBodyRecorder?.cancel()
@@ -240,6 +250,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
         self.requestHead = head
         self.transaction = transaction
+        self.pendingTarget = target
+        self.pendingRequest = request
 
         if requestPlan.shouldBlock {
             let blockedResponse: HTTPResponse
@@ -320,6 +332,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             uri: target.originForm,
             headers: forwardedHeaders
         )
+        pendingForwardedHead = forwardedHead
+
+        if requestPlan.shouldBreakpoint {
+            pendingRequestBreakpoint = true
+            return
+        }
 
         connectUpstream(
             target: target,
@@ -427,6 +445,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
         let certificateProvider = self.certificateProvider
         let ruleSnapshot = self.ruleSnapshot
+        let breakpointGate = self.breakpointGate
         channel.writeAndFlush(HTTPServerResponsePart.end(nil)).flatMap {
             HTTPServerPipeline.removePlaintextHTTPHandlers(from: channel)
         }.flatMapThrowing {
@@ -447,7 +466,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     certificateProvider: certificateProvider,
                     upstreamTLSContext: upstreamTLSContext,
                     tunnelTarget: target,
-                    ruleSnapshot: ruleSnapshot
+                    ruleSnapshot: ruleSnapshot,
+                    breakpointGate: breakpointGate
                 )
             )
         }.flatMap {
@@ -522,6 +542,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
 
         requestEnded = true
+        if pendingRequestBreakpoint {
+            pendingRequestParts.append(HTTPClientRequestPart.end(trailers))
+            beginRequestBreakpoint(channel: context.channel)
+            return
+        }
+
         finishRequestBodyCapture(context: context)
 
         let endPart = HTTPClientRequestPart.end(trailers)
@@ -616,6 +642,175 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
     }
 
+    private func beginRequestBreakpoint(channel: Channel) {
+        guard let transaction, let originalRequest = pendingRequest else {
+            return
+        }
+
+        let writeTask = requestBodyWriteTask
+        let recorder = requestBodyRecorder
+        let gate = breakpointGate
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        let completedAt = Date()
+        breakpointTask = Task {
+            do {
+                try await writeTask?.value
+                let reference = try await recorder?.finalize()
+                var pausedRequest = originalRequest
+                if let reference {
+                    pausedRequest = pausedRequest.replacingBody(reference)
+                }
+                await transaction.finishRequestBody(reference, at: completedAt)
+                await transaction.replaceRequest(pausedRequest)
+                await transaction.pause(.request)
+                let hit = BreakpointHit(
+                    flowID: await transaction.flowID(),
+                    phase: .request,
+                    request: pausedRequest
+                )
+                let decision = await gate.pause(hit)
+                let capturedRequest = pausedRequest
+                channel.eventLoop.execute {
+                    loopBoundSelf.value.applyRequestBreakpointDecision(
+                        decision,
+                        capturedRequest: capturedRequest,
+                        channel: channel
+                    )
+                }
+            } catch {
+                await recorder?.cancel()
+                await transaction.fail(.persistenceError(error.localizedDescription))
+                channel.close(promise: nil)
+            }
+        }
+    }
+
+    private func applyRequestBreakpointDecision(
+        _ decision: BreakpointDecision,
+        capturedRequest: HTTPRequest,
+        channel: Channel
+    ) {
+        guard channel.isActive else {
+            return
+        }
+
+        switch decision {
+        case .abort:
+            abortBreakpoint(channel: channel)
+        case .continue(let hit):
+            pendingRequestBreakpoint = false
+            pendingRequest = capturedRequest
+            let continued = hit.request
+            if continued != capturedRequest {
+                let transaction = self.transaction
+                Task { [transaction] in
+                    await transaction?.replaceRequest(continued)
+                }
+                do {
+                    try applyEditedRequest(continued, captured: capturedRequest, channel: channel)
+                } catch {
+                    sendError(
+                        statusCode: 400,
+                        reason: "Bad Request",
+                        message: error.localizedDescription,
+                        channel: channel
+                    )
+                    let transaction = self.transaction
+                    Task { [transaction] in
+                        await transaction?.fail(.protocolError(error.localizedDescription))
+                    }
+                    return
+                }
+            }
+
+            guard let target = pendingTarget,
+                let requestHead = pendingForwardedHead,
+                let request = pendingRequest,
+                let transaction
+            else {
+                abortBreakpoint(channel: channel)
+                return
+            }
+
+            connectUpstream(
+                target: target,
+                requestHead: requestHead,
+                request: request,
+                clientChannel: channel,
+                transaction: transaction
+            )
+        }
+    }
+
+    private func applyEditedRequest(
+        _ request: HTTPRequest,
+        captured: HTTPRequest,
+        channel: Channel
+    ) throws {
+        pendingRequest = request
+        if request.url != captured.url {
+            let target = try ProxyTarget(url: request.url)
+            pendingTarget = target
+            var headers = HTTPConversion.sanitizedRequestHeaders(
+                HTTPConversion.nioHeaders(from: request.headers)
+            )
+            headers.remove(name: "Host")
+            headers.add(name: "Host", value: target.hostHeader)
+            pendingForwardedHead = HTTPRequestHead(
+                version: request.version == .http10 ? .http1_0 : .http1_1,
+                method: NIOHTTP1.HTTPMethod(rawValue: request.method.rawValue),
+                uri: target.originForm,
+                headers: headers
+            )
+        } else if request.method != captured.method
+            || request.headers != captured.headers
+        {
+            var headers = HTTPConversion.sanitizedRequestHeaders(
+                HTTPConversion.nioHeaders(from: request.headers)
+            )
+            if let target = pendingTarget {
+                headers.remove(name: "Host")
+                headers.add(name: "Host", value: target.hostHeader)
+            }
+            let originForm = pendingForwardedHead?.uri ?? pendingTarget?.originForm ?? "/"
+            pendingForwardedHead = HTTPRequestHead(
+                version: request.version == .http10 ? .http1_0 : .http1_1,
+                method: NIOHTTP1.HTTPMethod(rawValue: request.method.rawValue),
+                uri: originForm,
+                headers: headers
+            )
+        }
+
+        if request.body?.id != captured.body?.id {
+            pendingRequestParts = []
+            pendingRequestBytes = 0
+            if let data = request.body?.inlineData, !data.isEmpty {
+                var buffer = channel.allocator.buffer(capacity: data.count)
+                buffer.writeBytes(data)
+                pendingRequestParts.append(.body(.byteBuffer(buffer)))
+                pendingRequestBytes = data.count
+            }
+            pendingRequestParts.append(.end(nil))
+        }
+    }
+
+    fileprivate func abortBreakpoint(channel: Channel) {
+        didFinishLocally = true
+        responseEnded = true
+        pendingRequestBreakpoint = false
+        breakpointTask = nil
+        let transaction = self.transaction
+        Task { [transaction] in
+            await transaction?.cancel()
+        }
+        sendError(
+            statusCode: 403,
+            reason: "Forbidden",
+            message: "Aborted at breakpoint",
+            channel: channel
+        )
+    }
+
     fileprivate func markResponseEnded() {
         responseEnded = true
     }
@@ -630,13 +825,14 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         let bodyStore = self.bodyStore
         let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
         let ruleSnapshot = self.ruleSnapshot
+        let breakpointGate = self.breakpointGate
         let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
         let bootstrap = ClientBootstrap(group: clientChannel.eventLoop)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelInitializer {
                 [
                     upstreamTLSContext, bodyStore, maximumCapturedBodyBytes, loopBoundSelf,
-                    request, ruleSnapshot
+                    request, ruleSnapshot, breakpointGate
                 ] channel in
                 let tlsFuture: EventLoopFuture<Void>
                 if target.usesTLS {
@@ -669,7 +865,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                             usesTLS: target.usesTLS,
                             bodyStore: bodyStore,
                             maximumCapturedBodyBytes: maximumCapturedBodyBytes,
-                            ruleSnapshot: ruleSnapshot
+                            ruleSnapshot: ruleSnapshot,
+                            breakpointGate: breakpointGate
                         )
                     )
                 }
@@ -746,7 +943,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         return spec
     }
 
-    private func sendLocalResponse(_ response: HTTPResponse, channel: Channel) {
+    fileprivate func sendLocalResponse(_ response: HTTPResponse, channel: Channel) {
         let headers = HTTPConversion.nioHeaders(from: response.headers)
         let status = HTTPResponseStatus(statusCode: response.statusCode)
         let head = HTTPResponseHead(
@@ -814,12 +1011,25 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
     private let bodyStore: (any BodyStore)?
     private let maximumCapturedBodyBytes: Int64
     private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let breakpointGate: any BreakpointGate
     private var responseStarted = false
     private var responseBodyRecorder: StreamingBodyRecorder?
     private var responseHeadTask: Task<Void, Never>?
     private var responseBodyWriteTask: Task<Void, Error>?
     private var captureWritesInFlight = 0
     private var captureFailureHandled = false
+    private var pendingResponseBreakpoint = false
+    private var pendingResponse: HTTPResponse?
+    private var pendingResponseHead: HTTPResponseHead?
+    private var pendingResponseBuffers: [ByteBuffer] = []
+    private var pendingResponseBytes = 0
+    private var pendingResponseTrailers: NIOHTTP1.HTTPHeaders?
+    private var breakpointTask: Task<Void, Never>?
+    private var didHandleUpstreamFailure = false
+
+    private var isWaitingOnCompleteResponseBreakpoint: Bool {
+        pendingResponseBreakpoint && breakpointTask != nil
+    }
 
     init(
         clientChannel: Channel,
@@ -829,7 +1039,8 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         usesTLS: Bool,
         bodyStore: (any BodyStore)?,
         maximumCapturedBodyBytes: Int64,
-        ruleSnapshot: (any RuleSnapshotSource)?
+        ruleSnapshot: (any RuleSnapshotSource)?,
+        breakpointGate: any BreakpointGate
     ) {
         self.clientChannel = clientChannel
         self.clientHandler = clientHandler
@@ -839,6 +1050,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         self.bodyStore = bodyStore
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
         self.ruleSnapshot = ruleSnapshot
+        self.breakpointGate = breakpointGate
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -891,11 +1103,17 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                 if responsePlan.applyNoCache {
                     forwardedHead.headers = HTTPConversion.nioHeaders(from: response.headers)
                 }
-                clientChannel.write(
-                    HTTPServerResponsePart.head(
-                        HTTPConversion.sanitizedResponseHead(forwardedHead)),
-                    promise: nil
-                )
+                if responsePlan.shouldBreakpoint {
+                    pendingResponseBreakpoint = true
+                    pendingResponse = capturedResponse
+                    pendingResponseHead = HTTPConversion.sanitizedResponseHead(forwardedHead)
+                } else {
+                    clientChannel.write(
+                        HTTPServerResponsePart.head(
+                            HTTPConversion.sanitizedResponseHead(forwardedHead)),
+                        promise: nil
+                    )
+                }
             } catch {
                 let transaction = self.transaction
                 let message = error.localizedDescription
@@ -908,8 +1126,34 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             }
         case .body(let buffer):
             recordResponseBody(buffer, context: context)
-            clientChannel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+            if pendingResponseBreakpoint {
+                let byteCount = buffer.readableBytes
+                if pendingResponseBytes + byteCount > maximumCapturedBodyBytes {
+                    captureFailureHandled = true
+                    let transaction = self.transaction
+                    Task {
+                        await transaction.fail(
+                            .protocolError("The paused response exceeded the capture limit")
+                        )
+                    }
+                    clientChannel.close(promise: nil)
+                    context.close(promise: nil)
+                    return
+                }
+                pendingResponseBytes += byteCount
+                pendingResponseBuffers.append(buffer)
+            } else {
+                clientChannel.write(
+                    HTTPServerResponsePart.body(.byteBuffer(buffer)),
+                    promise: nil
+                )
+            }
         case .end(let trailers):
+            if pendingResponseBreakpoint {
+                pendingResponseTrailers = trailers
+                beginResponseBreakpoint(context: context)
+                return
+            }
             clientHandler.value.markResponseEnded()
             finishResponseBodyCapture(context: context)
             let forwardedTrailers = HTTPConversion.sanitizedTrailers(trailers)
@@ -920,6 +1164,127 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             }
             context.close(promise: nil)
         }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        if isWaitingOnCompleteResponseBreakpoint {
+            context.fireChannelInactive()
+            return
+        }
+
+        breakpointTask?.cancel()
+        if pendingResponseBreakpoint {
+            failUpstream(
+                error: nil,
+                context: context
+            )
+        }
+        context.fireChannelInactive()
+    }
+
+    private func beginResponseBreakpoint(context: ChannelHandlerContext) {
+        let writeTask = responseBodyWriteTask
+        let headTask = responseHeadTask
+        let recorder = responseBodyRecorder
+        let transaction = self.transaction
+        let gate = breakpointGate
+        let request = self.request
+        let pendingResponse = self.pendingResponse
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: context.eventLoop)
+        let upstreamChannel = context.channel
+        let clientChannel = self.clientChannel
+        let clientHandler = self.clientHandler
+        let completedAt = Date()
+        let task = Task {
+            await headTask?.value
+            do {
+                try await writeTask?.value
+                let reference = try await recorder?.finalize()
+                var pausedResponse = pendingResponse
+                if let reference {
+                    pausedResponse = pausedResponse?.replacingBody(reference)
+                }
+                if let pausedResponse {
+                    await transaction.replaceResponse(pausedResponse)
+                }
+                await transaction.pause(.response)
+                await transaction.finishResponse(reference, at: completedAt)
+                let hit = BreakpointHit(
+                    flowID: await transaction.flowID(),
+                    phase: .response,
+                    request: request,
+                    response: pausedResponse ?? pendingResponse
+                )
+                let decision = await gate.pause(hit)
+                let capturedResponse = pausedResponse
+                upstreamChannel.eventLoop.execute {
+                    loopBoundSelf.value.applyResponseBreakpointDecision(
+                        decision,
+                        capturedResponse: capturedResponse,
+                        upstreamChannel: upstreamChannel
+                    )
+                }
+            } catch {
+                await recorder?.cancel()
+                await transaction.fail(.persistenceError(error.localizedDescription))
+                clientChannel.close(promise: nil)
+                upstreamChannel.close(promise: nil)
+            }
+        }
+        breakpointTask = task
+        clientHandler.value.breakpointTask = task
+    }
+
+    private func applyResponseBreakpointDecision(
+        _ decision: BreakpointDecision,
+        capturedResponse: HTTPResponse?,
+        upstreamChannel: Channel
+    ) {
+        guard clientChannel.isActive else {
+            upstreamChannel.close(promise: nil)
+            return
+        }
+
+        switch decision {
+        case .abort:
+            clientHandler.value.abortBreakpoint(channel: clientChannel)
+            upstreamChannel.close(promise: nil)
+        case .continue(let hit):
+            let continued = hit.response ?? capturedResponse
+            if let continued, continued != capturedResponse {
+                let transaction = self.transaction
+                Task { [transaction] in
+                    await transaction.replaceResponse(continued)
+                    await transaction.completePausedResponse(at: Date())
+                }
+                clientHandler.value.markResponseEnded()
+                clientHandler.value.sendLocalResponse(continued, channel: clientChannel)
+                upstreamChannel.close(promise: nil)
+                return
+            }
+
+            replayBufferedResponse(upstreamChannel: upstreamChannel)
+        }
+    }
+
+    private func replayBufferedResponse(upstreamChannel: Channel) {
+        clientHandler.value.markResponseEnded()
+        if let head = pendingResponseHead {
+            clientChannel.write(HTTPServerResponsePart.head(head), promise: nil)
+        }
+        for buffer in pendingResponseBuffers {
+            clientChannel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+        }
+        let trailers = HTTPConversion.sanitizedTrailers(pendingResponseTrailers)
+        clientChannel.writeAndFlush(HTTPServerResponsePart.end(trailers)).whenComplete {
+            [clientChannel] _ in
+            clientChannel.close(promise: nil)
+        }
+        let transaction = self.transaction
+        Task { [transaction] in
+            await transaction.completePausedResponse(at: Date())
+        }
+        upstreamChannel.close(promise: nil)
     }
 
     private func recordResponseBody(_ buffer: ByteBuffer, context: ChannelHandlerContext) {
@@ -1015,18 +1380,35 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        if isWaitingOnCompleteResponseBreakpoint {
+            return
+        }
+        failUpstream(error: error, context: context)
+    }
+
+    private func failUpstream(error: Error?, context: ChannelHandlerContext) {
+        guard !didHandleUpstreamFailure else {
+            return
+        }
+        didHandleUpstreamFailure = true
+        breakpointTask?.cancel()
+
         let transaction = self.transaction
         let responseBodyRecorder = self.responseBodyRecorder
         let responseHeadTask = self.responseHeadTask
         let failure: FlowFailure =
-            if usesTLS, let sslError = error as? NIOSSLError,
-                case .handshakeFailed = sslError
-            {
-                .tlsHandshakeFailed
-            } else if responseStarted {
-                .protocolError(error.localizedDescription)
+            if let error {
+                if usesTLS, let sslError = error as? NIOSSLError,
+                    case .handshakeFailed = sslError
+                {
+                    .tlsHandshakeFailed
+                } else if responseStarted {
+                    .protocolError(error.localizedDescription)
+                } else {
+                    .upstreamUnavailable
+                }
             } else {
-                .upstreamUnavailable
+                .protocolError("The upstream closed before the response completed")
             }
         Task { [transaction, responseBodyRecorder, responseHeadTask, failure] in
             await responseHeadTask?.value
@@ -1034,26 +1416,33 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             await transaction.fail(failure)
         }
 
-        if !responseStarted {
-            var body = clientChannel.allocator.buffer(capacity: 64)
-            body.writeString("The upstream response could not be read.\r\n")
-
-            var headers = NIOHTTP1.HTTPHeaders()
-            headers.add(name: "Content-Type", value: "text/plain; charset=utf-8")
-            headers.add(name: "Content-Length", value: "\(body.readableBytes)")
-            headers.add(name: "Connection", value: "close")
-
-            let head = HTTPResponseHead(
-                version: .http1_1,
-                status: HTTPResponseStatus(statusCode: 502, reasonPhrase: "Bad Gateway"),
-                headers: headers
-            )
-            clientChannel.write(HTTPServerResponsePart.head(head), promise: nil)
-            clientChannel.write(HTTPServerResponsePart.body(.byteBuffer(body)), promise: nil)
-            clientChannel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
+        let clientHasResponse = responseStarted && !pendingResponseBreakpoint
+        if !clientHasResponse {
+            sendBadGateway(to: clientChannel)
+        } else {
+            clientChannel.close(promise: nil)
         }
-
-        clientChannel.close(promise: nil)
         context.close(promise: nil)
+    }
+
+    private func sendBadGateway(to channel: Channel) {
+        var body = channel.allocator.buffer(capacity: 64)
+        body.writeString("The upstream response could not be read.\r\n")
+
+        var headers = NIOHTTP1.HTTPHeaders()
+        headers.add(name: "Content-Type", value: "text/plain; charset=utf-8")
+        headers.add(name: "Content-Length", value: "\(body.readableBytes)")
+        headers.add(name: "Connection", value: "close")
+
+        let head = HTTPResponseHead(
+            version: .http1_1,
+            status: HTTPResponseStatus(statusCode: 502, reasonPhrase: "Bad Gateway"),
+            headers: headers
+        )
+        channel.write(HTTPServerResponsePart.head(head), promise: nil)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(body)), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in
+            channel.close(promise: nil)
+        }
     }
 }

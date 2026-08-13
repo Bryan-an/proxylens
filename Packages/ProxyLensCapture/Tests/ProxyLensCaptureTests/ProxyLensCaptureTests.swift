@@ -701,6 +701,423 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
+    func testHTTPRequestBreakpointHoldsUpstreamUntilContinue() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint fixture",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let upstreamPort = upstream.endpoint.port
+            async let clientResponse = HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstreamPort)/paused",
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFlow { $0.state == .paused(.request) }
+            XCTAssertEqual(upstream.requestCount, 0)
+
+            let paused = await eventSink.lastFlow { $0.state == .paused(.request) }
+            let pausedFlow = try XCTUnwrap(paused)
+            let pendingHit = await coordinator.hit(for: pausedFlow.id)
+            let hit = try XCTUnwrap(pendingHit)
+            await coordinator.resume(flowID: hit.flowID, decision: .continue(hit))
+
+            let response = try await clientResponse
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("upstream response".utf8))
+            XCTAssertEqual(upstream.requestCount, 1)
+
+            await eventSink.waitForFinished()
+            let finished = await eventSink.lastFlow { $0.state == .completed }
+            let finishedFlow = try XCTUnwrap(finished)
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Breakpoint fixture"])
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.outcome), [.applied])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPRequestBreakpointAbortDoesNotCallUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint fixture",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let upstreamPort = upstream.endpoint.port
+            async let clientResponse = HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstreamPort)/aborted",
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFlow { $0.state == .paused(.request) }
+            let paused = await eventSink.lastFlow { $0.state == .paused(.request) }
+            let pausedFlow = try XCTUnwrap(paused)
+            await coordinator.abort(flowID: pausedFlow.id)
+
+            let response = try await clientResponse
+            XCTAssertEqual(response.statusCode, 403)
+            XCTAssertEqual(
+                String(data: response.body, encoding: .utf8), "Aborted at breakpoint\r\n")
+            XCTAssertEqual(upstream.requestCount, 0)
+
+            await eventSink.waitForFinished()
+            let finished = await eventSink.lastFlow { $0.state.isTerminal }
+            let finishedFlow = try XCTUnwrap(finished)
+            XCTAssertEqual(finishedFlow.state, .cancelled)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPRequestBreakpointAppliesEditedPathAndBody() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream")
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint fixture",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let upstreamPort = upstream.endpoint.port
+            async let clientResponse = HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstreamPort)/original",
+                body: Data("before".utf8),
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFlow { $0.state == .paused(.request) }
+            let paused = await eventSink.lastFlow { $0.state == .paused(.request) }
+            let pausedFlow = try XCTUnwrap(paused)
+            let pendingHit = await coordinator.hit(for: pausedFlow.id)
+            let hit = try XCTUnwrap(pendingHit)
+            let host = try XCTUnwrap(hit.request.headers.firstValue(for: "Host"))
+            let edited = try HTTPMessageText.parseRequest(
+                headersText: """
+                    POST /edited HTTP/1.1
+                    Host: \(host)
+                    Content-Type: text/plain
+                    """,
+                body: Data("after".utf8),
+                original: hit.request
+            )
+            await coordinator.resume(
+                flowID: hit.flowID,
+                decision: .continue(
+                    BreakpointHit(
+                        flowID: hit.flowID,
+                        phase: .request,
+                        request: edited
+                    )
+                )
+            )
+
+            let response = try await clientResponse
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("upstream:after".utf8))
+            XCTAssertEqual(upstream.requestURI, "/edited")
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPResponseBreakpointHoldsClientUntilContinueAndAppliesEdits() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint response",
+                    phase: .responseHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let upstreamPort = upstream.endpoint.port
+            async let clientResponse = HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstreamPort)/response-pause",
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFlow { $0.state == .paused(.response) }
+            XCTAssertEqual(upstream.requestCount, 1)
+
+            let paused = await eventSink.lastFlow { $0.state == .paused(.response) }
+            let pausedFlow = try XCTUnwrap(paused)
+            let pendingHit = await coordinator.hit(for: pausedFlow.id)
+            let hit = try XCTUnwrap(pendingHit)
+            let originalResponse = try XCTUnwrap(hit.response)
+            let edited = try HTTPMessageText.parseResponse(
+                headersText: """
+                    HTTP/1.1 201 Created
+                    Content-Type: text/plain; charset=utf-8
+                    """,
+                body: Data("patched".utf8),
+                original: originalResponse
+            )
+            await coordinator.resume(
+                flowID: hit.flowID,
+                decision: .continue(
+                    BreakpointHit(
+                        flowID: hit.flowID,
+                        phase: .response,
+                        request: hit.request,
+                        response: edited
+                    )
+                )
+            )
+
+            let response = try await clientResponse
+            XCTAssertEqual(response.statusCode, 201)
+            XCTAssertEqual(response.body, Data("patched".utf8))
+
+            await eventSink.waitForFinished()
+            let finished = await eventSink.lastFlow { $0.state == .completed }
+            let finishedFlow = try XCTUnwrap(finished)
+            XCTAssertEqual(finishedFlow.response?.statusCode, 201)
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Breakpoint response"])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPResponseBreakpointFailsWhenUpstreamDropsIncompleteResponse() async throws {
+        let upstream = try await TestHTTPServer.startDroppingAfterPartialResponse()
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint response",
+                    phase: .responseHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/drop",
+                through: proxyEndpoint
+            )
+            XCTAssertEqual(response.statusCode, 502)
+
+            await eventSink.waitForFinished()
+            let finished = await eventSink.lastFlow { flow in
+                if case .failed = flow.state {
+                    return true
+                }
+                return false
+            }
+            let finishedFlow = try XCTUnwrap(finished)
+            let pendingHit = await coordinator.hit(for: finishedFlow.id)
+            XCTAssertNil(pendingHit)
+            guard case .failed(let failure) = finishedFlow.state else {
+                return XCTFail("Expected the incomplete breakpoint response to fail the flow")
+            }
+            switch failure {
+            case .protocolError:
+                break
+            default:
+                XCTFail("Expected a protocol error, got \(failure)")
+            }
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPBreakpointRuleContinuesImmediatelyWithoutACoordinator() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint fixture",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/auto-continue",
+                through: proxyEndpoint
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("upstream response".utf8))
+
+            await eventSink.waitForFinished()
+            let finished = await eventSink.lastFlow { $0.state == .completed }
+            let finishedFlow = try XCTUnwrap(finished)
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.outcome), [.applied])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
     func testHTTPForwardingStreamsAndPersistsRawBodies() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
         let storageRoot = FileManager.default.temporaryDirectory
@@ -1019,6 +1436,7 @@ private actor TestSystemProxyController: SystemProxyController {
 private actor RecordingFlowEventSink: FlowEventSink {
     private var events: [FlowEvent] = []
     private var finishedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var flowWaiters: [FlowWaiter] = []
 
     func publish(_ event: FlowEvent) async {
         events.append(event)
@@ -1029,6 +1447,15 @@ private actor RecordingFlowEventSink: FlowEventSink {
                 waiter.resume()
             }
         }
+
+        let remaining = flowWaiters.filter { waiter in
+            if waiter.predicate(event.flow) {
+                waiter.continuation.resume()
+                return false
+            }
+            return true
+        }
+        flowWaiters = remaining
     }
 
     func waitForFinished() async {
@@ -1046,8 +1473,29 @@ private actor RecordingFlowEventSink: FlowEventSink {
         }
     }
 
+    func waitForFlow(
+        where predicate: @escaping @Sendable (Flow) -> Bool
+    ) async {
+        if events.contains(where: { predicate($0.flow) }) {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            flowWaiters.append(FlowWaiter(predicate: predicate, continuation: continuation))
+        }
+    }
+
     func snapshot() -> [FlowEvent] {
         events
+    }
+
+    func lastFlow(where predicate: @Sendable (Flow) -> Bool) -> Flow? {
+        events.map(\.flow).last(where: predicate)
+    }
+
+    private struct FlowWaiter {
+        let predicate: @Sendable (Flow) -> Bool
+        let continuation: CheckedContinuation<Void, Never>
     }
 }
 
@@ -1496,6 +1944,14 @@ private final class TestHTTPServer {
         try await start(responseBody: "", tlsContext: nil, responds: false)
     }
 
+    static func startDroppingAfterPartialResponse() async throws -> TestHTTPServer {
+        try await start(
+            responseBody: "partial",
+            tlsContext: nil,
+            closeAfterPartialResponse: true
+        )
+    }
+
     static func startHTTPS(
         responseBody: String,
         identity: CertificateIdentity
@@ -1510,7 +1966,8 @@ private final class TestHTTPServer {
         responseBody: String,
         tlsContext: NIOSSLContext?,
         responds: Bool = true,
-        extraResponseHeaders: [(String, String)] = []
+        extraResponseHeaders: [(String, String)] = [],
+        closeAfterPartialResponse: Bool = false
     ) async throws -> TestHTTPServer {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let state = TestHTTPServerState()
@@ -1536,6 +1993,7 @@ private final class TestHTTPServer {
                                     responseBody: responseBody,
                                     responds: responds,
                                     extraResponseHeaders: extraResponseHeaders,
+                                    closeAfterPartialResponse: closeAfterPartialResponse,
                                     state: state
                                 )
                             )
@@ -1597,6 +2055,7 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
     private let responseBody: String
     private let responds: Bool
     private let extraResponseHeaders: [(String, String)]
+    private let closeAfterPartialResponse: Bool
     private let state: TestHTTPServerState
     private var requestBody = Data()
 
@@ -1604,11 +2063,13 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
         responseBody: String,
         responds: Bool,
         extraResponseHeaders: [(String, String)],
+        closeAfterPartialResponse: Bool,
         state: TestHTTPServerState
     ) {
         self.responseBody = responseBody
         self.responds = responds
         self.extraResponseHeaders = extraResponseHeaders
+        self.closeAfterPartialResponse = closeAfterPartialResponse
         self.state = state
     }
 
@@ -1622,6 +2083,30 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
             }
         case .end:
             guard responds else {
+                return
+            }
+            let loopBoundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
+            if closeAfterPartialResponse {
+                var headers = NIOHTTP1.HTTPHeaders()
+                headers.add(name: "Content-Type", value: "text/plain")
+                headers.add(name: "Content-Length", value: "32")
+                headers.add(name: "Connection", value: "close")
+                let head = HTTPResponseHead(
+                    version: .http1_1,
+                    status: .ok,
+                    headers: headers
+                )
+                context.write(Self.wrapOutboundOut(.head(head)), promise: nil)
+                var body = context.channel.allocator.buffer(capacity: responseBody.utf8.count)
+                body.writeString(responseBody)
+                let flushed = context.eventLoop.makePromise(of: Void.self)
+                context.writeAndFlush(
+                    Self.wrapOutboundOut(.body(.byteBuffer(body))),
+                    promise: flushed
+                )
+                flushed.futureResult.whenComplete { _ in
+                    loopBoundContext.value.close(promise: nil)
+                }
                 return
             }
             let bodySuffix =
@@ -1648,7 +2133,6 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
             )
             context.write(Self.wrapOutboundOut(.head(head)), promise: nil)
             context.write(Self.wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
-            let loopBoundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
             context.writeAndFlush(Self.wrapOutboundOut(.end(nil))).whenComplete { _ in
                 loopBoundContext.value.close(promise: nil)
             }

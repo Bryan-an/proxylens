@@ -1,8 +1,12 @@
 import AppKit
+import ProxyLensCore
 
 @MainActor
-final class InspectorViewController: NSViewController {
+final class InspectorViewController: NSViewController, NSTextViewDelegate {
+    private let viewModel: TrafficConsoleViewModel?
     private let titleField = NSTextField(labelWithString: "No Flow Selected")
+    private let continueButton = NSButton(title: "Continue", target: nil, action: nil)
+    private let abortButton = NSButton(title: "Abort", target: nil, action: nil)
     private let messageSelector = NSSegmentedControl(
         labels: ["Request", "Response", "Rules"],
         trackingMode: .selectOne,
@@ -17,12 +21,37 @@ final class InspectorViewController: NSViewController {
     )
     private let textView = NSTextView()
     private var inspection = TrafficFlowInspection.empty
+    private var editedHeaders: [Int: String] = [:]
+    private var editedBodies: [Int: String] = [:]
+    private var hasUserEdits = false
+
+    init(viewModel: TrafficConsoleViewModel? = nil) {
+        self.viewModel = viewModel
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     override func loadView() {
         titleField.translatesAutoresizingMaskIntoConstraints = false
         titleField.font = .systemFont(ofSize: 13, weight: .semibold)
         titleField.lineBreakMode = .byTruncatingMiddle
         titleField.maximumNumberOfLines = 1
+
+        continueButton.translatesAutoresizingMaskIntoConstraints = false
+        continueButton.bezelStyle = .rounded
+        continueButton.target = self
+        continueButton.action = #selector(continueBreakpoint)
+        continueButton.setAccessibilityIdentifier("inspector.continue")
+
+        abortButton.translatesAutoresizingMaskIntoConstraints = false
+        abortButton.bezelStyle = .rounded
+        abortButton.target = self
+        abortButton.action = #selector(abortBreakpoint)
+        abortButton.setAccessibilityIdentifier("inspector.abort")
 
         messageSelector.translatesAutoresizingMaskIntoConstraints = false
         messageSelector.selectedSegment = 0
@@ -36,6 +65,7 @@ final class InspectorViewController: NSViewController {
         sectionSelector.action = #selector(selectionChanged)
         sectionSelector.setAccessibilityIdentifier("inspector.section")
 
+        textView.delegate = self
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = false
@@ -62,6 +92,12 @@ final class InspectorViewController: NSViewController {
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
 
+        let breakpointStack = NSStackView(views: [continueButton, abortButton])
+        breakpointStack.translatesAutoresizingMaskIntoConstraints = false
+        breakpointStack.orientation = .horizontal
+        breakpointStack.spacing = 8
+        breakpointStack.alignment = .centerY
+
         let selectorStack = NSStackView(views: [messageSelector, sectionSelector])
         selectorStack.translatesAutoresizingMaskIntoConstraints = false
         selectorStack.orientation = .horizontal
@@ -70,12 +106,21 @@ final class InspectorViewController: NSViewController {
 
         let container = NSView()
         container.addSubview(titleField)
+        container.addSubview(breakpointStack)
         container.addSubview(selectorStack)
         container.addSubview(scrollView)
         NSLayoutConstraint.activate([
             titleField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            titleField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            titleField.trailingAnchor.constraint(
+                lessThanOrEqualTo: breakpointStack.leadingAnchor,
+                constant: -8
+            ),
             titleField.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            breakpointStack.trailingAnchor.constraint(
+                equalTo: container.trailingAnchor,
+                constant: -10
+            ),
+            breakpointStack.centerYAnchor.constraint(equalTo: titleField.centerYAnchor),
             selectorStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
             selectorStack.trailingAnchor.constraint(
                 equalTo: container.trailingAnchor, constant: -10),
@@ -90,8 +135,20 @@ final class InspectorViewController: NSViewController {
     }
 
     func render(_ snapshot: TrafficConsoleSnapshot) {
+        let previousFlowID = inspection.flowID
+        let previousBreakpoint = inspection.breakpoint
         inspection = snapshot.inspection
+        if previousFlowID != inspection.flowID || previousBreakpoint != inspection.breakpoint {
+            editedHeaders.removeAll()
+            editedBodies.removeAll()
+            hasUserEdits = false
+        }
         titleField.stringValue = inspection.title
+        let isPaused = inspection.breakpoint != nil
+        continueButton.isHidden = !isPaused
+        abortButton.isHidden = !isPaused
+        continueButton.isEnabled = isPaused
+        abortButton.isEnabled = isPaused
         messageSelector.isEnabled = inspection.flowID != nil
         messageSelector.setEnabled(inspection.request != nil, forSegment: 0)
         messageSelector.setEnabled(inspection.response != nil, forSegment: 1)
@@ -101,44 +158,139 @@ final class InspectorViewController: NSViewController {
         if inspection.response == nil, messageSelector.selectedSegment == 1 {
             messageSelector.selectedSegment = 0
         }
+        if previousBreakpoint == nil, let breakpoint = inspection.breakpoint {
+            messageSelector.selectedSegment = breakpoint.phase == .response ? 1 : 0
+        }
+        if hasUserEdits, previousFlowID == inspection.flowID {
+            updateEditingState()
+            return
+        }
         updateContent()
     }
 
     @objc private func selectionChanged(_ sender: Any?) {
+        saveCurrentEdits()
         updateContent()
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard textView.isEditable else {
+            return
+        }
+        hasUserEdits = true
+        saveCurrentEdits()
     }
 
     private func updateContent() {
         sectionSelector.isEnabled = inspection.flowID != nil && messageSelector.selectedSegment != 2
         if messageSelector.selectedSegment == 2 {
             textView.string = inspection.rules
+            textView.isEditable = false
             textView.scrollToBeginningOfDocument(nil)
             return
         }
         guard let message = selectedMessage else {
             textView.string = "Select a captured flow to inspect its request and response."
+            textView.isEditable = false
             return
         }
         if sectionSelector.selectedSegment == 0 {
-            textView.string = message.headers
+            textView.string =
+                editedHeaders[messageSelector.selectedSegment] ?? message.headers
+        } else if let editedBody = editedBodies[messageSelector.selectedSegment] {
+            textView.string = editedBody
         } else {
-            textView.string = Self.bodyText(message.body)
+            textView.string = Self.bodyText(message.body, editable: isEditingCurrentMessage)
         }
+        updateEditingState()
         textView.scrollToBeginningOfDocument(nil)
+    }
+
+    private func updateEditingState() {
+        textView.isEditable = isEditingCurrentSection
     }
 
     private var selectedMessage: TrafficMessageInspection? {
         messageSelector.selectedSegment == 1 ? inspection.response : inspection.request
     }
 
-    private static func bodyText(_ body: TrafficBodyPresentation) -> String {
+    private var isEditingCurrentMessage: Bool {
+        guard let breakpoint = inspection.breakpoint else {
+            return false
+        }
+        switch breakpoint.phase {
+        case .request:
+            return messageSelector.selectedSegment == 0
+        case .response:
+            return messageSelector.selectedSegment == 1
+        }
+    }
+
+    private var isEditingCurrentSection: Bool {
+        guard isEditingCurrentMessage, messageSelector.selectedSegment != 2 else {
+            return false
+        }
+        if sectionSelector.selectedSegment == 0 {
+            return true
+        }
+        return inspection.breakpoint?.canEditBody == true
+    }
+
+    private func saveCurrentEdits() {
+        guard isEditingCurrentMessage, messageSelector.selectedSegment != 2 else {
+            return
+        }
+        if sectionSelector.selectedSegment == 0 {
+            editedHeaders[messageSelector.selectedSegment] = textView.string
+        } else if inspection.breakpoint?.canEditBody == true {
+            editedBodies[messageSelector.selectedSegment] = textView.string
+        }
+    }
+
+    @objc private func continueBreakpoint() {
+        saveCurrentEdits()
+        guard let breakpoint = inspection.breakpoint else {
+            return
+        }
+        let messageIndex = breakpoint.phase == .response ? 1 : 0
+        let headersText: String
+        if let edited = editedHeaders[messageIndex] {
+            headersText = edited
+        } else if messageIndex == 1 {
+            headersText = inspection.response?.headers ?? ""
+        } else {
+            headersText = inspection.request?.headers ?? ""
+        }
+        let bodyText = editedBodies[messageIndex]
+        Task { @MainActor in
+            do {
+                try await viewModel?.continueBreakpoint(
+                    headersText: headersText,
+                    bodyText: bodyText
+                )
+            } catch {
+                let alert = NSAlert(error: error)
+                if let window = view.window {
+                    await alert.beginSheetModal(for: window)
+                } else {
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    @objc private func abortBreakpoint() {
+        viewModel?.abortBreakpoint()
+    }
+
+    private static func bodyText(_ body: TrafficBodyPresentation, editable: Bool) -> String {
         switch body {
         case .none(let message):
-            return message
+            return editable ? "" : message
         case .loading(let metadata):
             return "\(metadata)\n\nLoading captured bytes…"
         case .content(let metadata, let value):
-            return "\(metadata)\n\n\(value)"
+            return editable ? value : "\(metadata)\n\n\(value)"
         case .failed(let metadata, let message):
             return "\(metadata)\n\nUnable to read captured bytes:\n\(message)"
         }

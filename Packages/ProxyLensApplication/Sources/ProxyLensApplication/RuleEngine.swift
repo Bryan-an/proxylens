@@ -160,6 +160,29 @@ public actor RuleEngine {
         return rule
     }
 
+    @discardableResult
+    public func breakpoint(
+        host: String,
+        path: String,
+        phase: RulePhase
+    ) -> Rule {
+        let normalizedPath = Self.normalizedPath(path)
+        let resolvedPhase = phase == .responseHeaders ? RulePhase.responseHeaders : .requestHeaders
+        let phaseLabel = resolvedPhase == .responseHeaders ? "response" : "request"
+        let rule = Rule(
+            name: "Breakpoint \(phaseLabel) \(host)\(normalizedPath)",
+            priority: 18,
+            phase: resolvedPhase,
+            matcher: .allOf([
+                .host(.exact(host)),
+                .path(.exact(normalizedPath))
+            ]),
+            action: .breakpoint
+        )
+        add(rule)
+        return rule
+    }
+
     private static func mappedLocalResourceIDs(in ruleSet: RuleSet) -> Set<String> {
         Set(
             ruleSet.rules.compactMap { rule in

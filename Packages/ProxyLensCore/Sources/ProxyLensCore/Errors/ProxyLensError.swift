@@ -9,6 +9,7 @@ public enum ProxyLensError: Error, Equatable, LocalizedError, Sendable {
     case invalidFlowTransition(from: FlowState, to: FlowState)
     case invalidPattern(String)
     case invalidURL(String)
+    case invalidHTTPMessage(String)
     case unsupportedOperation(String)
 
     public var errorDescription: String? {
@@ -27,6 +28,8 @@ public enum ProxyLensError: Error, Equatable, LocalizedError, Sendable {
             "Invalid matcher pattern: \(pattern)"
         case .invalidURL(let url):
             "Invalid URL: \(url)"
+        case .invalidHTTPMessage(let message):
+            "Invalid HTTP message: \(message)"
         case .unsupportedOperation(let operation):
             "Unsupported operation: \(operation)"
         }

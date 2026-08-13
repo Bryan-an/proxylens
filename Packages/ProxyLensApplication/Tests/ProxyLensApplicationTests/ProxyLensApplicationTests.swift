@@ -162,6 +162,69 @@ final class ProxyLensApplicationTests: XCTestCase {
         }
     }
 
+    func testRuleEnginePublishesBreakpointRules() async {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+
+        let requestRule = await engine.breakpoint(
+            host: "api.example.com",
+            path: "/users?unused=1",
+            phase: .requestHeaders
+        )
+        let responseRule = await engine.breakpoint(
+            host: "api.example.com",
+            path: "/users",
+            phase: .responseHeaders
+        )
+
+        XCTAssertEqual(requestRule.name, "Breakpoint request api.example.com/users")
+        XCTAssertEqual(requestRule.priority, 18)
+        XCTAssertEqual(requestRule.phase, .requestHeaders)
+        XCTAssertEqual(requestRule.action, .breakpoint)
+        XCTAssertEqual(responseRule.name, "Breakpoint response api.example.com/users")
+        XCTAssertEqual(responseRule.phase, .responseHeaders)
+
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .get,
+                    url: URL(string: "https://api.example.com/users")!
+                )
+            ),
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(matching.map(\.id), [requestRule.id])
+    }
+
+    func testBreakpointCoordinatorWaitsUntilResumeOrAbort() async {
+        let coordinator = BreakpointCoordinator()
+        let request = HTTPRequest(method: .get, url: URL(string: "http://example.com/pause")!)
+        let hit = BreakpointHit(flowID: FlowID(), phase: .request, request: request)
+
+        let paused = Task {
+            await coordinator.pause(hit)
+        }
+        while await coordinator.hit(for: hit.flowID) == nil {
+            await Task.yield()
+        }
+
+        let pendingHit = await coordinator.hit(for: hit.flowID)
+        XCTAssertEqual(pendingHit?.flowID, hit.flowID)
+        await coordinator.resume(flowID: hit.flowID, decision: .continue(hit))
+        let continued = await paused.value
+        XCTAssertEqual(continued, .continue(hit))
+
+        let aborting = Task {
+            await coordinator.pause(hit)
+        }
+        while await coordinator.hit(for: hit.flowID) == nil {
+            await Task.yield()
+        }
+        await coordinator.abortAll()
+        let aborted = await aborting.value
+        XCTAssertEqual(aborted, .abort)
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()

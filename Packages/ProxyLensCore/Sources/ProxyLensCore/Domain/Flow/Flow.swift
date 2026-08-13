@@ -110,6 +110,10 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
         self.request = request
     }
 
+    public mutating func replaceResponse(_ response: HTTPResponse) {
+        self.response = response
+    }
+
     public mutating func markRequestHeadersReceived(at date: Date) {
         timing.markRequestHeadersReceived(at: date)
     }

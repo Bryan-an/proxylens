@@ -120,6 +120,10 @@ struct FlowRepository: Sendable {
             "connecting_upstream"
         case .receivingResponse:
             "receiving_response"
+        case .paused(.request):
+            "paused_request"
+        case .paused(.response):
+            "paused_response"
         case .completed:
             "completed"
         case .cancelled:

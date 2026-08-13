@@ -105,4 +105,11 @@ public struct BodyReference: Codable, Equatable, Hashable, Sendable {
             false
         }
     }
+
+    public var inlineData: Data? {
+        if case .inline(let data) = storage {
+            return data
+        }
+        return nil
+    }
 }
