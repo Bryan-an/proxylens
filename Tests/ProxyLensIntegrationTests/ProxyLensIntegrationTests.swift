@@ -46,6 +46,23 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.visibleRows.map(\.id), [second.id])
     }
 
+    func testConsoleStoreReplaceAllResetsRowsAndKeepsFilters() throws {
+        let first = try Self.makeFlow(index: 1, host: "api.example.com", statusCode: 200)
+        let second = try Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 404)
+        let replacement = try Self.makeFlow(index: 3, host: "api.example.com", statusCode: 201)
+        var store = TrafficConsoleStore()
+        store.apply([.finished(first), .finished(second)])
+        store.selectFlow(first.id)
+        store.setDisplayFilter(TrafficDisplayFilter(searchText: "api"))
+
+        store.replaceAll([replacement])
+        let snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.allFlowCount, 1)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [replacement.id])
+        XCTAssertNil(snapshot.selectedFlowID)
+        XCTAssertEqual(snapshot.displayFilter.searchText, "api")
+    }
+
     func testDisplayFilterComposesSearchFacetsAndDomainSelection() throws {
         let matching = try Self.makeFlow(
             index: 1,
@@ -470,6 +487,123 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertTrue(responseMetadata.contains("3 B"))
         XCTAssertTrue(responseValue.contains("00000000"))
         XCTAssertTrue(responseValue.contains("00 01 ff"))
+    }
+
+    func testViewModelHydratesPersistedWorkspaceAndClearsItOffline() async throws {
+        let first = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("request body".utf8),
+            responseBody: Data("response body".utf8)
+        )
+        let second = try Self.makeFlow(
+            index: 2,
+            host: "cdn.example.com",
+            statusCode: 404
+        )
+        let sessionService = RecordingSessionService(flows: [first, second])
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            exportService: ExportService(bodyStore: InlineBodyStore()),
+            sessionService: sessionService
+        )
+
+        await viewModel.prepare()
+
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 2)
+        XCTAssertEqual(viewModel.snapshot.visibleRows.map(\.id), [first.id, second.id])
+        XCTAssertEqual(viewModel.snapshot.capture, .stopped)
+
+        viewModel.selectFlow(first.id)
+        try await waitUntil {
+            guard case .content = viewModel.snapshot.inspection.request?.body else {
+                return false
+            }
+            return true
+        }
+        guard
+            case .content(_, let requestValue) = viewModel.snapshot.inspection.request?.body
+        else {
+            return XCTFail("Expected loaded request body")
+        }
+        XCTAssertEqual(requestValue, "request body")
+
+        let command = try await viewModel.curlCommand(for: first.id)
+        XCTAssertTrue(command.contains("curl 'https://api.example.com/v1/items/1?source=test'"))
+        XCTAssertTrue(command.contains("--data-binary 'request body'"))
+
+        try await viewModel.clearSession()
+        let didClear = await sessionService.cleared()
+        XCTAssertTrue(didClear)
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 0)
+        XCTAssertTrue(viewModel.snapshot.visibleRows.isEmpty)
+        XCTAssertNil(viewModel.snapshot.selectedFlowID)
+        XCTAssertEqual(viewModel.snapshot.inspection, .empty)
+    }
+
+    func testViewModelStopsCaptureAndDropsPendingEventsWhenClearingTheSession() async throws {
+        let persisted = try Self.makeFlow(index: 1, host: "api.example.com", statusCode: 200)
+        let pending = try Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 404)
+        let sessionService = RecordingSessionService(flows: [persisted])
+        let captureController = RecordingCaptureController()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: captureController,
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            sessionService: sessionService
+        )
+
+        await viewModel.prepare()
+        viewModel.toggleCapture()
+        try await waitUntil {
+            if case .running = viewModel.snapshot.capture {
+                return true
+            }
+            return false
+        }
+        viewModel.receive(.finished(pending))
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 1)
+
+        try await viewModel.clearSession()
+
+        XCTAssertEqual(viewModel.snapshot.capture, .stopped)
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 0)
+        XCTAssertTrue(viewModel.snapshot.visibleRows.isEmpty)
+        let didClear = await sessionService.cleared()
+        XCTAssertTrue(didClear)
+        let calls = await captureController.calls()
+        XCTAssertEqual(calls, ["recover", "start", "stop"])
+
+        viewModel.flushPendingEvents()
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 0)
+    }
+
+    func testViewModelSurfacesWorkspaceHydrationFailures() async throws {
+        let sessionService = RecordingSessionService(
+            loadError: ProxyLensError.unsupportedOperation("The capture database could not be read")
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            sessionService: sessionService
+        )
+
+        await viewModel.prepare()
+
+        XCTAssertEqual(viewModel.snapshot.capture, .stopped)
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 0)
+        XCTAssertEqual(
+            viewModel.snapshot.workspaceWarning,
+            "Could not restore the previous session: Unsupported operation: The capture database could not be read"
+        )
     }
 
     func testCaptureControlPresentsRecoveryStartAndStopTransitions() async throws {
@@ -962,5 +1096,50 @@ private actor InlineBodyReader: TrafficBodyReading {
             throw CocoaError(.fileReadNoSuchFile)
         }
         return data
+    }
+}
+
+private actor InlineBodyStore: BodyStore {
+    func beginWrite(
+        metadata _: BodyMetadata,
+        maximumByteCount _: Int64?
+    ) throws -> any BodyWriter {
+        throw CocoaError(.fileWriteUnknown)
+    }
+
+    func read(_ reference: BodyReference) throws -> Data {
+        guard case .inline(let data) = reference.storage else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        return data
+    }
+
+    func remove(_: BodyReference) {}
+}
+
+private actor RecordingSessionService: TrafficSessionLoading {
+    private var flows: [Flow]
+    private var didClear = false
+    private let loadError: (any Error)?
+
+    init(flows: [Flow] = [], loadError: (any Error)? = nil) {
+        self.flows = flows
+        self.loadError = loadError
+    }
+
+    func loadWorkspace() throws -> [Flow] {
+        if let loadError {
+            throw loadError
+        }
+        return flows
+    }
+
+    func clearWorkspace() {
+        flows = []
+        didClear = true
+    }
+
+    func cleared() -> Bool {
+        didClear
     }
 }

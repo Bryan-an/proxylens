@@ -83,6 +83,12 @@ public actor GRDBSessionStore: SessionStore {
         }
     }
 
+    public func listAllFlows() async throws -> [Flow] {
+        try await database.pool.read { database in
+            try FlowRepository.fetchAll(from: database)
+        }
+    }
+
     public func listSummaries(in sessionID: SessionID) async throws -> [FlowSummary] {
         try await listFlows(in: sessionID).map(\.summary)
     }

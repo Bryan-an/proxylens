@@ -12,15 +12,7 @@ final class CompositionRoot {
     let trafficConsoleViewModel: TrafficConsoleViewModel
 
     init(fileManager: FileManager = .default) throws {
-        let applicationSupportURL = try fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let storageRoot =
-            applicationSupportURL
-            .appendingPathComponent("ProxyLens", isDirectory: true)
+        let storageRoot = try Self.storageRoot(fileManager: fileManager)
         let databaseConfiguration = DatabaseConfiguration(
             databaseURL: storageRoot.appendingPathComponent("Capture.sqlite", isDirectory: false),
             bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies", isDirectory: true)
@@ -58,6 +50,7 @@ final class CompositionRoot {
         )
         let bodyReader = FlowBodyReader(bodyStore: bodyStore)
         let exportService = ExportService(bodyStore: bodyStore)
+        let sessionService = SessionService(sessionStore: sessionStore)
 
         self.flowEvents = flowEvents
         self.captureCoordinator = captureCoordinator
@@ -73,7 +66,28 @@ final class CompositionRoot {
             ),
             ruleEngine: ruleEngine,
             breakpointCoordinator: breakpointCoordinator,
-            exportService: exportService
+            exportService: exportService,
+            sessionService: sessionService
         )
+    }
+
+    private static func storageRoot(fileManager: FileManager) throws -> URL {
+        let arguments = ProcessInfo.processInfo.arguments
+        if let flagIndex = arguments.firstIndex(of: "-ProxyLensStorageRoot") {
+            let pathIndex = arguments.index(after: flagIndex)
+            if pathIndex < arguments.endIndex {
+                let override = URL(fileURLWithPath: arguments[pathIndex], isDirectory: true)
+                try fileManager.createDirectory(at: override, withIntermediateDirectories: true)
+                return override
+            }
+        }
+
+        let applicationSupportURL = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        return applicationSupportURL.appendingPathComponent("ProxyLens", isDirectory: true)
     }
 }

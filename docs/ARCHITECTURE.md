@@ -428,7 +428,7 @@ FlowTableDataSource / InspectorViewModel
 AppKit views
 ```
 
-The view model may maintain a display projection for sorting and grouping. It must retain a reference to the authoritative flow and body store for inspection and export.
+The view model may maintain a display projection for sorting and grouping. It hydrates that projection from `SessionService` on launch and retains the body store for inspection and export.
 
 ## Persistence architecture
 
@@ -478,6 +478,12 @@ P0 export currently implemented:
 - Export HAR 1.2 for a single flow. Incomplete flows emit `status` 0. Truncation, cancellation, and failure are recorded in `comment`. `ExportService` reads in-memory `Flow` snapshots and body bytes; it does not import HAR, export a session, or talk to NIO.
 
 The traffic console exposes both actions on the flow-table context menu. Inspector text is not the export source.
+
+P0 session persistence currently implemented:
+
+- Capture upserts every flow snapshot into `GRDBSessionStore` before the UI sees it. Bodies stay in `FileBodyStore`.
+- On launch, `SessionService.loadWorkspace()` hydrates the traffic console with every persisted flow, oldest first, after capture recovery. Inspection and HAR/cURL work with capture stopped because they read `BodyStore` from those restored `Flow` snapshots.
+- Clear Session stops capture if it is running, empties the console, and deletes every session plus body files. Pending live events are discarded so cleared flows cannot reappear. A new capture can append afterward. Restore failures are shown in the status bar. There is no session picker or portable session file; HAR remains the interchange format.
 
 ## Security and platform boundaries
 
@@ -572,7 +578,8 @@ Tests must not depend on the public internet.
 8. Add display filters and search.
 9. Add Map Local, Map Remote, Breakpoint, Block/Allow, and no-cache rules.
 10. Add HAR and cURL export.
-11. Add signing, notarization, and a direct-download release workflow.
+11. Restore persisted sessions into the traffic console and clear the workspace.
+12. Add signing, notarization, and a direct-download release workflow.
 
 Do not start HTTP/2, HTTP/3, Network Extension, mobile capture, scripting, cloud sync, or team collaboration until the P0 workflow is reliable.
 

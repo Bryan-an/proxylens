@@ -9,6 +9,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let inspectorController: InspectorViewController
     private let splitViewController = NSSplitViewController()
     private let captureButton = NSButton()
+    private let clearSessionButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
@@ -53,11 +54,19 @@ final class TrafficConsoleViewController: NSViewController {
         captureButton.keyEquivalentModifierMask = [.command]
         captureButton.setAccessibilityIdentifier("capture.toggle")
 
+        clearSessionButton.translatesAutoresizingMaskIntoConstraints = false
+        clearSessionButton.title = "Clear Session"
+        clearSessionButton.bezelStyle = .rounded
+        clearSessionButton.target = self
+        clearSessionButton.action = #selector(clearSession)
+        clearSessionButton.setAccessibilityIdentifier("session.clear")
+
         let header = NSView()
         header.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
+        header.addSubview(clearSessionButton)
         header.addSubview(captureButton)
         NSLayoutConstraint.activate([
             appTitle.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 12),
@@ -69,7 +78,10 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.leadingAnchor.constraint(equalTo: statusImage.trailingAnchor, constant: 5),
             statusField.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusField.trailingAnchor.constraint(
-                lessThanOrEqualTo: captureButton.leadingAnchor, constant: -12),
+                lessThanOrEqualTo: clearSessionButton.leadingAnchor, constant: -12),
+            clearSessionButton.trailingAnchor.constraint(
+                equalTo: captureButton.leadingAnchor, constant: -8),
+            clearSessionButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             captureButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -12),
             captureButton.centerYAnchor.constraint(equalTo: header.centerYAnchor)
         ])
@@ -157,15 +169,48 @@ final class TrafficConsoleViewController: NSViewController {
             accessibilityDescription: presentation.status
         )
         filterBar.render(snapshot)
-        statusImage.contentTintColor = presentation.color
-        statusField.stringValue = presentation.status
-        statusField.toolTip = presentation.status
         captureButton.title = presentation.buttonTitle
         captureButton.isEnabled = presentation.buttonEnabled
+        if case .failed = snapshot.capture {
+            statusField.stringValue = presentation.status
+            statusField.toolTip = presentation.status
+            statusImage.contentTintColor = presentation.color
+        } else if let warning = snapshot.workspaceWarning {
+            statusField.stringValue = warning
+            statusField.toolTip = warning
+            statusImage.contentTintColor = .systemOrange
+        } else {
+            statusField.stringValue = presentation.status
+            statusField.toolTip = presentation.status
+            statusImage.contentTintColor = presentation.color
+        }
+        let canClear: Bool
+        switch snapshot.capture {
+        case .stopped, .failed, .running:
+            canClear = snapshot.allFlowCount > 0
+        case .recovering, .starting, .stopping:
+            canClear = false
+        }
+        clearSessionButton.isEnabled = canClear
     }
 
     @objc private func toggleCapture() {
         viewModel.toggleCapture()
+    }
+
+    @objc private func clearSession() {
+        Task { @MainActor in
+            do {
+                try await viewModel.clearSession()
+            } catch {
+                let alert = NSAlert(error: error)
+                if let window = view.window {
+                    await alert.beginSheetModal(for: window)
+                } else {
+                    alert.runModal()
+                }
+            }
+        }
     }
 }
 

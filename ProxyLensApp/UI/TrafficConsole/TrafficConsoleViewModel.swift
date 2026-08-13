@@ -27,6 +27,13 @@ protocol TrafficBodyReading: Sendable {
 
 extension FlowBodyReader: TrafficBodyReading {}
 
+protocol TrafficSessionLoading: Sendable {
+    func loadWorkspace() async throws -> [Flow]
+    func clearWorkspace() async throws
+}
+
+extension SessionService: TrafficSessionLoading {}
+
 @MainActor
 final class TrafficConsoleViewModel: ObservableObject {
     @Published private(set) var snapshot = TrafficConsoleSnapshot.initial
@@ -39,12 +46,15 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let ruleEngine: RuleEngine?
     private let breakpointCoordinator: BreakpointCoordinator?
     private let exportService: ExportService?
+    private let sessionService: (any TrafficSessionLoading)?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
     private var inspection = TrafficFlowInspection.empty
     private var pendingEvents: [FlowEvent] = []
     private var isPrepared = false
+    private var isClearingSession = false
+    private var workspaceWarning: String?
     private var eventTask: Task<Void, Never>?
     private var eventBatchTask: Task<Void, Never>?
     private var bodyTask: Task<Void, Never>?
@@ -58,7 +68,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         eventBatchDelay: Duration = .milliseconds(40),
         ruleEngine: RuleEngine? = nil,
         breakpointCoordinator: BreakpointCoordinator? = nil,
-        exportService: ExportService? = nil
+        exportService: ExportService? = nil,
+        sessionService: (any TrafficSessionLoading)? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -68,6 +79,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.ruleEngine = ruleEngine
         self.breakpointCoordinator = breakpointCoordinator
         self.exportService = exportService
+        self.sessionService = sessionService
     }
 
     deinit {
@@ -91,6 +103,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         } catch {
             capturePresentation = .failed(error.localizedDescription)
         }
+        await hydrateWorkspace()
         publishSnapshot()
         subscribeToFlowEvents()
     }
@@ -212,6 +225,35 @@ final class TrafficConsoleViewModel: ObservableObject {
         return try await exportService.har(for: flow)
     }
 
+    func clearSession() async throws {
+        switch capturePresentation {
+        case .recovering, .starting, .stopping:
+            throw ProxyLensError.unsupportedOperation(
+                "Wait until capture has finished starting or stopping before clearing the session"
+            )
+        case .running:
+            await stopCapture()
+            guard case .stopped = capturePresentation else {
+                throw ProxyLensError.unsupportedOperation(
+                    "Capture must be stopped before the session can be cleared"
+                )
+            }
+        case .stopped, .failed:
+            break
+        }
+
+        isClearingSession = true
+        defer { isClearingSession = false }
+        discardPendingFlowEvents()
+        try await sessionService?.clearWorkspace()
+        discardPendingFlowEvents()
+        store.replaceAll([])
+        bodyTask?.cancel()
+        inspection = .empty
+        workspaceWarning = nil
+        publishSnapshot()
+    }
+
     func continueBreakpoint(headersText: String, bodyText: String?) async throws {
         guard let flow = store.selectedFlow,
             let coordinator = breakpointCoordinator,
@@ -279,6 +321,9 @@ final class TrafficConsoleViewModel: ObservableObject {
     }
 
     func receive(_ event: FlowEvent) {
+        guard !isClearingSession else {
+            return
+        }
         pendingEvents.append(event)
         guard eventBatchTask == nil else {
             return
@@ -289,6 +334,9 @@ final class TrafficConsoleViewModel: ObservableObject {
             } catch {
                 return
             }
+            guard !Task.isCancelled else {
+                return
+            }
             self?.flushPendingEvents()
         }
     }
@@ -296,6 +344,10 @@ final class TrafficConsoleViewModel: ObservableObject {
     func flushPendingEvents() {
         eventBatchTask?.cancel()
         eventBatchTask = nil
+        guard !isClearingSession else {
+            pendingEvents.removeAll(keepingCapacity: true)
+            return
+        }
         guard !pendingEvents.isEmpty else {
             return
         }
@@ -310,6 +362,27 @@ final class TrafficConsoleViewModel: ObservableObject {
         } else {
             publishSnapshot()
         }
+    }
+
+    private func hydrateWorkspace() async {
+        guard let sessionService else {
+            return
+        }
+
+        do {
+            let flows = try await sessionService.loadWorkspace()
+            store.replaceAll(flows)
+            workspaceWarning = nil
+        } catch {
+            workspaceWarning =
+                "Could not restore the previous session: \(error.localizedDescription)"
+        }
+    }
+
+    private func discardPendingFlowEvents() {
+        eventBatchTask?.cancel()
+        eventBatchTask = nil
+        pendingEvents.removeAll(keepingCapacity: true)
     }
 
     private func subscribeToFlowEvents() {
@@ -426,7 +499,11 @@ final class TrafficConsoleViewModel: ObservableObject {
     }
 
     private func publishSnapshot() {
-        snapshot = store.snapshot(capture: capturePresentation, inspection: inspection)
+        snapshot = store.snapshot(
+            capture: capturePresentation,
+            inspection: inspection,
+            workspaceWarning: workspaceWarning
+        )
     }
 
     private static func initialInspection(for flow: Flow) -> TrafficFlowInspection {

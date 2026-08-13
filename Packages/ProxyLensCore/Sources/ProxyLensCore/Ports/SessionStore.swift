@@ -5,6 +5,7 @@ public protocol SessionStore: FlowStore, CaptureStartupRecovery {
     func saveSession(_ session: Session) async throws
     func loadSession(sessionID: SessionID) async throws -> Session?
     func listSessions() async throws -> [Session]
+    func listAllFlows() async throws -> [Flow]
     func stopSession(sessionID: SessionID, at date: Date) async throws
     func removeSession(sessionID: SessionID) async throws
 }

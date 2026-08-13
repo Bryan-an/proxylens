@@ -128,6 +128,7 @@ struct TrafficBreakpointInspection: Equatable, Sendable {
 
 struct TrafficConsoleSnapshot: Equatable, Sendable {
     let capture: TrafficCapturePresentation
+    let workspaceWarning: String?
     let allFlowCount: Int
     let domains: [TrafficDomainSummary]
     let selectedSource: TrafficSourceSelection
@@ -138,6 +139,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
 
     static let initial = TrafficConsoleSnapshot(
         capture: .recovering,
+        workspaceWarning: nil,
         allFlowCount: 0,
         domains: [],
         selectedSource: .allTraffic,
@@ -227,6 +229,19 @@ struct TrafficConsoleStore {
         clearSelectionIfHidden()
     }
 
+    mutating func replaceAll(_ flows: [Flow]) {
+        flowsByID = [:]
+        orderedFlowIDs = []
+        orderIndexByID = [:]
+        searchableTextByID = [:]
+        domainCounts = [:]
+        domainSummaries = []
+        visibleRows = []
+        visibleFlowIDs = []
+        selectedFlowID = nil
+        apply(flows.map(FlowEvent.finished))
+    }
+
     mutating func selectSource(_ source: TrafficSourceSelection) {
         guard selectedSource != source else {
             return
@@ -274,10 +289,12 @@ struct TrafficConsoleStore {
 
     func snapshot(
         capture: TrafficCapturePresentation,
-        inspection: TrafficFlowInspection
+        inspection: TrafficFlowInspection,
+        workspaceWarning: String? = nil
     ) -> TrafficConsoleSnapshot {
         TrafficConsoleSnapshot(
             capture: capture,
+            workspaceWarning: workspaceWarning,
             allFlowCount: flowsByID.count,
             domains: domainSummaries,
             selectedSource: selectedSource,

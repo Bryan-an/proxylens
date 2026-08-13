@@ -2,18 +2,33 @@ import XCTest
 
 @MainActor
 final class ProxyLensUITests: XCTestCase {
+    private var storageRoot: URL!
+
     override func setUpWithError() throws {
         continueAfterFailure = false
+        storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensUITests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        if let storageRoot {
+            try? FileManager.default.removeItem(at: storageRoot)
+        }
     }
 
     func testTrafficConsoleShowsNativeThreePaneWorkspace() {
         let app = XCUIApplication()
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        app.launchArguments = [
+            "-ApplePersistenceIgnoreState", "YES",
+            "-ProxyLensStorageRoot", storageRoot.path
+        ]
         app.launch()
 
         let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["capture.toggle"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["session.clear"].exists)
         XCTAssertTrue(app.searchFields["traffic.search"].exists)
         XCTAssertTrue(app.popUpButtons["traffic.filter.method"].exists)
         XCTAssertTrue(app.popUpButtons["traffic.filter.status"].exists)

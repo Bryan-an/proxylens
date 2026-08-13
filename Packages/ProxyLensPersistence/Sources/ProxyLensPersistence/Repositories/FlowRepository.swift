@@ -65,6 +65,14 @@ struct FlowRepository: Sendable {
         return try PersistenceCoding.decode(Flow.self, from: snapshot)
     }
 
+    static func fetchAll(from database: Database) throws -> [Flow] {
+        let rows = try Row.fetchAll(
+            database,
+            sql: "SELECT snapshot FROM flows ORDER BY created_at ASC"
+        )
+        return try decodeFlows(rows)
+    }
+
     static func fetchAll(in sessionID: SessionID, from database: Database) throws -> [Flow] {
         let rows = try Row.fetchAll(
             database,

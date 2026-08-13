@@ -422,6 +422,47 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual((failedTimings["ssl"] as? NSNumber)?.doubleValue, -1)
     }
 
+    func testSessionServiceLoadsWorkspaceFlowsOldestFirstAndClearsEverySession() async throws {
+        let recorder = CallRecorder()
+        let sessionStore = RecordingSessionStore(sessionID: SessionID(), recorder: recorder)
+        let olderSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let newerSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        let olderFlow = Flow(
+            sessionID: olderSession.id,
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://older.example.test/")!
+            ),
+            startedAt: Date(timeIntervalSince1970: 10)
+        )
+        let newerFlow = Flow(
+            sessionID: newerSession.id,
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://newer.example.test/")!
+            ),
+            startedAt: Date(timeIntervalSince1970: 20)
+        )
+        await sessionStore.seed(session: newerSession, flows: [newerFlow])
+        await sessionStore.seed(session: olderSession, flows: [olderFlow])
+        let service = SessionService(sessionStore: sessionStore)
+
+        let loaded = try await service.loadWorkspace()
+        XCTAssertEqual(loaded.map(\.id), [olderFlow.id, newerFlow.id])
+
+        try await service.clearWorkspace()
+        let remainingFlows = try await service.loadWorkspace()
+        let remainingSessions = await sessionStore.listSessions()
+        XCTAssertTrue(remainingFlows.isEmpty)
+        XCTAssertTrue(remainingSessions.isEmpty)
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()
@@ -1050,6 +1091,10 @@ private actor RecordingSessionStore: SessionStore {
         Array(sessions.values)
     }
 
+    func listAllFlows() -> [Flow] {
+        Array(flows.values)
+    }
+
     func stopSession(sessionID: SessionID, at date: Date) async throws {
         await recorder.append("session.stop")
         guard var session = sessions[sessionID] else {
@@ -1061,6 +1106,7 @@ private actor RecordingSessionStore: SessionStore {
 
     func removeSession(sessionID: SessionID) {
         sessions.removeValue(forKey: sessionID)
+        flows = flows.filter { $0.value.sessionID != sessionID }
     }
 
     func save(_ flow: Flow) {
@@ -1071,14 +1117,23 @@ private actor RecordingSessionStore: SessionStore {
         flows[flowID]
     }
 
+    func listFlows(in sessionID: SessionID) -> [Flow] {
+        flows.values.filter { $0.sessionID == sessionID }
+    }
+
     func listSummaries(in sessionID: SessionID) -> [FlowSummary] {
-        flows.values
-            .filter { $0.sessionID == sessionID }
-            .map(\.summary)
+        listFlows(in: sessionID).map(\.summary)
     }
 
     func remove(flowID: FlowID) {
         flows.removeValue(forKey: flowID)
+    }
+
+    func seed(session: Session, flows: [Flow] = []) {
+        sessions[session.id] = session
+        for flow in flows {
+            self.flows[flow.id] = flow
+        }
     }
 
     func seedRecordingSession(id: SessionID) {

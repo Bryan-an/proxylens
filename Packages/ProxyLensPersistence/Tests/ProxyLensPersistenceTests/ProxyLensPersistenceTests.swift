@@ -133,6 +133,86 @@ final class ProxyLensPersistenceTests: XCTestCase {
         XCTAssertEqual(restoredSession.state, .recording)
     }
 
+    func testListSessionsAndAllFlowsReturnPersistedWorkspaceInStableOrder() async throws {
+        let fixture = try PersistenceFixture()
+        defer { fixture.remove() }
+
+        let olderSession = Session(startedAt: Date(timeIntervalSince1970: 1_000))
+        let newerSession = Session(startedAt: Date(timeIntervalSince1970: 2_000))
+        try await fixture.sessionStore.saveSession(newerSession)
+        try await fixture.sessionStore.saveSession(olderSession)
+
+        let newerFlow = try Self.makeCompletedFlow(sessionID: newerSession.id, index: 2)
+        let olderFlow = try Self.makeCompletedFlow(sessionID: olderSession.id, index: 1)
+        try await fixture.sessionStore.save(newerFlow)
+        try await fixture.sessionStore.save(olderFlow)
+
+        let sessions = try await fixture.sessionStore.listSessions()
+        let allFlows = try await fixture.sessionStore.listAllFlows()
+        let olderSessionFlows = try await fixture.sessionStore.listFlows(in: olderSession.id)
+        XCTAssertEqual(sessions.map(\.id), [newerSession.id, olderSession.id])
+        XCTAssertEqual(allFlows.map(\.id), [olderFlow.id, newerFlow.id])
+        XCTAssertEqual(olderSessionFlows.map(\.id), [olderFlow.id])
+    }
+
+    func testRemoveSessionDeletesMetadataAndBodyFilesAcrossReopen() async throws {
+        let fixture = try PersistenceFixture(inlineBodyThreshold: 4)
+        defer { fixture.remove() }
+
+        let session = Session(startedAt: Date(timeIntervalSince1970: 4_000))
+        try await fixture.sessionStore.saveSession(session)
+        let requestBody = try await fixture.bodyStore.put(
+            Data("request bytes to delete".utf8),
+            metadata: BodyMetadata(contentType: "text/plain")
+        )
+        let responseBody = try await fixture.bodyStore.put(
+            Data("response bytes to delete".utf8),
+            metadata: BodyMetadata(contentType: "text/plain")
+        )
+        let flow = try Self.makeCompletedFlow(
+            sessionID: session.id,
+            index: 1,
+            requestBody: requestBody,
+            responseBody: responseBody
+        )
+        try await fixture.sessionStore.save(flow)
+        XCTAssertFalse(requestBody.isInline)
+        XCTAssertFalse(responseBody.isInline)
+
+        try await fixture.sessionStore.removeSession(sessionID: session.id)
+
+        let removedSession = try await fixture.sessionStore.loadSession(sessionID: session.id)
+        let removedFlow = try await fixture.sessionStore.load(flowID: flow.id)
+        let remainingFlows = try await fixture.sessionStore.listAllFlows()
+        XCTAssertNil(removedSession)
+        XCTAssertNil(removedFlow)
+        XCTAssertTrue(remainingFlows.isEmpty)
+        await assertThrowsErrorAsync(try await fixture.bodyStore.read(requestBody)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(requestBody.id))
+        }
+        await assertThrowsErrorAsync(try await fixture.bodyStore.read(responseBody)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(responseBody.id))
+        }
+
+        let reopenedDatabase = try DatabaseController(configuration: fixture.configuration)
+        let reopenedBodyStore = FileBodyStore(database: reopenedDatabase)
+        let reopenedSessionStore = GRDBSessionStore(
+            database: reopenedDatabase,
+            bodyStore: reopenedBodyStore
+        )
+        let reopenedSession = try await reopenedSessionStore.loadSession(sessionID: session.id)
+        let reopenedFlow = try await reopenedSessionStore.load(flowID: flow.id)
+        let reopenedSessions = try await reopenedSessionStore.listSessions()
+        let reopenedFlows = try await reopenedSessionStore.listAllFlows()
+        XCTAssertNil(reopenedSession)
+        XCTAssertNil(reopenedFlow)
+        XCTAssertTrue(reopenedSessions.isEmpty)
+        XCTAssertTrue(reopenedFlows.isEmpty)
+        await assertThrowsErrorAsync(try await reopenedBodyStore.read(requestBody)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(requestBody.id))
+        }
+    }
+
     func testConcurrentWritesAndInspectionReadsPreserveEveryFlow() async throws {
         let fixture = try PersistenceFixture()
         defer { fixture.remove() }
@@ -387,6 +467,10 @@ private actor OrderedFlowStore: FlowStore {
 
     func load(flowID _: FlowID) -> Flow? {
         nil
+    }
+
+    func listFlows(in _: SessionID) -> [Flow] {
+        []
     }
 
     func listSummaries(in _: SessionID) -> [FlowSummary] {
