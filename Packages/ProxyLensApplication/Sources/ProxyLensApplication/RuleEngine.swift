@@ -4,6 +4,7 @@ import ProxyLensCore
 public enum RuleEngineError: Error, Equatable, LocalizedError, Sendable {
     case mapLocalFileUnreadable(path: String, message: String)
     case mapLocalFileTooLarge(byteCount: Int64, maximumByteCount: Int64)
+    case mapRemoteInvalidDestination(String)
 
     public var errorDescription: String? {
         switch self {
@@ -11,6 +12,8 @@ public enum RuleEngineError: Error, Equatable, LocalizedError, Sendable {
             "Could not read Map Local file \(path): \(message)"
         case .mapLocalFileTooLarge(let byteCount, let maximumByteCount):
             "Map Local file is \(byteCount) bytes; the limit is \(maximumByteCount) bytes"
+        case .mapRemoteInvalidDestination(let destination):
+            "Map Remote destination is invalid: \(destination)"
         }
     }
 }
@@ -125,6 +128,33 @@ public actor RuleEngine {
                 .path(.exact(normalizedPath))
             ]),
             action: .mapLocal(resourceID: spec.resourceID)
+        )
+        add(rule)
+        return rule
+    }
+
+    @discardableResult
+    public func mapRemote(
+        host: String,
+        path: String,
+        destination: URL
+    ) throws -> Rule {
+        let normalizedPath = Self.normalizedPath(path)
+        do {
+            try MappedRemoteHTTPRequest.validateDestination(destination)
+        } catch {
+            throw RuleEngineError.mapRemoteInvalidDestination(destination.absoluteString)
+        }
+
+        let rule = Rule(
+            name: "Map remote \(host)\(normalizedPath)",
+            priority: 15,
+            phase: .requestHeaders,
+            matcher: .allOf([
+                .host(.exact(host)),
+                .path(.exact(normalizedPath))
+            ]),
+            action: .mapRemote(url: destination)
         )
         add(rule)
         return rule

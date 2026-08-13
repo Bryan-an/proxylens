@@ -141,9 +141,9 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             return
         }
 
-        let target: ProxyTarget
+        let originalTarget: ProxyTarget
         do {
-            target = try ProxyTarget(
+            originalTarget = try ProxyTarget(
                 uri: head.uri,
                 headers: head.headers,
                 tunnelTarget: tunnelTarget
@@ -169,16 +169,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
         var request = HTTPRequest(
             method: ProxyLensCore.HTTPMethod(rawValue: head.method.rawValue),
-            url: target.url,
+            url: originalTarget.url,
             headers: coreHeaders,
             version: coreVersion,
             rawTarget: head.uri
-        )
-        let connection = ConnectionInfo(
-            protocolKind: target.usesTLS ? .https : .http,
-            upstreamHost: target.host,
-            upstreamPort: UInt16(target.port),
-            tlsIntercepted: target.usesTLS
         )
         let requestPlan = RulePlanner.plan(
             rules: ruleSnapshot?.currentRules() ?? RuleSet(),
@@ -201,6 +195,36 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             }
         }
 
+        var target = originalTarget
+        var mappedHostHeader: String?
+        if !requestPlan.shouldBlock,
+            requestPlan.mapLocalResourceID == nil,
+            let destination = requestPlan.mapRemoteURL
+        {
+            do {
+                let mapped = try MappedRemoteHTTPRequest.make(
+                    originalURL: originalTarget.url,
+                    destination: destination
+                )
+                target = ProxyTarget(mapped)
+                mappedHostHeader = mapped.hostHeader
+            } catch {
+                sendError(
+                    statusCode: 500,
+                    reason: "Internal Server Error",
+                    message: error.localizedDescription,
+                    context: context
+                )
+                return
+            }
+        }
+
+        let connection = ConnectionInfo(
+            protocolKind: target.usesTLS ? .https : .http,
+            upstreamHost: target.host,
+            upstreamPort: UInt16(target.port),
+            tlsIntercepted: originalTarget.usesTLS
+        )
         let flow = Flow(sessionID: sessionID, request: request, connection: connection)
         let transaction = FlowTransaction(flow: flow, eventSink: eventSink)
         if let bodyStore {
@@ -278,13 +302,17 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             await transaction.appendRuleTraces(requestPlan.traces)
         }
 
-        let forwardedHeaders: NIOHTTP1.HTTPHeaders
+        var forwardedHeaders: NIOHTTP1.HTTPHeaders
         if requestPlan.applyNoCache {
             forwardedHeaders = HTTPConversion.sanitizedRequestHeaders(
                 HTTPConversion.nioHeaders(from: request.headers)
             )
         } else {
             forwardedHeaders = HTTPConversion.sanitizedRequestHeaders(head.headers)
+        }
+        if let mappedHostHeader {
+            forwardedHeaders.remove(name: "Host")
+            forwardedHeaders.add(name: "Host", value: mappedHostHeader)
         }
         let forwardedHead = HTTPRequestHead(
             version: head.version,

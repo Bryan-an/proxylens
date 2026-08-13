@@ -30,6 +30,16 @@ final class ProxyLensCaptureTests: XCTestCase {
         XCTAssertEqual(originTarget.host, "127.0.0.1")
         XCTAssertEqual(originTarget.port, 8080)
         XCTAssertEqual(originTarget.originForm, "/health?ready=true")
+
+        let mapped = try MappedRemoteHTTPRequest.make(
+            originalURL: URL(string: "http://api.example.com/v1/users?x=1")!,
+            destination: URL(string: "https://staging.example.com:8443")!
+        )
+        let mappedTarget = ProxyTarget(mapped)
+        XCTAssertEqual(mappedTarget.host, "staging.example.com")
+        XCTAssertEqual(mappedTarget.port, 8_443)
+        XCTAssertTrue(mappedTarget.usesTLS)
+        XCTAssertEqual(mappedTarget.originForm, "/v1/users?x=1")
     }
 
     func testConnectIsRejectedWhenInterceptionIsDisabled() throws {
@@ -369,6 +379,160 @@ final class ProxyLensCaptureTests: XCTestCase {
 
         await engine.stop()
         await upstream.stop()
+    }
+
+    func testHTTPMapRemoteRuleForwardsToAnotherHostWithoutCallingTheOriginal() async throws {
+        let original = try await TestHTTPServer.start(responseBody: "original upstream")
+        let mapped = try await TestHTTPServer.start(responseBody: "mapped upstream")
+        let eventSink = RecordingFlowEventSink()
+        let destination = URL(string: "http://127.0.0.1:\(mapped.endpoint.port)")!
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map remote users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .allOf([
+                        .host(.exact("127.0.0.1")),
+                        .path(.exact("/users"))
+                    ]),
+                    action: .mapRemote(url: destination)
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await original.stop()
+                await mapped.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(original.endpoint.port)/users?id=1",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("mapped upstream".utf8))
+            XCTAssertEqual(original.requestCount, 0)
+            XCTAssertEqual(mapped.requestCount, 1)
+            XCTAssertEqual(mapped.requestURI, "/users?id=1")
+            XCTAssertEqual(
+                mapped.requestHeader("Host"),
+                "127.0.0.1:\(mapped.endpoint.port)"
+            )
+
+            await eventSink.waitForFinished()
+            let mappedEvents = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                mappedEvents.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(finishedFlow.state, .completed)
+            XCTAssertEqual(finishedFlow.request.url.path, "/users")
+            XCTAssertEqual(finishedFlow.connection?.upstreamPort, mapped.endpoint.port)
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Map remote users"])
+            XCTAssertEqual(finishedFlow.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertNotNil(finishedFlow.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await original.stop()
+            await mapped.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await original.stop()
+        await mapped.stop()
+    }
+
+    func testHTTPMapRemoteRuleReplacesPathAndAppliesNoCache() async throws {
+        let original = try await TestHTTPServer.start(responseBody: "original upstream")
+        let mapped = try await TestHTTPServer.start(responseBody: "mapped mock")
+        let eventSink = RecordingFlowEventSink()
+        let destination = URL(
+            string: "http://127.0.0.1:\(mapped.endpoint.port)/mock/users"
+        )!
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow fixture",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .allow
+                ),
+                Rule(
+                    name: "Map remote users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapRemote(url: destination)
+                ),
+                Rule(
+                    name: "No cache request",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .noCache
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await original.stop()
+                await mapped.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(original.endpoint.port)/users?id=1",
+                through: proxyEndpoint,
+                extraHeaders: [("If-None-Match", "\"abc\"")]
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("mapped mock".utf8))
+            XCTAssertEqual(original.requestCount, 0)
+            XCTAssertEqual(mapped.requestCount, 1)
+            XCTAssertEqual(mapped.requestURI, "/mock/users")
+            XCTAssertEqual(mapped.requestHeader("Cache-Control"), "no-cache")
+            XCTAssertEqual(mapped.requestHeader("Pragma"), "no-cache")
+            XCTAssertNil(mapped.requestHeader("If-None-Match"))
+        } catch {
+            await engine.stop()
+            await original.stop()
+            await mapped.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await original.stop()
+        await mapped.stop()
     }
 
     func testHTTPAllowRuleOverridesLaterCatchAllBlock() async throws {
@@ -1288,6 +1452,10 @@ private final class TestHTTPServer {
         state.requestCount
     }
 
+    var requestURI: String? {
+        state.requestURI
+    }
+
     func requestHeader(_ name: String) -> String? {
         state.headerValue(name)
     }
@@ -1392,6 +1560,7 @@ private final class TestHTTPServer {
 private final class TestHTTPServerState: @unchecked Sendable {
     private let lock = NSLock()
     private var requestCountValue = 0
+    private var lastRequestURI: String?
     private var lastRequestHeaders: [(String, String)] = []
 
     var requestCount: Int {
@@ -1400,10 +1569,17 @@ private final class TestHTTPServerState: @unchecked Sendable {
         return requestCountValue
     }
 
-    func recordRequest(headers: NIOHTTP1.HTTPHeaders) {
+    var requestURI: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastRequestURI
+    }
+
+    func recordRequest(uri: String, headers: NIOHTTP1.HTTPHeaders) {
         lock.lock()
         defer { lock.unlock() }
         requestCountValue += 1
+        lastRequestURI = uri
         lastRequestHeaders = headers.map { ($0.0, $0.1) }
     }
 
@@ -1439,7 +1615,7 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch Self.unwrapInboundIn(data) {
         case .head(let head):
-            state.recordRequest(headers: head.headers)
+            state.recordRequest(uri: head.uri, headers: head.headers)
         case .body(var buffer):
             if let bytes = buffer.readBytes(length: buffer.readableBytes) {
                 requestBody.append(contentsOf: bytes)

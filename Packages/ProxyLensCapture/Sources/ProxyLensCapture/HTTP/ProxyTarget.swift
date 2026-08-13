@@ -1,5 +1,6 @@
 import Foundation
 import NIOHTTP1
+import ProxyLensCore
 
 struct ProxyTarget: Sendable {
     let url: URL
@@ -62,6 +63,16 @@ struct ProxyTarget: Sendable {
             port: port,
             originForm: originForm.isEmpty ? "/" : originForm,
             usesTLS: false
+        )
+    }
+
+    init(_ mapped: MappedRemoteTarget) {
+        self.init(
+            url: mapped.url,
+            host: mapped.host,
+            port: mapped.port,
+            originForm: mapped.originForm,
+            usesTLS: mapped.usesTLS
         )
     }
 

@@ -175,6 +175,13 @@ final class TrafficConsoleViewModel: ObservableObject {
         try await ruleEngine.mapLocal(host: host, path: path, fileURL: fileURL)
     }
 
+    func mapRemote(host: String, path: String, destination: URL) async throws {
+        guard let ruleEngine else {
+            return
+        }
+        try await ruleEngine.mapRemote(host: host, path: path, destination: destination)
+    }
+
     private func updateDisplayFilter(_ update: (inout TrafficDisplayFilter) -> Void) {
         var filter = store.displayFilter
         update(&filter)

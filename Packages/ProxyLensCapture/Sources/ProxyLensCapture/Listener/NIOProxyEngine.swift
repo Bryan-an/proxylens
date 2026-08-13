@@ -53,12 +53,11 @@ public actor NIOProxyEngine: ProxyEngine {
             throw TLSInterceptionError.missingCertificateProvider
         }
 
-        let upstreamTLSContext: NIOSSLContext?
+        let upstreamTLSContext: NIOSSLContext
         do {
-            upstreamTLSContext =
-                configuration.interceptHTTPS
-                ? try TLSContextFactory.upstreamContext(configuration: upstreamTLSConfiguration)
-                : nil
+            upstreamTLSContext = try TLSContextFactory.upstreamContext(
+                configuration: upstreamTLSConfiguration
+            )
         } catch {
             currentState = .failed(error.localizedDescription)
             throw error

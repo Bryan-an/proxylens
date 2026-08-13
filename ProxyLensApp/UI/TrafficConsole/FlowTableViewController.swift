@@ -253,8 +253,16 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             keyEquivalent: ""
         )
         mapLocalItem.target = self
-        mapLocalItem.representedObject = MapLocalMenuTarget(host: host, path: path)
+        mapLocalItem.representedObject = HostPathMenuTarget(host: host, path: path)
         menu.addItem(mapLocalItem)
+        let mapRemoteItem = NSMenuItem(
+            title: "Map Remote \(host)\(path)…",
+            action: #selector(mapRemote),
+            keyEquivalent: ""
+        )
+        mapRemoteItem.target = self
+        mapRemoteItem.representedObject = HostPathMenuTarget(host: host, path: path)
+        menu.addItem(mapRemoteItem)
     }
 
     private func ruleMenuItem(title: String, host: String, action: Selector) -> NSMenuItem {
@@ -286,7 +294,7 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
     }
 
     @objc private func mapLocal(_ sender: NSMenuItem) {
-        guard let target = sender.representedObject as? MapLocalMenuTarget else {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
             return
         }
 
@@ -319,6 +327,60 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         }
     }
 
+    @objc private func mapRemote(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+
+        Task { @MainActor in
+            await promptMapRemote(target: target)
+        }
+    }
+
+    private func promptMapRemote(target: HostPathMenuTarget) async {
+        let alert = NSAlert()
+        alert.messageText = "Map Remote"
+        alert.informativeText =
+            "Enter the destination URL for \(target.host)\(target.path). A host-only URL keeps the original path and query."
+        alert.addButton(withTitle: "Map")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "http://127.0.0.1:8080"
+        field.stringValue = "http://"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            guard let destination = URL(string: text) else {
+                throw ProxyLensError.invalidURL(text)
+            }
+            try await viewModel.mapRemote(
+                host: target.host,
+                path: target.path,
+                destination: destination
+            )
+        } catch {
+            let errorAlert = NSAlert(error: error)
+            if let window = view.window {
+                await errorAlert.beginSheetModal(for: window)
+            } else {
+                errorAlert.runModal()
+            }
+        }
+    }
+
     private static func mappingPath(for row: TrafficFlowRow) -> String {
         let path =
             row.path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: true)
@@ -327,7 +389,7 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
     }
 }
 
-private final class MapLocalMenuTarget: NSObject {
+private final class HostPathMenuTarget: NSObject {
     let host: String
     let path: String
 

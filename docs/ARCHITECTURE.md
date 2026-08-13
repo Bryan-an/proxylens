@@ -466,11 +466,11 @@ P0 rules currently implemented in the shared pipeline:
 - Block and Allow, evaluated during request headers. The first matching allow or block terminates later block/allow rules in that phase.
 - No-cache request and response header rewriting.
 - Map Local, evaluated during request headers. The first matching map-local rule serves a preloaded local response and skips the upstream connection. File bytes are loaded in `RuleEngine` and published through `MutableRuleSnapshot`; NIO handlers only read the snapshot.
+- Map Remote, evaluated during request headers. The first matching map-remote rule rewrites the upstream scheme, host, port, and path, then connects to that destination. An origin-only destination (`http://host` or `http://host/`) keeps the original path and query; a destination with a path or query replaces them. The captured request URL stays client-facing; `ConnectionInfo` records the mapped upstream. Map Local and Map Remote are mutually exclusive: the first matching mapping rule wins.
 - Display/filter matching.
 
 Still to implement on the same pipeline:
 
-- Map Remote.
 - Breakpoint for request and response editing.
 
 Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.

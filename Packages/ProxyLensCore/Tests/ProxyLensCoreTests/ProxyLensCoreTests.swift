@@ -265,6 +265,7 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertNil(plan.blockReason)
         XCTAssertTrue(plan.applyNoCache)
         XCTAssertEqual(plan.mapLocalResourceID, "pixel.json")
+        XCTAssertNil(plan.mapRemoteURL)
         XCTAssertEqual(plan.traces.map(\.ruleID), [noCacheID, allowID, blockID, mapLocalID])
         XCTAssertEqual(
             plan.traces.map(\.ruleName),
@@ -482,9 +483,260 @@ final class ProxyLensCoreTests: XCTestCase {
         )
 
         XCTAssertNil(plan.mapLocalResourceID)
+        XCTAssertNil(plan.mapRemoteURL)
         XCTAssertEqual(
             plan.traces.map(\.outcome),
             [.skipped(reason: RulePlanner.Decision.mapLocalPhaseReason)]
+        )
+    }
+
+    func testRulePlannerAppliesMapRemoteAfterAllowAndSkipsAfterBlock() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let context = RuleMatchContext(request: request)
+        let staging = URL(string: "http://staging.example.com/")!
+        let allowThenMap = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Allow api",
+                    priority: 0,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("api.example.com")),
+                    action: .allow
+                ),
+                Rule(
+                    name: "Map remote users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapRemote(url: staging)
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(allowThenMap.shouldBlock)
+        XCTAssertNil(allowThenMap.mapLocalResourceID)
+        XCTAssertEqual(allowThenMap.mapRemoteURL, staging)
+        XCTAssertEqual(allowThenMap.traces.map(\.outcome), [.applied, .applied])
+
+        let mapThenBlock = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map remote users",
+                    priority: 5,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapRemote(url: staging)
+                ),
+                Rule(
+                    name: "Block all",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .block(reason: "blocked by default")
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertFalse(mapThenBlock.shouldBlock)
+        XCTAssertEqual(mapThenBlock.mapRemoteURL, staging)
+        XCTAssertEqual(
+            mapThenBlock.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+
+        let blockThenMap = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block api",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("api.example.com")),
+                    action: .block(reason: "blocked host")
+                ),
+                Rule(
+                    name: "Map remote users",
+                    priority: 15,
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/users")),
+                    action: .mapRemote(url: staging)
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+
+        XCTAssertTrue(blockThenMap.shouldBlock)
+        XCTAssertNil(blockThenMap.mapRemoteURL)
+        XCTAssertEqual(
+            blockThenMap.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+
+        let other = URL(string: "http://other.example.com/")!
+        let firstMapWins = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map remote first",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .mapRemote(url: staging)
+                ),
+                Rule(
+                    name: "Map remote second",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .mapRemote(url: other)
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(firstMapWins.mapRemoteURL, staging)
+        XCTAssertEqual(
+            firstMapWins.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyMappedReason)
+            ]
+        )
+    }
+
+    func testRulePlannerTreatsMapLocalAndMapRemoteAsMutuallyExclusive() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://api.example.com/users")!)
+        let context = RuleMatchContext(request: request)
+        let staging = URL(string: "http://staging.example.com/")!
+
+        let localThenRemote = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local users",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .mapLocal(resourceID: "users.json")
+                ),
+                Rule(
+                    name: "Map remote users",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .mapRemote(url: staging)
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(localThenRemote.mapLocalResourceID, "users.json")
+        XCTAssertNil(localThenRemote.mapRemoteURL)
+        XCTAssertEqual(
+            localThenRemote.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyMappedReason)
+            ]
+        )
+
+        let remoteThenLocal = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map remote users",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .mapRemote(url: staging)
+                ),
+                Rule(
+                    name: "Map local users",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .mapLocal(resourceID: "users.json")
+                )
+            ]),
+            context: context,
+            phase: .requestHeaders
+        )
+        XCTAssertNil(remoteThenLocal.mapLocalResourceID)
+        XCTAssertEqual(remoteThenLocal.mapRemoteURL, staging)
+        XCTAssertEqual(
+            remoteThenLocal.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyMappedReason)
+            ]
+        )
+    }
+
+    func testRulePlannerSkipsMapRemoteOutsideRequestHeaders() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/users")!)
+        let response = try HTTPResponse(statusCode: 200)
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Late map remote",
+                    phase: .responseHeaders,
+                    action: .mapRemote(url: URL(string: "http://staging.example.com/")!)
+                )
+            ]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseHeaders
+        )
+
+        XCTAssertNil(plan.mapRemoteURL)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [.skipped(reason: RulePlanner.Decision.mapRemotePhaseReason)]
+        )
+    }
+
+    func testMappedRemoteHTTPRequestPreservesPathForOriginDestinations() throws {
+        let mapped = try MappedRemoteHTTPRequest.make(
+            originalURL: URL(string: "https://api.example.com/v1/users?x=one%20two")!,
+            destination: URL(string: "http://127.0.0.1:9000")!
+        )
+
+        XCTAssertEqual(mapped.host, "127.0.0.1")
+        XCTAssertEqual(mapped.port, 9_000)
+        XCTAssertFalse(mapped.usesTLS)
+        XCTAssertEqual(mapped.originForm, "/v1/users?x=one%20two")
+        XCTAssertEqual(mapped.hostHeader, "127.0.0.1:9000")
+        XCTAssertEqual(mapped.url.absoluteString, "http://127.0.0.1:9000/v1/users?x=one%20two")
+    }
+
+    func testMappedRemoteHTTPRequestReplacesPathAndScheme() throws {
+        let mapped = try MappedRemoteHTTPRequest.make(
+            originalURL: URL(string: "http://api.example.com/v1/users?x=1")!,
+            destination: URL(string: "https://staging.example.com/mock/users")!
+        )
+
+        XCTAssertEqual(mapped.host, "staging.example.com")
+        XCTAssertEqual(mapped.port, 443)
+        XCTAssertTrue(mapped.usesTLS)
+        XCTAssertEqual(mapped.originForm, "/mock/users")
+        XCTAssertEqual(mapped.hostHeader, "staging.example.com")
+        XCTAssertEqual(mapped.url.absoluteString, "https://staging.example.com/mock/users")
+    }
+
+    func testMappedRemoteHTTPRequestRejectsUnsupportedDestinations() {
+        XCTAssertThrowsError(
+            try MappedRemoteHTTPRequest.make(
+                originalURL: URL(string: "https://api.example.com/users")!,
+                destination: URL(string: "ftp://files.example.com/users")!
+            )
+        )
+        XCTAssertThrowsError(
+            try MappedRemoteHTTPRequest.make(
+                originalURL: URL(string: "https://api.example.com/users")!,
+                destination: URL(string: "/relative")!
+            )
         )
     }
 
@@ -515,9 +767,9 @@ final class ProxyLensCoreTests: XCTestCase {
     func testRulePlannerSkipsUnimplementedActions() throws {
         let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
         let rule = Rule(
-            name: "Map remote",
+            name: "Breakpoint",
             phase: .requestHeaders,
-            action: .mapRemote(url: URL(string: "https://other.example.com/")!)
+            action: .breakpoint
         )
         let plan = RulePlanner.plan(
             rules: RuleSet(rules: [rule]),

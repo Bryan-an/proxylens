@@ -117,6 +117,51 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertTrue(snapshot.currentRules().rules.isEmpty)
     }
 
+    func testRuleEnginePublishesMapRemoteRules() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+        let destination = URL(string: "http://127.0.0.1:9000/mock/users")!
+
+        let rule = try await engine.mapRemote(
+            host: "api.example.com",
+            path: "/users?unused=1",
+            destination: destination
+        )
+
+        XCTAssertEqual(rule.name, "Map remote api.example.com/users")
+        XCTAssertEqual(rule.priority, 15)
+        XCTAssertEqual(rule.phase, .requestHeaders)
+        guard case .mapRemote(let mappedURL) = rule.action else {
+            return XCTFail("Expected a map remote action")
+        }
+        XCTAssertEqual(mappedURL, destination)
+
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .get,
+                    url: URL(string: "https://api.example.com/users")!
+                )
+            ),
+            phase: .requestHeaders
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+
+        do {
+            _ = try await engine.mapRemote(
+                host: "api.example.com",
+                path: "/ftp",
+                destination: URL(string: "ftp://files.example.com/users")!
+            )
+            XCTFail("Expected an unsupported Map Remote destination to be rejected")
+        } catch let error as RuleEngineError {
+            XCTAssertEqual(
+                error,
+                .mapRemoteInvalidDestination("ftp://files.example.com/users")
+            )
+        }
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()
