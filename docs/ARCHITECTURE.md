@@ -472,6 +472,13 @@ P0 rules currently implemented in the shared pipeline:
 
 Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.
 
+P0 export currently implemented:
+
+- Copy as cURL from a single captured flow. Hop-by-hop and auto-set headers (`Content-Length`, `Transfer-Encoding`, `Connection`, and related) are omitted. The request body is the captured raw bytes from `BodyStore`.
+- Export HAR 1.2 for a single flow. Incomplete flows emit `status` 0. Truncation, cancellation, and failure are recorded in `comment`. `ExportService` reads in-memory `Flow` snapshots and body bytes; it does not import HAR, export a session, or talk to NIO.
+
+The traffic console exposes both actions on the flow-table context menu. Inspector text is not the export source.
+
 ## Security and platform boundaries
 
 All macOS-specific security behavior belongs in `ProxyLensPlatform`:

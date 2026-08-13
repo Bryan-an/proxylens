@@ -57,6 +57,7 @@ final class CompositionRoot {
             systemProxyController: systemProxyController
         )
         let bodyReader = FlowBodyReader(bodyStore: bodyStore)
+        let exportService = ExportService(bodyStore: bodyStore)
 
         self.flowEvents = flowEvents
         self.captureCoordinator = captureCoordinator
@@ -71,7 +72,8 @@ final class CompositionRoot {
                 )
             ),
             ruleEngine: ruleEngine,
-            breakpointCoordinator: breakpointCoordinator
+            breakpointCoordinator: breakpointCoordinator,
+            exportService: exportService
         )
     }
 }

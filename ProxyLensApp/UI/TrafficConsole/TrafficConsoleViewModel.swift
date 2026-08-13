@@ -38,6 +38,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let eventBatchDelay: Duration
     private let ruleEngine: RuleEngine?
     private let breakpointCoordinator: BreakpointCoordinator?
+    private let exportService: ExportService?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -56,7 +57,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         captureConfiguration: CaptureConfiguration,
         eventBatchDelay: Duration = .milliseconds(40),
         ruleEngine: RuleEngine? = nil,
-        breakpointCoordinator: BreakpointCoordinator? = nil
+        breakpointCoordinator: BreakpointCoordinator? = nil,
+        exportService: ExportService? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -65,6 +67,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.eventBatchDelay = eventBatchDelay
         self.ruleEngine = ruleEngine
         self.breakpointCoordinator = breakpointCoordinator
+        self.exportService = exportService
     }
 
     deinit {
@@ -187,6 +190,26 @@ final class TrafficConsoleViewModel: ObservableObject {
 
     func breakpoint(host: String, path: String, phase: RulePhase) {
         Task { await ruleEngine?.breakpoint(host: host, path: path, phase: phase) }
+    }
+
+    func curlCommand(for flowID: FlowID) async throws -> String {
+        guard let exportService else {
+            throw ProxyLensError.unsupportedOperation("Export is not available")
+        }
+        guard let flow = store.flow(id: flowID) else {
+            throw ProxyLensError.unsupportedOperation("The flow is no longer available")
+        }
+        return try await exportService.curl(for: flow)
+    }
+
+    func harFile(for flowID: FlowID) async throws -> Data {
+        guard let exportService else {
+            throw ProxyLensError.unsupportedOperation("Export is not available")
+        }
+        guard let flow = store.flow(id: flowID) else {
+            throw ProxyLensError.unsupportedOperation("The flow is no longer available")
+        }
+        return try await exportService.har(for: flow)
     }
 
     func continueBreakpoint(headersText: String, bodyText: String?) async throws {

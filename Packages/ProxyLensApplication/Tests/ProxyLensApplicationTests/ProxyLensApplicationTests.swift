@@ -225,6 +225,203 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(aborted, .abort)
     }
 
+    func testExportServiceWritesCURLForPOSTJSONThroughTheBodyStore() async throws {
+        let body = Data(#"{"name":"ada"}"#.utf8)
+        let flow = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/users?x=1",
+            requestHeaders: [
+                ("Host", "api.example.com"),
+                ("Content-Type", "application/json"),
+                ("Content-Length", "14"),
+                ("Connection", "close"),
+                ("Cookie", "session=abc")
+            ],
+            requestBody: body,
+            statusCode: 201,
+            reasonPhrase: "Created",
+            responseHeaders: [
+                ("Content-Type", "application/json"),
+                ("Set-Cookie", "session=abc; Path=/")
+            ],
+            responseBody: Data(#"{"ok":true}"#.utf8)
+        )
+        let store = RecordingBodyStore()
+        let exporter = ExportService(bodyStore: store)
+
+        let command = try await exporter.curl(for: flow)
+
+        XCTAssertTrue(command.contains("curl 'https://api.example.com/users?x=1'"))
+        XCTAssertTrue(command.contains("-X 'POST'"))
+        XCTAssertTrue(command.contains("-H 'Content-Type: application/json'"))
+        XCTAssertTrue(command.contains("-H 'Cookie: session=abc'"))
+        XCTAssertTrue(command.contains("--data-binary '{\"name\":\"ada\"}'"))
+        XCTAssertFalse(command.contains("Content-Length"))
+        XCTAssertFalse(command.contains("Connection"))
+        let readIDs = await store.readIDs()
+        XCTAssertEqual(readIDs, [flow.request.body?.id].compactMap { $0 })
+    }
+
+    func testExportServiceEscapesBinaryCURLBodiesAndOmitsGETMethod() async throws {
+        let binary = Data([0x00, 0x01, 0xFF])
+        var post = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/upload",
+            requestHeaders: [("Content-Type", "application/octet-stream")],
+            requestBody: binary,
+            statusCode: 200,
+            responseBody: Data()
+        )
+        post.replaceRequest(
+            post.request.replacingBody(
+                BodyReference(
+                    inline: binary,
+                    metadata: BodyMetadata(
+                        contentType: "application/octet-stream",
+                        isTruncated: true
+                    )
+                )
+            )
+        )
+        let get = try Self.exportFlow(
+            method: .get,
+            url: "https://api.example.com/health",
+            statusCode: 200
+        )
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+
+        let binaryCommand = try await exporter.curl(for: post)
+        let getCommand = try await exporter.curl(for: get)
+
+        XCTAssertTrue(binaryCommand.contains("--data-binary $'\\x00\\x01\\xff'"))
+        XCTAssertTrue(binaryCommand.contains("# Captured request body was truncated"))
+        XCTAssertTrue(getCommand.contains("curl 'https://api.example.com/health'"))
+        XCTAssertFalse(getCommand.contains("-X"))
+        XCTAssertFalse(getCommand.contains("--data-binary"))
+    }
+
+    func testExportServiceWritesHARForCompletedAndIncompleteFlows() async throws {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        var completed = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/users?x=1",
+            requestHeaders: [
+                ("Content-Type", "application/json"),
+                ("Cookie", "a=1; b=2")
+            ],
+            requestBody: Data(#"{"name":"ada"}"#.utf8),
+            statusCode: 201,
+            reasonPhrase: "Created",
+            responseHeaders: [("Content-Type", "text/plain")],
+            responseBody: Data("ok".utf8),
+            startedAt: startedAt
+        )
+        completed.markRequestBodyCompleted(at: Date(timeIntervalSince1970: 1_000.05))
+        completed.markUpstreamConnected(at: Date(timeIntervalSince1970: 1_000.06))
+        completed.markTLSHandshakeCompleted(at: Date(timeIntervalSince1970: 1_000.08))
+        completed.markResponseHeadersReceived(at: Date(timeIntervalSince1970: 1_000.2))
+        completed.markResponseBodyCompleted(at: Date(timeIntervalSince1970: 1_000.25))
+        completed.markCompleted(at: Date(timeIntervalSince1970: 1_000.3))
+
+        let binary = Data([0x00, 0xFF])
+        let binaryFlow = try Self.exportFlow(
+            method: .put,
+            url: "https://api.example.com/blob",
+            requestHeaders: [("Content-Type", "application/octet-stream")],
+            requestBody: binary,
+            statusCode: 200,
+            responseBody: binary
+        )
+
+        var failed = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://api.example.com/drop")!
+            ),
+            startedAt: startedAt
+        )
+        try failed.transition(to: .receivingRequest)
+        try failed.transition(to: .failed(.upstreamUnavailable))
+
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+        let completedJSON = try Self.harObject(try await exporter.har(for: completed))
+        let binaryJSON = try Self.harObject(try await exporter.har(for: binaryFlow))
+        let failedJSON = try Self.harObject(try await exporter.har(for: failed))
+
+        let completedLog = try XCTUnwrap(completedJSON["log"] as? [String: Any])
+        XCTAssertEqual(completedLog["version"] as? String, "1.2")
+        let creator = try XCTUnwrap(completedLog["creator"] as? [String: Any])
+        XCTAssertEqual(creator["name"] as? String, "ProxyLens")
+        let completedEntry = try XCTUnwrap((completedLog["entries"] as? [[String: Any]])?.first)
+        XCTAssertEqual(completedEntry["startedDateTime"] as? String, "1970-01-01T00:16:40.000Z")
+        XCTAssertEqual(
+            try XCTUnwrap(completedEntry["time"] as? NSNumber).doubleValue,
+            300,
+            accuracy: 0.001
+        )
+        let request = try XCTUnwrap(completedEntry["request"] as? [String: Any])
+        XCTAssertEqual(request["method"] as? String, "POST")
+        XCTAssertEqual(request["url"] as? String, "https://api.example.com/users?x=1")
+        XCTAssertEqual(request["httpVersion"] as? String, "HTTP/1.1")
+        let query = try XCTUnwrap(request["queryString"] as? [[String: Any]])
+        XCTAssertEqual(query.first?["name"] as? String, "x")
+        XCTAssertEqual(query.first?["value"] as? String, "1")
+        let cookies = try XCTUnwrap(request["cookies"] as? [[String: Any]])
+        XCTAssertEqual(cookies.map { $0["name"] as? String }, ["a", "b"])
+        let postData = try XCTUnwrap(request["postData"] as? [String: Any])
+        XCTAssertEqual(postData["mimeType"] as? String, "application/json")
+        XCTAssertEqual(postData["text"] as? String, #"{"name":"ada"}"#)
+        XCTAssertNil(postData["encoding"])
+        let response = try XCTUnwrap(completedEntry["response"] as? [String: Any])
+        XCTAssertEqual(response["status"] as? Int, 201)
+        XCTAssertEqual(response["statusText"] as? String, "Created")
+        let content = try XCTUnwrap(response["content"] as? [String: Any])
+        XCTAssertEqual(content["text"] as? String, "ok")
+        let timings = try XCTUnwrap(completedEntry["timings"] as? [String: Any])
+        let send = try XCTUnwrap(timings["send"] as? NSNumber).doubleValue
+        let connect = try XCTUnwrap(timings["connect"] as? NSNumber).doubleValue
+        let wait = try XCTUnwrap(timings["wait"] as? NSNumber).doubleValue
+        let receive = try XCTUnwrap(timings["receive"] as? NSNumber).doubleValue
+        let ssl = try XCTUnwrap(timings["ssl"] as? NSNumber).doubleValue
+        let time = try XCTUnwrap(completedEntry["time"] as? NSNumber).doubleValue
+        XCTAssertEqual(send, 50, accuracy: 0.001)
+        XCTAssertEqual(connect, 30, accuracy: 0.001)
+        XCTAssertEqual(wait, 120, accuracy: 0.001)
+        XCTAssertEqual(receive, 100, accuracy: 0.001)
+        XCTAssertEqual(ssl, 20, accuracy: 0.001)
+        XCTAssertGreaterThanOrEqual(connect, ssl)
+        XCTAssertEqual(try XCTUnwrap(timings["blocked"] as? NSNumber).doubleValue, -1)
+        XCTAssertEqual(try XCTUnwrap(timings["dns"] as? NSNumber).doubleValue, -1)
+        XCTAssertEqual(time, send + connect + wait + receive, accuracy: 0.001)
+
+        let binaryRequest = try XCTUnwrap(
+            ((binaryJSON["log"] as? [String: Any])?["entries"] as? [[String: Any]])?.first?[
+                "request"
+            ] as? [String: Any]
+        )
+        let binaryPost = try XCTUnwrap(binaryRequest["postData"] as? [String: Any])
+        XCTAssertEqual(binaryPost["encoding"] as? String, "base64")
+        XCTAssertEqual(binaryPost["text"] as? String, binary.base64EncodedString())
+
+        let failedEntry = try XCTUnwrap(
+            ((failedJSON["log"] as? [String: Any])?["entries"] as? [[String: Any]])?.first
+        )
+        XCTAssertEqual((failedEntry["time"] as? NSNumber)?.doubleValue, 0)
+        let failedResponse = try XCTUnwrap(failedEntry["response"] as? [String: Any])
+        XCTAssertEqual(failedResponse["status"] as? Int, 0)
+        XCTAssertEqual(
+            failedEntry["comment"] as? String,
+            "Response was not captured. Flow failed: The upstream was unavailable"
+        )
+        let failedTimings = try XCTUnwrap(failedEntry["timings"] as? [String: Any])
+        XCTAssertEqual((failedTimings["send"] as? NSNumber)?.doubleValue, 0)
+        XCTAssertEqual((failedTimings["wait"] as? NSNumber)?.doubleValue, 0)
+        XCTAssertEqual((failedTimings["receive"] as? NSNumber)?.doubleValue, 0)
+        XCTAssertEqual((failedTimings["connect"] as? NSNumber)?.doubleValue, -1)
+        XCTAssertEqual((failedTimings["ssl"] as? NSNumber)?.doubleValue, -1)
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()
@@ -537,6 +734,76 @@ final class ProxyLensApplicationTests: XCTestCase {
             )
         )
     }
+
+    private static func exportFlow(
+        method: HTTPMethod,
+        url: String,
+        requestHeaders: [(String, String)] = [],
+        requestBody: Data? = nil,
+        statusCode: Int? = nil,
+        reasonPhrase: String? = nil,
+        responseHeaders: [(String, String)] = [],
+        responseBody: Data? = nil,
+        startedAt: Date = Date(timeIntervalSince1970: 1_000)
+    ) throws -> Flow {
+        var requestHeaderFields = HTTPHeaders()
+        for (name, value) in requestHeaders {
+            try requestHeaderFields.append(name: name, value: value)
+        }
+        let requestReference = requestBody.map { data in
+            BodyReference(
+                inline: data,
+                metadata: BodyMetadata(
+                    contentType: requestHeaderFields.firstValue(for: "Content-Type")
+                )
+            )
+        }
+        var flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(
+                method: method,
+                url: URL(string: url)!,
+                headers: requestHeaderFields,
+                body: requestReference
+            ),
+            startedAt: startedAt
+        )
+        try flow.transition(to: .receivingRequest)
+        guard let statusCode else {
+            return flow
+        }
+
+        var responseHeaderFields = HTTPHeaders()
+        for (name, value) in responseHeaders {
+            try responseHeaderFields.append(name: name, value: value)
+        }
+        let responseReference = responseBody.map { data in
+            BodyReference(
+                inline: data,
+                metadata: BodyMetadata(
+                    contentType: responseHeaderFields.firstValue(for: "Content-Type")
+                )
+            )
+        }
+        try flow.transition(to: .receivingResponse)
+        flow.attachResponse(
+            try HTTPResponse(
+                statusCode: statusCode,
+                reasonPhrase: reasonPhrase,
+                headers: responseHeaderFields,
+                body: responseReference
+            )
+        )
+        try flow.transition(to: .completed)
+        return flow
+    }
+
+    private static func harObject(_ data: Data) throws -> [String: Any] {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProxyLensError.unsupportedOperation("HAR JSON was not an object")
+        }
+        return object
+    }
 }
 
 private enum TestFailure: LocalizedError {
@@ -557,6 +824,45 @@ private actor CallRecorder {
     func snapshot() -> [String] {
         calls
     }
+}
+
+private actor RecordingBodyStore: BodyStore {
+    private var ids: [BodyID] = []
+
+    func beginWrite(
+        metadata: BodyMetadata,
+        maximumByteCount: Int64?
+    ) async throws -> any BodyWriter {
+        RecordingBodyWriter()
+    }
+
+    func read(_ reference: BodyReference) async throws -> Data {
+        ids.append(reference.id)
+        if case .inline(let data) = reference.storage {
+            return data
+        }
+        throw ProxyLensError.unsupportedOperation("Missing exported body")
+    }
+
+    func remove(_ reference: BodyReference) async {}
+
+    func readIDs() -> [BodyID] {
+        ids
+    }
+}
+
+private actor RecordingBodyWriter: BodyWriter {
+    private var buffer = Data()
+
+    func append(_ data: Data) {
+        buffer.append(data)
+    }
+
+    func finalize() -> BodyReference {
+        BodyReference(inline: buffer)
+    }
+
+    func cancel() {}
 }
 
 private actor AsyncGate {

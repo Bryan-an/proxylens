@@ -1,5 +1,6 @@
 import AppKit
 import ProxyLensCore
+import UniformTypeIdentifiers
 
 @MainActor
 final class FlowTableViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate,
@@ -237,6 +238,14 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 
         let host = rows[rowIndex].host
         let path = Self.mappingPath(for: rows[rowIndex])
+        let flowID = rows[rowIndex].id
+        menu.addItem(
+            exportMenuItem(title: "Copy as cURL", flowID: flowID, action: #selector(copyCURL))
+        )
+        menu.addItem(
+            exportMenuItem(title: "Export HAR…", flowID: flowID, action: #selector(exportHAR))
+        )
+        menu.addItem(.separator())
         menu.addItem(ruleMenuItem(title: "Block \(host)", host: host, action: #selector(blockHost)))
         menu.addItem(ruleMenuItem(title: "Allow \(host)", host: host, action: #selector(allowHost)))
         menu.addItem(
@@ -282,11 +291,72 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         menu.addItem(responseBreakpointItem)
     }
 
+    private func exportMenuItem(title: String, flowID: FlowID, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = flowID
+        return item
+    }
+
     private func ruleMenuItem(title: String, host: String, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         item.representedObject = host
         return item
+    }
+
+    @objc private func copyCURL(_ sender: NSMenuItem) {
+        guard let flowID = sender.representedObject as? FlowID else {
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                let command = try await viewModel.curlCommand(for: flowID)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    @objc private func exportHAR(_ sender: NSMenuItem) {
+        guard let flowID = sender.representedObject as? FlowID else {
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.title = "Export HAR"
+        panel.nameFieldStringValue = "flow.har"
+        if let harType = UTType(filenameExtension: "har") {
+            panel.allowedContentTypes = [harType]
+        } else {
+            panel.allowedContentTypes = [.json]
+        }
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    let data = try await self.viewModel.harFile(for: flowID)
+                    try data.write(to: url)
+                } catch {
+                    await self.presentError(error)
+                }
+            }
+        }
+    }
+
+    private func presentError(_ error: Error) async {
+        let alert = NSAlert(error: error)
+        if let window = view.window {
+            await alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     @objc private func blockHost(_ sender: NSMenuItem) {

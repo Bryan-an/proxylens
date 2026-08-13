@@ -167,6 +167,10 @@ struct TrafficConsoleStore {
         selectedFlowID.flatMap { flowsByID[$0] }
     }
 
+    func flow(id: FlowID) -> Flow? {
+        flowsByID[id]
+    }
+
     mutating func apply(_ events: [FlowEvent]) {
         var domainProjectionChanged = false
         var needsSort = false
