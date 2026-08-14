@@ -180,6 +180,7 @@ ProxyLens/
 │   │   │   │   ├── FlowStore.swift
 │   │   │   │   ├── BodyStore.swift
 │   │   │   │   ├── CertificateProvider.swift
+│   │   │   │   ├── CertificateTrustStore.swift
 │   │   │   │   └── SystemProxyController.swift
 │   │   │   └── Errors/
 │   │   │       └── ProxyLensError.swift
@@ -192,6 +193,7 @@ ProxyLens/
 │   │   │   ├── FlowEventBus.swift
 │   │   │   ├── RuleEngine.swift
 │   │   │   ├── SessionService.swift
+│   │   │   ├── CertificateTrustService.swift
 │   │   │   ├── ReplayService.swift
 │   │   │   └── ExportService.swift
 │   │   └── Tests/ProxyLensApplicationTests/
@@ -239,7 +241,8 @@ ProxyLens/
 │       │   ├── TLS/
 │       │   │   ├── CertificateAuthority.swift
 │       │   │   ├── LeafCertificateProvider.swift
-│       │   │   └── KeychainStore.swift
+│       │   │   ├── KeychainStore.swift
+│       │   │   └── SystemCertificateTrustStore.swift
 │       │   ├── SystemProxy/
 │       │   │   ├── SystemProxyController.swift
 │       │   │   └── SavedProxyConfiguration.swift
@@ -486,6 +489,18 @@ P0 session persistence currently implemented:
 - On launch, `SessionService.loadWorkspace()` hydrates the traffic console with every persisted flow, oldest first, after capture recovery. Inspection and HAR/cURL work with capture stopped because they read `BodyStore` from those restored `Flow` snapshots.
 - Clear Session stops capture if it is running, empties the console, and deletes every session plus body files. Pending live events are discarded so cleared flows cannot reappear. A new capture can append afterward. Restore failures are shown in the status bar. There is no session picker or portable session file; HAR remains the interchange format.
 
+P0 HTTPS certificate trust currently implemented:
+
+- `KeychainCertificateProvider` still owns CA material. The root private key stays non-extractable; the public certificate is stored both as a Keychain certificate item and as namespaced DER so the same CA is reloaded after relaunch. `SystemCertificateTrustStore` is a separate actor so the macOS password panel cannot stall leaf minting.
+- Trust is installed into the user domain with `SecTrustSettingsSetTrustSettings`. The app stays unprivileged; SecurityAgent prompts for the login password. Removal uses `SecTrustSettingsRemoveTrustSettings` and treats a missing setting as success.
+- The traffic console reports *effective* trust, not just stored settings: a probe leaf for `trust-probe.proxylens.invalid` is evaluated with `SecTrustEvaluateWithError`. That also reports trusted when the root was installed by hand in Keychain Access.
+- The header button opens a SwiftUI sheet to install trust, save the PEM, or remove trust. The sheet is not shown automatically on launch. A dismissed password panel is treated as cancellation, not a failure.
+
+P0 system proxy configuration currently implemented:
+
+- `MacOSSystemProxyController` creates its `SCPreferences` session with `SCPreferencesCreateWithAuthorization` and an `AuthorizationRef`. An unauthorized session cannot take the write lock: `SCPreferencesLock` fails with `kSCStatusAccessError` for an unprivileged app. The authorization is released with the session, and the app stays unprivileged.
+- Taking the pre-activation snapshot only reads service configuration, so it does not hold the write lock. Applying and restoring proxy settings lock, commit, and apply.
+
 P0 distribution currently implemented:
 
 - Hardened Runtime is enabled. The app is not sandboxed.
@@ -498,7 +513,7 @@ All macOS-specific security behavior belongs in `ProxyLensPlatform`:
 
 - Root CA creation and leaf certificate generation.
 - Keychain storage of private keys and certificates.
-- Certificate trust guidance or installation.
+- Certificate trust guidance or installation via `CertificateTrustStore` / `SystemCertificateTrustStore`.
 - System HTTP/HTTPS proxy configuration and restoration.
 - OSLog categories and redaction.
 - Future login-item or helper-process registration.

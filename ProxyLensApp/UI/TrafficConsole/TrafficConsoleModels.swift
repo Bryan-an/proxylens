@@ -129,6 +129,7 @@ struct TrafficBreakpointInspection: Equatable, Sendable {
 struct TrafficConsoleSnapshot: Equatable, Sendable {
     let capture: TrafficCapturePresentation
     let workspaceWarning: String?
+    let certificateTrust: CertificateTrustState?
     let allFlowCount: Int
     let domains: [TrafficDomainSummary]
     let selectedSource: TrafficSourceSelection
@@ -140,6 +141,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
     static let initial = TrafficConsoleSnapshot(
         capture: .recovering,
         workspaceWarning: nil,
+        certificateTrust: nil,
         allFlowCount: 0,
         domains: [],
         selectedSource: .allTraffic,
@@ -290,11 +292,13 @@ struct TrafficConsoleStore {
     func snapshot(
         capture: TrafficCapturePresentation,
         inspection: TrafficFlowInspection,
-        workspaceWarning: String? = nil
+        workspaceWarning: String? = nil,
+        certificateTrust: CertificateTrustState? = nil
     ) -> TrafficConsoleSnapshot {
         TrafficConsoleSnapshot(
             capture: capture,
             workspaceWarning: workspaceWarning,
+            certificateTrust: certificateTrust,
             allFlowCount: flowsByID.count,
             domains: domainSummaries,
             selectedSource: selectedSource,

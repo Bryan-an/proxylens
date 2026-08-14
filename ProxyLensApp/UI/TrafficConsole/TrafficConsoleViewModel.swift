@@ -34,6 +34,15 @@ protocol TrafficSessionLoading: Sendable {
 
 extension SessionService: TrafficSessionLoading {}
 
+protocol TrafficCertificateTrusting: Sendable {
+    func state() async throws -> CertificateTrustState
+    func install() async throws
+    func remove() async throws
+    func exportRootCertificate(to url: URL) async throws
+}
+
+extension CertificateTrustService: TrafficCertificateTrusting {}
+
 @MainActor
 final class TrafficConsoleViewModel: ObservableObject {
     @Published private(set) var snapshot = TrafficConsoleSnapshot.initial
@@ -47,6 +56,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let breakpointCoordinator: BreakpointCoordinator?
     private let exportService: ExportService?
     private let sessionService: (any TrafficSessionLoading)?
+    private let certificateTrust: (any TrafficCertificateTrusting)?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -55,6 +65,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private var isPrepared = false
     private var isClearingSession = false
     private var workspaceWarning: String?
+    private var certificateTrustState: CertificateTrustState?
     private var eventTask: Task<Void, Never>?
     private var eventBatchTask: Task<Void, Never>?
     private var bodyTask: Task<Void, Never>?
@@ -69,7 +80,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         ruleEngine: RuleEngine? = nil,
         breakpointCoordinator: BreakpointCoordinator? = nil,
         exportService: ExportService? = nil,
-        sessionService: (any TrafficSessionLoading)? = nil
+        sessionService: (any TrafficSessionLoading)? = nil,
+        certificateTrust: (any TrafficCertificateTrusting)? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -80,6 +92,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.breakpointCoordinator = breakpointCoordinator
         self.exportService = exportService
         self.sessionService = sessionService
+        self.certificateTrust = certificateTrust
     }
 
     deinit {
@@ -104,6 +117,7 @@ final class TrafficConsoleViewModel: ObservableObject {
             capturePresentation = .failed(error.localizedDescription)
         }
         await hydrateWorkspace()
+        await refreshCertificateTrust()
         publishSnapshot()
         subscribeToFlowEvents()
     }
@@ -309,6 +323,39 @@ final class TrafficConsoleViewModel: ObservableObject {
         Task { await breakpointCoordinator?.abort(flowID: flowID) }
     }
 
+    func installCertificateTrust() async throws {
+        do {
+            try await certificateTrust?.install()
+        } catch {
+            if Self.isCertificateTrustCancellation(error) {
+                await refreshCertificateTrust()
+                return
+            }
+            await refreshCertificateTrust()
+            throw error
+        }
+        await refreshCertificateTrust()
+    }
+
+    func removeCertificateTrust() async throws {
+        do {
+            try await certificateTrust?.remove()
+        } catch {
+            if Self.isCertificateTrustCancellation(error) {
+                await refreshCertificateTrust()
+                return
+            }
+            await refreshCertificateTrust()
+            throw error
+        }
+        await refreshCertificateTrust()
+    }
+
+    func exportRootCertificate(to url: URL) async throws {
+        try await certificateTrust?.exportRootCertificate(to: url)
+        await refreshCertificateTrust()
+    }
+
     private func updateDisplayFilter(_ update: (inout TrafficDisplayFilter) -> Void) {
         var filter = store.displayFilter
         update(&filter)
@@ -377,6 +424,30 @@ final class TrafficConsoleViewModel: ObservableObject {
             workspaceWarning =
                 "Could not restore the previous session: \(error.localizedDescription)"
         }
+    }
+
+    private func refreshCertificateTrust() async {
+        guard let certificateTrust else {
+            certificateTrustState = nil
+            return
+        }
+
+        do {
+            certificateTrustState = try await certificateTrust.state()
+        } catch {
+            if Self.isCertificateTrustCancellation(error) {
+                return
+            }
+            certificateTrustState = nil
+        }
+        publishSnapshot()
+    }
+
+    private static func isCertificateTrustCancellation(_ error: Error) -> Bool {
+        if let trustError = error as? CertificateTrustError, trustError == .userCancelled {
+            return true
+        }
+        return error.localizedDescription == CertificateTrustError.cancelledDescription
     }
 
     private func discardPendingFlowEvents() {
@@ -502,7 +573,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         snapshot = store.snapshot(
             capture: capturePresentation,
             inspection: inspection,
-            workspaceWarning: workspaceWarning
+            workspaceWarning: workspaceWarning,
+            certificateTrust: certificateTrustState
         )
     }
 

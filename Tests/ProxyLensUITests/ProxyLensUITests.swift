@@ -29,6 +29,7 @@ final class ProxyLensUITests: XCTestCase {
         XCTAssertTrue(window.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["capture.toggle"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["session.clear"].exists)
+        XCTAssertTrue(app.buttons["certificate.trust"].exists)
         XCTAssertTrue(app.searchFields["traffic.search"].exists)
         XCTAssertTrue(app.popUpButtons["traffic.filter.method"].exists)
         XCTAssertTrue(app.popUpButtons["traffic.filter.status"].exists)

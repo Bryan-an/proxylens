@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import SwiftUI
 
 @MainActor
 final class TrafficConsoleViewController: NSViewController {
@@ -10,6 +11,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let splitViewController = NSSplitViewController()
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
+    private let certificateButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
@@ -61,11 +63,19 @@ final class TrafficConsoleViewController: NSViewController {
         clearSessionButton.action = #selector(clearSession)
         clearSessionButton.setAccessibilityIdentifier("session.clear")
 
+        certificateButton.translatesAutoresizingMaskIntoConstraints = false
+        certificateButton.title = "Trust HTTPS Certificate…"
+        certificateButton.bezelStyle = .rounded
+        certificateButton.target = self
+        certificateButton.action = #selector(showCertificateTrust)
+        certificateButton.setAccessibilityIdentifier("certificate.trust")
+
         let header = NSView()
         header.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
+        header.addSubview(certificateButton)
         header.addSubview(clearSessionButton)
         header.addSubview(captureButton)
         NSLayoutConstraint.activate([
@@ -78,7 +88,10 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.leadingAnchor.constraint(equalTo: statusImage.trailingAnchor, constant: 5),
             statusField.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusField.trailingAnchor.constraint(
-                lessThanOrEqualTo: clearSessionButton.leadingAnchor, constant: -12),
+                lessThanOrEqualTo: certificateButton.leadingAnchor, constant: -12),
+            certificateButton.trailingAnchor.constraint(
+                equalTo: clearSessionButton.leadingAnchor, constant: -8),
+            certificateButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             clearSessionButton.trailingAnchor.constraint(
                 equalTo: captureButton.leadingAnchor, constant: -8),
             clearSessionButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -192,6 +205,29 @@ final class TrafficConsoleViewController: NSViewController {
             canClear = false
         }
         clearSessionButton.isEnabled = canClear
+        switch snapshot.certificateTrust {
+        case .trusted:
+            certificateButton.title = "HTTPS Certificate Trusted"
+        case .notGenerated, .untrusted, nil:
+            certificateButton.title = "Trust HTTPS Certificate…"
+        }
+    }
+
+    @objc private func showCertificateTrust() {
+        let sheet = NSHostingController(
+            rootView: CertificateTrustView(viewModel: viewModel) { [weak self] in
+                self?.dismissCertificateTrustSheet()
+            }
+        )
+        sheet.title = "HTTPS Certificate"
+        presentAsSheet(sheet)
+    }
+
+    private func dismissCertificateTrustSheet() {
+        guard let presented = presentedViewControllers?.last else {
+            return
+        }
+        dismiss(presented)
     }
 
     @objc private func toggleCapture() {

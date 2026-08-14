@@ -26,6 +26,9 @@ final class CompositionRoot {
             downstream: flowEvents
         )
         let certificateProvider = KeychainCertificateProvider()
+        let certificateTrustStore = SystemCertificateTrustStore(
+            certificateProvider: certificateProvider
+        )
         let ruleEngine = RuleEngine()
         let breakpointCoordinator = BreakpointCoordinator()
         let proxyEngine = NIOProxyEngine(
@@ -51,6 +54,7 @@ final class CompositionRoot {
         let bodyReader = FlowBodyReader(bodyStore: bodyStore)
         let exportService = ExportService(bodyStore: bodyStore)
         let sessionService = SessionService(sessionStore: sessionStore)
+        let certificateTrustService = CertificateTrustService(trustStore: certificateTrustStore)
 
         self.flowEvents = flowEvents
         self.captureCoordinator = captureCoordinator
@@ -67,7 +71,8 @@ final class CompositionRoot {
             ruleEngine: ruleEngine,
             breakpointCoordinator: breakpointCoordinator,
             exportService: exportService,
-            sessionService: sessionService
+            sessionService: sessionService,
+            certificateTrust: certificateTrustService
         )
     }
 

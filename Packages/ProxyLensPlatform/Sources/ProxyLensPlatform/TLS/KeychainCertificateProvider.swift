@@ -58,6 +58,24 @@ public actor KeychainCertificateProvider: CertificateProvider {
         try rootMaterial().certificateData
     }
 
+    /// Generates the local CA if needed so onboarding can install trust before capture.
+    public func prepareCertificateAuthority() async throws {
+        _ = try rootMaterial()
+    }
+
+    /// Returns the stored root certificate without creating a CA.
+    func storedRootCertificateReference() throws -> SecCertificate? {
+        if let cachedRootMaterial {
+            return try Self.secCertificate(
+                fromDERData: try Self.derData(for: cachedRootMaterial.certificate)
+            )
+        }
+        guard let data = try loadRootCertificateData() else {
+            return nil
+        }
+        return try Self.secCertificate(fromDERData: data)
+    }
+
     public func leafCertificate(for hostname: String) async throws -> CertificateIdentity {
         let normalizedHostname = try Self.normalizedHostname(hostname)
         let now = Date()
@@ -100,6 +118,10 @@ public actor KeychainCertificateProvider: CertificateProvider {
             query: rootCertificateQuery,
             operation: "remove root certificate"
         )
+        try deleteKeychainItem(
+            query: rootCertificateDataQuery,
+            operation: "remove root certificate data"
+        )
         cachedRootMaterial = nil
         leafCache.removeAll(keepingCapacity: false)
     }
@@ -122,6 +144,14 @@ public actor KeychainCertificateProvider: CertificateProvider {
         [
             kSecClass: kSecClassCertificate,
             kSecAttrLabel: "\(configuration.keychainNamespace).root-ca.certificate"
+        ]
+    }
+
+    private var rootCertificateDataQuery: [CFString: Any] {
+        [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: configuration.keychainNamespace,
+            kSecAttrAccount: "root-ca.certificate"
         ]
     }
 
@@ -284,22 +314,16 @@ public actor KeychainCertificateProvider: CertificateProvider {
     }
 
     private func loadRootCertificateData() throws -> Data? {
-        var query = rootCertificateQuery
-        query[kSecReturnData] = true
-        query[kSecMatchLimit] = kSecMatchLimitOne
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound {
-            return nil
+        if let data = try copyKeychainData(
+            query: rootCertificateDataQuery,
+            operation: "load root certificate data"
+        ) {
+            return data
         }
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw CertificateProviderError.keychain(
-                operation: "load root certificate",
-                status: status
-            )
-        }
-        return data
+        return try copyKeychainData(
+            query: rootCertificateQuery,
+            operation: "load root certificate"
+        )
     }
 
     private func saveRootCertificateData(_ data: Data) throws {
@@ -310,16 +334,47 @@ public actor KeychainCertificateProvider: CertificateProvider {
             query: rootCertificateQuery,
             operation: "replace root certificate"
         )
+        try deleteKeychainItem(
+            query: rootCertificateDataQuery,
+            operation: "replace root certificate data"
+        )
 
-        var item = rootCertificateQuery
-        item[kSecValueRef] = certificate
-        let addStatus = SecItemAdd(item as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
+        var certificateItem = rootCertificateQuery
+        certificateItem[kSecValueRef] = certificate
+        let certificateStatus = SecItemAdd(certificateItem as CFDictionary, nil)
+        guard certificateStatus == errSecSuccess else {
             throw CertificateProviderError.keychain(
                 operation: "store root certificate",
-                status: addStatus
+                status: certificateStatus
             )
         }
+
+        var dataItem = rootCertificateDataQuery
+        dataItem[kSecValueData] = data
+        dataItem[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let dataStatus = SecItemAdd(dataItem as CFDictionary, nil)
+        guard dataStatus == errSecSuccess else {
+            throw CertificateProviderError.keychain(
+                operation: "store root certificate data",
+                status: dataStatus
+            )
+        }
+    }
+
+    private func copyKeychainData(query: [CFString: Any], operation: String) throws -> Data? {
+        var copyQuery = query
+        copyQuery[kSecReturnData] = true
+        copyQuery[kSecMatchLimit] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(copyQuery as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            return nil
+        }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw CertificateProviderError.keychain(operation: operation, status: status)
+        }
+        return data
     }
 
     private func deleteKeychainItem(query: [CFString: Any], operation: String) throws {
@@ -410,6 +465,13 @@ public actor KeychainCertificateProvider: CertificateProvider {
         var serializer = DER.Serializer()
         try serializer.serialize(certificate)
         return Data(serializer.serializedBytes)
+    }
+
+    private static func secCertificate(fromDERData data: Data) throws -> SecCertificate {
+        guard let certificate = SecCertificateCreateWithData(nil, data as CFData) else {
+            throw CertificateProviderError.malformedStoredCertificate
+        }
+        return certificate
     }
 
     private static func certificate(fromDERData data: Data) throws -> Certificate {

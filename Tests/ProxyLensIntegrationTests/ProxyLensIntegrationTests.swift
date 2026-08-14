@@ -606,6 +606,63 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
     }
 
+    func testViewModelPublishesCertificateTrustAndRefreshesAfterInstall() async throws {
+        let trust = RecordingCertificateTrust(state: .untrusted)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            certificateTrust: trust
+        )
+
+        await viewModel.prepare()
+        XCTAssertEqual(viewModel.snapshot.certificateTrust, .untrusted)
+
+        try await viewModel.installCertificateTrust()
+        XCTAssertEqual(viewModel.snapshot.certificateTrust, .trusted)
+        let calls = await trust.calls()
+        XCTAssertEqual(calls, ["state", "install", "state"])
+    }
+
+    func testViewModelSwallowsCertificateTrustCancellationAndSurfacesFailures() async throws {
+        let trust = RecordingCertificateTrust(state: .untrusted)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            certificateTrust: trust
+        )
+
+        await viewModel.prepare()
+        await trust.failNextInstall(CertificateTrustError.userCancelled)
+        try await viewModel.installCertificateTrust()
+        XCTAssertEqual(viewModel.snapshot.certificateTrust, .untrusted)
+
+        await trust.failNextInstall(
+            ProxyLensError.unsupportedOperation("The trust settings could not be updated")
+        )
+        do {
+            try await viewModel.installCertificateTrust()
+            XCTFail("Expected a trust failure to be surfaced")
+        } catch let error as ProxyLensError {
+            XCTAssertEqual(
+                error,
+                .unsupportedOperation("The trust settings could not be updated")
+            )
+        }
+        XCTAssertEqual(viewModel.snapshot.certificateTrust, .untrusted)
+
+        let exportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-trust-\(UUID().uuidString).pem")
+        defer { try? FileManager.default.removeItem(at: exportURL) }
+        try await viewModel.exportRootCertificate(to: exportURL)
+        XCTAssertEqual(viewModel.snapshot.certificateTrust, .untrusted)
+        let exported = await trust.exportedURLs()
+        XCTAssertEqual(exported, [exportURL])
+    }
+
     func testCaptureControlPresentsRecoveryStartAndStopTransitions() async throws {
         let captureController = RecordingCaptureController()
         let viewModel = TrafficConsoleViewModel(
@@ -1141,5 +1198,55 @@ private actor RecordingSessionService: TrafficSessionLoading {
 
     func cleared() -> Bool {
         didClear
+    }
+}
+
+private actor RecordingCertificateTrust: TrafficCertificateTrusting {
+    private var currentState: CertificateTrustState
+    private var installError: (any Error)?
+    private var recordedCalls: [String] = []
+    private var exported: [URL] = []
+
+    init(state: CertificateTrustState) {
+        currentState = state
+    }
+
+    func state() -> CertificateTrustState {
+        recordedCalls.append("state")
+        return currentState
+    }
+
+    func install() throws {
+        recordedCalls.append("install")
+        if let installError {
+            self.installError = nil
+            throw installError
+        }
+        currentState = .trusted
+    }
+
+    func remove() {
+        recordedCalls.append("remove")
+        if currentState != .notGenerated {
+            currentState = .untrusted
+        }
+    }
+
+    func exportRootCertificate(to url: URL) throws {
+        recordedCalls.append("export")
+        exported.append(url)
+        try Data().write(to: url)
+    }
+
+    func failNextInstall(_ error: any Error) {
+        installError = error
+    }
+
+    func calls() -> [String] {
+        recordedCalls
+    }
+
+    func exportedURLs() -> [URL] {
+        exported
     }
 }

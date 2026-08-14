@@ -1,5 +1,6 @@
 import Foundation
 import ProxyLensCore
+@preconcurrency import Security
 @preconcurrency import SystemConfiguration
 
 public enum SystemProxyControllerError: LocalizedError, Equatable, Sendable {
@@ -70,11 +71,12 @@ public actor MacOSSystemProxyController: SystemProxyController {
             throw SystemProxyControllerError.snapshotAlreadyExists
         }
 
-        let preferences = try makePreferences()
-        try lock(preferences)
-        defer { SCPreferencesUnlock(preferences) }
+        // Snapshotting only reads configuration, so it must not take the write lock.
+        let session = try makePreferences()
+        defer { session.invalidate() }
 
-        let snapshots = try enabledProxyProtocols(in: preferences).map { serviceID, protocolRef in
+        let snapshots = try enabledProxyProtocols(in: session.preferences).map {
+            serviceID, protocolRef in
             ServiceSnapshot(
                 serviceID: serviceID,
                 configuration: try Self.encodeConfiguration(
@@ -101,7 +103,9 @@ public actor MacOSSystemProxyController: SystemProxyController {
 
     public func apply(_ configuration: SystemProxyConfiguration) async throws {
         let snapshot = try loadSnapshot(requireExisting: true)
-        let preferences = try makePreferences()
+        let session = try makePreferences()
+        defer { session.invalidate() }
+        let preferences = session.preferences
         try lock(preferences)
         defer { SCPreferencesUnlock(preferences) }
 
@@ -146,7 +150,9 @@ public actor MacOSSystemProxyController: SystemProxyController {
 
     private func restoreSnapshot(requireExisting: Bool) throws {
         let snapshot = try loadSnapshot(requireExisting: requireExisting)
-        let preferences = try makePreferences()
+        let session = try makePreferences()
+        defer { session.invalidate() }
+        let preferences = session.preferences
         try lock(preferences)
         defer { SCPreferencesUnlock(preferences) }
 
@@ -189,11 +195,40 @@ public actor MacOSSystemProxyController: SystemProxyController {
         }
     }
 
-    private func makePreferences() throws -> SCPreferences {
-        guard let preferences = SCPreferencesCreate(nil, "ProxyLens" as CFString, nil) else {
-            throw SystemProxyControllerError.preferencesUnavailable(Self.lastSCError())
+    /// An `SCPreferences` session paired with the authorization that keeps it writable.
+    ///
+    /// Modifying network preferences requires an `AuthorizationRef`; without one
+    /// `SCPreferencesLock` fails with `kSCStatusAccessError` for an unprivileged app.
+    private struct PreferencesSession {
+        let preferences: SCPreferences
+        let authorization: AuthorizationRef
+
+        func invalidate() {
+            AuthorizationFree(authorization, [])
         }
-        return preferences
+    }
+
+    private func makePreferences() throws -> PreferencesSession {
+        var authorization: AuthorizationRef?
+        let authorizationStatus = AuthorizationCreate(nil, nil, [], &authorization)
+        guard authorizationStatus == errAuthorizationSuccess, let authorization else {
+            throw SystemProxyControllerError.preferencesUnavailable(
+                "authorization could not be created (status \(authorizationStatus))"
+            )
+        }
+
+        let created = SCPreferencesCreateWithAuthorization(
+            nil,
+            "ProxyLens" as CFString,
+            nil,
+            authorization
+        )
+        guard let preferences = created else {
+            let message = Self.lastSCError()
+            AuthorizationFree(authorization, [])
+            throw SystemProxyControllerError.preferencesUnavailable(message)
+        }
+        return PreferencesSession(preferences: preferences, authorization: authorization)
     }
 
     private func lock(_ preferences: SCPreferences) throws {

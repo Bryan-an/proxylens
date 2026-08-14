@@ -463,6 +463,32 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertTrue(remainingSessions.isEmpty)
     }
 
+    func testCertificateTrustServiceDelegatesInstallRemoveExportAndState() async throws {
+        let store = RecordingCertificateTrustStore(state: .notGenerated)
+        let service = CertificateTrustService(trustStore: store)
+        let exportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-trust-export-\(UUID().uuidString).pem")
+        defer { try? FileManager.default.removeItem(at: exportURL) }
+
+        let initial = try await service.state()
+        XCTAssertEqual(initial, .notGenerated)
+
+        try await service.exportRootCertificate(to: exportURL)
+        let afterExport = try await service.state()
+        XCTAssertEqual(afterExport, .untrusted)
+        let exported = await store.exportedURLs()
+        XCTAssertEqual(exported, [exportURL])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exportURL.path))
+
+        try await service.install()
+        let trusted = try await service.state()
+        XCTAssertEqual(trusted, .trusted)
+
+        try await service.remove()
+        let untrusted = try await service.state()
+        XCTAssertEqual(untrusted, .untrusted)
+    }
+
     func testStartUsesCreatedSessionAndStopRestoresDependenciesInOrder() async throws {
         let recorder = CallRecorder()
         let sessionID = SessionID()
@@ -1138,5 +1164,41 @@ private actor RecordingSessionStore: SessionStore {
 
     func seedRecordingSession(id: SessionID) {
         sessions[id] = Session(id: id, startedAt: Date(timeIntervalSince1970: 800))
+    }
+}
+
+private actor RecordingCertificateTrustStore: CertificateTrustStore {
+    private var state: CertificateTrustState
+    private var exported: [URL] = []
+
+    init(state: CertificateTrustState) {
+        self.state = state
+    }
+
+    func trustState() -> CertificateTrustState {
+        state
+    }
+
+    func installTrust() {
+        state = .trusted
+    }
+
+    func removeTrust() {
+        if state != .notGenerated {
+            state = .untrusted
+        }
+    }
+
+    func exportRootCertificate(to url: URL) throws {
+        if state == .notGenerated {
+            state = .untrusted
+        }
+        exported.append(url)
+        try Data("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".utf8)
+            .write(to: url)
+    }
+
+    func exportedURLs() -> [URL] {
+        exported
     }
 }

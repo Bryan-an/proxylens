@@ -42,6 +42,18 @@ The `core.hooksPath` setting belongs to the local clone and is not transferred t
 
 Release packaging, Hardened Runtime, and notarization are documented in [DISTRIBUTION.md](DISTRIBUTION.md). A paid Apple Developer Program membership is required before `./scripts/notarize.sh` can succeed.
 
+## HTTPS capture
+
+HTTPS interception needs the local CA trusted in the user domain. In the app, open **Trust HTTPS Certificate…**, then **Install and Trust**, and enter the login password when macOS asks.
+
+Verify from a terminal after capture is running:
+
+```sh
+curl -x http://127.0.0.1:9090 https://example.com/
+```
+
+`curl` uses the system trust store on macOS. If the CA is trusted, the request succeeds and the flow appears in the console. **Remove Trust** in the same sheet reverses the change.
+
 The formatter configuration is stored in `.swift-format`. The project uses the Swift formatter from the active Xcode toolchain through `swift-format`, `xcrun`, or `swift format`.
 
 ## Hook responsibilities

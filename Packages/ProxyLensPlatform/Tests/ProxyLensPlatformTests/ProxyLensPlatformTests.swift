@@ -78,6 +78,57 @@ final class ProxyLensPlatformTests: XCTestCase {
         try await provider.removeCertificateAuthority()
     }
 
+    func testRootCertificateRoundTripsAcrossProviderInstances() async throws {
+        let namespace = "com.proxylens.tests.\(UUID().uuidString)"
+        let first = KeychainCertificateProvider(
+            configuration: .init(keychainNamespace: namespace)
+        )
+        let second = KeychainCertificateProvider(
+            configuration: .init(keychainNamespace: namespace)
+        )
+
+        do {
+            let pem = try await first.rootCertificate()
+            let reloaded = try await second.rootCertificate()
+            XCTAssertEqual(pem, reloaded)
+        } catch {
+            try? await first.removeCertificateAuthority()
+            throw error
+        }
+
+        try await first.removeCertificateAuthority()
+    }
+
+    func testTrustStoreReportsNotGeneratedThenUntrustedAndExportsPEM() async throws {
+        let provider = makeProvider()
+        let store = SystemCertificateTrustStore(certificateProvider: provider)
+        let exportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-root-\(UUID().uuidString).pem")
+
+        do {
+            let initial = try await store.trustState()
+            XCTAssertEqual(initial, .notGenerated)
+
+            try await store.exportRootCertificate(to: exportURL)
+            let attributes = try FileManager.default.attributesOfItem(atPath: exportURL.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.uint16Value, 0o644)
+
+            let pem = try String(contentsOf: exportURL, encoding: .utf8)
+            XCTAssertTrue(pem.contains("BEGIN CERTIFICATE"))
+            _ = try Certificate(pemEncoded: pem)
+
+            let afterExport = try await store.trustState()
+            XCTAssertEqual(afterExport, .untrusted)
+        } catch {
+            try? await provider.removeCertificateAuthority()
+            try? FileManager.default.removeItem(at: exportURL)
+            throw error
+        }
+
+        try? FileManager.default.removeItem(at: exportURL)
+        try await provider.removeCertificateAuthority()
+    }
+
     func testSystemProxyRecoveryIsNoOpWithoutSnapshot() async throws {
         let snapshotURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("ProxyLensSystemProxyTests-\(UUID().uuidString)")

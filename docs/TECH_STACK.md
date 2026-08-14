@@ -163,7 +163,7 @@ The first release should provide explicit onboarding and a reversible setup flow
 
 - Generate a local CA on first use.
 - Store it in the Keychain.
-- Explain how to trust it in macOS Keychain Access, or automate the supported step only after the security and UX behavior is understood.
+- Install trust into the macOS user domain with `SecTrustSettings`, prompting for the login password. Saving the PEM remains available as a manual Keychain Access fallback.
 - Configure the macOS HTTP/HTTPS proxy through a narrow integration wrapper.
 - Restore the previous proxy configuration when the user disables capture, subject to clear user consent and failure-safe behavior.
 

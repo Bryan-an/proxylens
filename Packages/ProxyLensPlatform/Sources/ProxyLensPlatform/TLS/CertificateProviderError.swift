@@ -7,6 +7,8 @@ public enum CertificateProviderError: Error, Equatable, LocalizedError, Sendable
     case keyGeneration(String)
     case keychain(operation: String, status: OSStatus)
     case malformedStoredCertificate
+    case trustSettings(operation: String, status: OSStatus)
+    case userCancelled
 
     public var errorDescription: String? {
         switch self {
@@ -20,6 +22,10 @@ public enum CertificateProviderError: Error, Equatable, LocalizedError, Sendable
             "Keychain operation '\(operation)' failed with status \(status)"
         case .malformedStoredCertificate:
             "The stored ProxyLens root certificate is malformed"
+        case .trustSettings(let operation, let status):
+            "Trust settings operation '\(operation)' failed with status \(status)"
+        case .userCancelled:
+            "The certificate trust change was cancelled."
         }
     }
 }
