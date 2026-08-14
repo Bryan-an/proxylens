@@ -31,11 +31,11 @@ public enum JSONBodyView: Sendable {
         isTruncated: Bool = false
     ) -> Result {
         switch unwrapForInspection(data, contentEncoding: contentEncoding) {
-        case .failed(let reason):
-            if isTruncated {
+        case .failed(let failure):
+            if isTruncated, failure.isCausedByIncompleteData {
                 return .unavailable(reason: truncatedReason)
             }
-            return .unavailable(reason: reason)
+            return .unavailable(reason: failure.reason)
         case .decoded(let decoded):
             return prettyPrint(
                 decoded,
@@ -47,7 +47,33 @@ public enum JSONBodyView: Sendable {
 
     private enum UnwrappedBody {
         case decoded(Data)
-        case failed(String)
+        case failed(UnwrapFailure)
+    }
+
+    private enum UnwrapFailure {
+        case unsupportedEncoding(String)
+        case decompressionFailed(String)
+        case exceedsLimit
+
+        var isCausedByIncompleteData: Bool {
+            switch self {
+            case .decompressionFailed:
+                true
+            case .unsupportedEncoding, .exceedsLimit:
+                false
+            }
+        }
+
+        var reason: String {
+            switch self {
+            case .unsupportedEncoding(let encoding):
+                JSONBodyView.unsupportedContentEncodingReason(encoding)
+            case .decompressionFailed(let encoding):
+                JSONBodyView.decompressionFailedReason(encoding)
+            case .exceedsLimit:
+                JSONBodyView.exceedsDisplayLimitReason
+            }
+        }
     }
 
     private static func unwrapForInspection(
@@ -65,7 +91,7 @@ public enum JSONBodyView: Sendable {
         case "deflate":
             return inflateDeflate(data)
         default:
-            return .failed(unsupportedContentEncodingReason(encoding))
+            return .failed(.unsupportedEncoding(encoding))
         }
 
         do {
@@ -76,9 +102,9 @@ public enum JSONBodyView: Sendable {
             )
             return .decoded(decoded)
         } catch ZlibContentEncoding.Error.exceedsLimit {
-            return .failed(exceedsDisplayLimitReason)
+            return .failed(.exceedsLimit)
         } catch {
-            return .failed(decompressionFailedReason(encoding))
+            return .failed(.decompressionFailed(encoding))
         }
     }
 
@@ -91,7 +117,7 @@ public enum JSONBodyView: Sendable {
             )
             return .decoded(decoded)
         } catch ZlibContentEncoding.Error.exceedsLimit {
-            return .failed(exceedsDisplayLimitReason)
+            return .failed(.exceedsLimit)
         } catch {
             do {
                 let decoded = try ZlibContentEncoding.decompress(
@@ -101,9 +127,9 @@ public enum JSONBodyView: Sendable {
                 )
                 return .decoded(decoded)
             } catch ZlibContentEncoding.Error.exceedsLimit {
-                return .failed(exceedsDisplayLimitReason)
+                return .failed(.exceedsLimit)
             } catch {
-                return .failed(decompressionFailedReason("deflate"))
+                return .failed(.decompressionFailed("deflate"))
             }
         }
     }

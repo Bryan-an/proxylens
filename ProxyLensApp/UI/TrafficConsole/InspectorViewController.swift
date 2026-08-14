@@ -24,6 +24,8 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
     private var editedHeaders: [Int: String] = [:]
     private var editedBodies: [Int: String] = [:]
     private var hasUserEdits = false
+    private var displayedMessageSegment = 0
+    private var displayedSectionSegment = 0
 
     init(viewModel: TrafficConsoleViewModel? = nil) {
         self.viewModel = viewModel
@@ -183,6 +185,7 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
 
     private func updateContent() {
         sectionSelector.isEnabled = inspection.flowID != nil && messageSelector.selectedSegment != 2
+        defer { rememberDisplayedSelection() }
         if messageSelector.selectedSegment == 2 {
             textView.string = inspection.rules
             textView.isEditable = false
@@ -212,20 +215,29 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         textView.isEditable = isEditingCurrentSection
     }
 
-    private var selectedMessage: TrafficMessageInspection? {
-        messageSelector.selectedSegment == 1 ? inspection.response : inspection.request
+    private func rememberDisplayedSelection() {
+        displayedMessageSegment = messageSelector.selectedSegment
+        displayedSectionSegment = sectionSelector.selectedSegment
     }
 
-    private var isEditingCurrentMessage: Bool {
+    private func isEditingMessage(_ messageIndex: Int) -> Bool {
         guard let breakpoint = inspection.breakpoint else {
             return false
         }
         switch breakpoint.phase {
         case .request:
-            return messageSelector.selectedSegment == 0
+            return messageIndex == 0
         case .response:
-            return messageSelector.selectedSegment == 1
+            return messageIndex == 1
         }
+    }
+
+    private var selectedMessage: TrafficMessageInspection? {
+        messageSelector.selectedSegment == 1 ? inspection.response : inspection.request
+    }
+
+    private var isEditingCurrentMessage: Bool {
+        isEditingMessage(messageSelector.selectedSegment)
     }
 
     private var isEditingCurrentSection: Bool {
@@ -242,13 +254,13 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
     }
 
     private func saveCurrentEdits() {
-        guard isEditingCurrentMessage, messageSelector.selectedSegment != 2 else {
+        guard isEditingMessage(displayedMessageSegment), displayedMessageSegment != 2 else {
             return
         }
-        if sectionSelector.selectedSegment == 0 {
-            editedHeaders[messageSelector.selectedSegment] = textView.string
-        } else if sectionSelector.selectedSegment == 1, inspection.breakpoint?.canEditBody == true {
-            editedBodies[messageSelector.selectedSegment] = textView.string
+        if displayedSectionSegment == 0 {
+            editedHeaders[displayedMessageSegment] = textView.string
+        } else if displayedSectionSegment == 1, inspection.breakpoint?.canEditBody == true {
+            editedBodies[displayedMessageSegment] = textView.string
         }
     }
 

@@ -1005,6 +1005,63 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertFalse(inspector.string.contains(compact))
     }
 
+    func testInspectorDoesNotCopyJSONTabIntoBodyEditsDuringBreakpoint() throws {
+        let compact = #"{"z":1,"a":2}"#
+        let pretty = "{\n  \"a\" : 2,\n  \"z\" : 1\n}"
+        let flowID = FlowID()
+        let snapshot = TrafficConsoleSnapshot(
+            capture: .stopped,
+            workspaceWarning: nil,
+            certificateTrust: nil,
+            allFlowCount: 1,
+            domains: [],
+            selectedSource: .allTraffic,
+            displayFilter: .all,
+            visibleRows: [],
+            selectedFlowID: flowID,
+            inspection: TrafficFlowInspection(
+                flowID: flowID,
+                title: "POST https://api.example.com/v1",
+                request: TrafficMessageInspection(
+                    title: "Request",
+                    headers: "POST /v1 HTTP/1.1\nHost: api.example.com",
+                    body: .content(metadata: "11 B", value: compact),
+                    json: .content(metadata: "11 B", value: pretty)
+                ),
+                response: nil,
+                rules: "No rules applied to this flow.",
+                breakpoint: TrafficBreakpointInspection(phase: .request, canEditBody: true)
+            )
+        )
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(snapshot)
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+            )
+        )
+        let inspector = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+            )
+        )
+
+        sectionSelector.selectedSegment = 2
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        XCTAssertTrue(inspector.string.contains(pretty))
+
+        sectionSelector.selectedSegment = 1
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        XCTAssertEqual(inspector.string, compact)
+        XCTAssertFalse(inspector.string.contains(pretty))
+    }
+
     private static var captureConfiguration: CaptureConfiguration {
         CaptureConfiguration(
             proxy: ProxyConfiguration(

@@ -1342,6 +1342,25 @@ final class ProxyLensCoreTests: XCTestCase {
             .unavailable(reason: JSONBodyView.unsupportedContentEncodingReason("br"))
         )
 
+        let truncatedBrotli = JSONBodyView.render(
+            data: compact,
+            contentType: "application/json",
+            contentEncoding: "br",
+            isTruncated: true
+        )
+        XCTAssertEqual(
+            truncatedBrotli,
+            .unavailable(reason: JSONBodyView.unsupportedContentEncodingReason("br"))
+        )
+
+        let truncatedGzip = JSONBodyView.render(
+            data: Data([0x1F, 0x8B, 0x08]),
+            contentType: "application/json",
+            contentEncoding: "gzip",
+            isTruncated: true
+        )
+        XCTAssertEqual(truncatedGzip, .unavailable(reason: JSONBodyView.truncatedReason))
+
         let payload =
             Data("{\"a\":\"".utf8)
             + Data(repeating: UInt8(ascii: "x"), count: JSONBodyView.maximumDecodedByteCount + 8)
