@@ -880,6 +880,71 @@ final class ProxyLensIntegrationTests: XCTestCase {
         window.contentViewController = nil
     }
 
+    func testInspectorLongURLDoesNotExpandPastWindowBounds() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        var flow = try Self.makeFlow(index: 9, host: "api.example.com", statusCode: 200)
+        let query = String(repeating: "parameter=0123456789&", count: 100)
+        flow.replaceRequest(
+            HTTPRequest(
+                method: flow.request.method,
+                url: try XCTUnwrap(URL(string: "https://api.example.com/search?\(query)")),
+                headers: flow.request.headers
+            )
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        defer {
+            window.orderOut(nil)
+            window.contentViewController = nil
+        }
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertLessThanOrEqual(controller.view.fittingSize.width, frame.width)
+
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+            )
+        )
+        let selectorFrame = sectionSelector.convert(sectionSelector.bounds, to: controller.view)
+        XCTAssertLessThanOrEqual(selectorFrame.maxX, controller.view.bounds.maxX)
+
+        let representation = try XCTUnwrap(
+            controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds)
+        )
+        controller.view.cacheDisplay(in: controller.view.bounds, to: representation)
+        let png = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 10_000)
+
+        let attachment = XCTAttachment(data: png, uniformTypeIdentifier: "public.png")
+        attachment.name = "ProxyLens long URL inspector"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testInspectorShowsAppliedRuleTraces() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),

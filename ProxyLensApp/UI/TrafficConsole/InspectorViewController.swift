@@ -42,6 +42,7 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         titleField.font = .systemFont(ofSize: 13, weight: .semibold)
         titleField.lineBreakMode = .byTruncatingMiddle
         titleField.maximumNumberOfLines = 1
+        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         continueButton.translatesAutoresizingMaskIntoConstraints = false
         continueButton.bezelStyle = .rounded
@@ -114,7 +115,7 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         NSLayoutConstraint.activate([
             titleField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
             titleField.trailingAnchor.constraint(
-                lessThanOrEqualTo: breakpointStack.leadingAnchor,
+                equalTo: breakpointStack.leadingAnchor,
                 constant: -8
             ),
             titleField.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
