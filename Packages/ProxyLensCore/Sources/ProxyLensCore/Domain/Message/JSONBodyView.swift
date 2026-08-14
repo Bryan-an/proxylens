@@ -114,14 +114,17 @@ public enum JSONBodyView: Sendable {
         isTruncated: Bool
     ) -> Result {
         let payload = strippingUTF8BOM(data)
+        let declaredJSON = isJSONMediaType(contentType)
         if payload.count > maximumDecodedByteCount {
             return .unavailable(reason: exceedsDisplayLimitReason)
         }
         if payload.isEmpty {
-            return unavailableAfterParseFailure(isTruncated: isTruncated, declaredJSON: false)
+            return unavailableAfterParseFailure(
+                isTruncated: isTruncated,
+                declaredJSON: declaredJSON
+            )
         }
 
-        let declaredJSON = isJSONMediaType(contentType)
         let options: JSONSerialization.ReadingOptions = declaredJSON ? [.fragmentsAllowed] : []
         let object: Any
         do {

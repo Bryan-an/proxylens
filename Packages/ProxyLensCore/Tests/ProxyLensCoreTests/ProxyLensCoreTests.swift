@@ -1261,6 +1261,23 @@ final class ProxyLensCoreTests: XCTestCase {
         )
         XCTAssertEqual(notJSON, .unavailable(reason: JSONBodyView.notJSONReason))
 
+        let emptyJSON = JSONBodyView.render(
+            data: Data(),
+            contentType: "application/json",
+            contentEncoding: nil
+        )
+        XCTAssertEqual(
+            emptyJSON,
+            .unavailable(reason: JSONBodyView.invalidJSONReason("The body is empty."))
+        )
+
+        let emptyPlain = JSONBodyView.render(
+            data: Data(),
+            contentType: "text/plain",
+            contentEncoding: nil
+        )
+        XCTAssertEqual(emptyPlain, .unavailable(reason: JSONBodyView.notJSONReason))
+
         let truncated = JSONBodyView.render(
             data: Data(#"{"ok":"#.utf8),
             contentType: "application/json",
