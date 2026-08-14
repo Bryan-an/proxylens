@@ -35,7 +35,12 @@ The `core.hooksPath` setting belongs to the local clone and is not transferred t
 
 # Run the macOS UI test target explicitly.
 ./scripts/quality.sh ui
+
+# Build a Release zip under dist/ (ad-hoc signed by default).
+./scripts/package.sh
 ```
+
+Release packaging, Hardened Runtime, and notarization are documented in [DISTRIBUTION.md](DISTRIBUTION.md). A paid Apple Developer Program membership is required before `./scripts/notarize.sh` can succeed.
 
 The formatter configuration is stored in `.swift-format`. The project uses the Swift formatter from the active Xcode toolchain through `swift-format`, `xcrun`, or `swift format`.
 

@@ -30,6 +30,8 @@ targets:
     platform: macOS
     sources:
       - path: ProxyLensApp
+        excludes:
+          - "**/*.entitlements"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.proxylens.ProxyLens
@@ -37,6 +39,13 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: ProxyLens
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: ProxyLensApp/Resources/ProxyLens.entitlements
+      configs:
+        Release:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
     dependencies:
       - package: ProxyLensCore
         product: ProxyLensCore

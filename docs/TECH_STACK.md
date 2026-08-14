@@ -396,6 +396,8 @@ The first public build should use direct distribution:
 5. Submit the release for Apple notarization.
 6. Publish the artifact and checksums on GitHub Releases.
 
+Hardened Runtime and `scripts/package.sh` are in place. Default packaging is an ad-hoc signed `.zip` plus SHA-256 checksum; `scripts/notarize.sh` fails closed without a Developer ID. GitHub Releases wait on a paid Apple Developer Program membership. See [DISTRIBUTION.md](DISTRIBUTION.md).
+
 This avoids App Store constraints while the product needs system proxy setup, Keychain interaction, local session files, and possibly a narrowly scoped helper. App Store distribution can be evaluated later; it should not drive the first architecture.
 
 Security requirements for every release:
@@ -492,7 +494,7 @@ Useful internal metrics include:
 7. Add filtering, search, and flow inspection.
 8. Add Map Local, Map Remote, Breakpoint, Block/Allow, and no-cache rules.
 9. Add HAR and cURL export.
-10. Package a signed, notarized direct-download build.
+10. Package a Hardened Runtime Release zip; notarized GitHub Releases wait on a Developer ID.
 
 ### P1 — serious daily-driver debugging features
 

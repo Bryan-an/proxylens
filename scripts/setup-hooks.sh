@@ -12,7 +12,7 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
     exit 1
 }
 
-chmod +x .githooks/pre-commit .githooks/pre-push scripts/quality.sh scripts/setup-hooks.sh
+chmod +x .githooks/pre-commit .githooks/pre-push scripts/quality.sh scripts/setup-hooks.sh scripts/package.sh scripts/notarize.sh
 git config --local core.hooksPath .githooks
 
 printf 'Git hooks enabled for ProxyLens.\n'

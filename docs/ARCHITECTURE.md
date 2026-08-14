@@ -256,11 +256,12 @@ ProxyLens/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── TECH_STACK.md
+│   ├── DISTRIBUTION.md
 │   └── PROXYMAN_FEATURE_INVESTIGATION.md
 │
 ├── scripts/
-│   ├── build.sh
-│   ├── test.sh
+│   ├── quality.sh
+│   ├── package.sh
 │   └── notarize.sh
 │
 └── .github/
@@ -485,6 +486,12 @@ P0 session persistence currently implemented:
 - On launch, `SessionService.loadWorkspace()` hydrates the traffic console with every persisted flow, oldest first, after capture recovery. Inspection and HAR/cURL work with capture stopped because they read `BodyStore` from those restored `Flow` snapshots.
 - Clear Session stops capture if it is running, empties the console, and deletes every session plus body files. Pending live events are discarded so cleared flows cannot reappear. A new capture can append afterward. Restore failures are shown in the status bar. There is no session picker or portable session file; HAR remains the interchange format.
 
+P0 distribution currently implemented:
+
+- Hardened Runtime is enabled. The app is not sandboxed.
+- `scripts/package.sh` builds a Release zip and SHA-256 checksum under `dist/`. Default signing is ad-hoc. `PROXYLENS_SIGN_IDENTITY` can supply a Developer ID Application identity later. Apple Development identities are rejected for the zip.
+- `scripts/notarize.sh` re-signs, submits with `notarytool`, staples, and rewrites the zip when a Developer ID and notary credentials are present. Without a paid Developer Program membership it exits with setup instructions. GitHub Releases are deferred until then. See [DISTRIBUTION.md](DISTRIBUTION.md).
+
 ## Security and platform boundaries
 
 All macOS-specific security behavior belongs in `ProxyLensPlatform`:
@@ -579,7 +586,7 @@ Tests must not depend on the public internet.
 9. Add Map Local, Map Remote, Breakpoint, Block/Allow, and no-cache rules.
 10. Add HAR and cURL export.
 11. Restore persisted sessions into the traffic console and clear the workspace.
-12. Add signing, notarization, and a direct-download release workflow.
+12. Package a Hardened Runtime Release zip. Notarized GitHub Releases wait on a Developer ID.
 
 Do not start HTTP/2, HTTP/3, Network Extension, mobile capture, scripting, cloud sync, or team collaboration until the P0 workflow is reliable.
 
@@ -601,6 +608,7 @@ These rules should be reviewed whenever a new feature is added:
 ## Related references
 
 - [TECH_STACK.md](TECH_STACK.md)
+- [DISTRIBUTION.md](DISTRIBUTION.md)
 - [PROXYMAN_FEATURE_INVESTIGATION.md](PROXYMAN_FEATURE_INVESTIGATION.md)
 - [SwiftNIO](https://github.com/apple/swift-nio)
 - [GRDB.swift](https://github.com/groue/GRDB.swift)
