@@ -39,6 +39,7 @@ final class ProxyLensUITests: XCTestCase {
         XCTAssertTrue(app.outlines["traffic.sources"].exists)
         XCTAssertTrue(app.tables["traffic.flows"].exists)
         XCTAssertTrue(app.textViews["inspector.content"].exists)
+        XCTAssertTrue(app.segmentedControls["inspector.section"].exists)
         XCTAssertTrue(app.staticTexts["All Traffic"].exists)
         XCTAssertTrue(app.staticTexts["Domains"].exists)
         XCTAssertTrue(app.staticTexts["No traffic captured yet"].exists)

@@ -14,7 +14,7 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         action: nil
     )
     private let sectionSelector = NSSegmentedControl(
-        labels: ["Headers", "Body"],
+        labels: ["Headers", "Body", "JSON"],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -197,6 +197,8 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         if sectionSelector.selectedSegment == 0 {
             textView.string =
                 editedHeaders[messageSelector.selectedSegment] ?? message.headers
+        } else if sectionSelector.selectedSegment == 2 {
+            textView.string = Self.bodyText(message.json, editable: false)
         } else if let editedBody = editedBodies[messageSelector.selectedSegment] {
             textView.string = editedBody
         } else {
@@ -233,7 +235,10 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         if sectionSelector.selectedSegment == 0 {
             return true
         }
-        return inspection.breakpoint?.canEditBody == true
+        if sectionSelector.selectedSegment == 1 {
+            return inspection.breakpoint?.canEditBody == true
+        }
+        return false
     }
 
     private func saveCurrentEdits() {
@@ -242,7 +247,7 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         }
         if sectionSelector.selectedSegment == 0 {
             editedHeaders[messageSelector.selectedSegment] = textView.string
-        } else if inspection.breakpoint?.canEditBody == true {
+        } else if sectionSelector.selectedSegment == 1, inspection.breakpoint?.canEditBody == true {
             editedBodies[messageSelector.selectedSegment] = textView.string
         }
     }

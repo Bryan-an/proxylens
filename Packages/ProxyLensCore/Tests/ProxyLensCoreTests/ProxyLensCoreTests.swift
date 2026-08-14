@@ -1191,4 +1191,151 @@ final class ProxyLensCoreTests: XCTestCase {
 
         XCTAssertEqual(decoded, original)
     }
+
+    func testJSONBodyViewPrettyPrintsObjectsAndArrays() throws {
+        let object = JSONBodyView.render(
+            data: Data(#"{"z":1,"a":2,"url":"https://example.com/a"}"#.utf8),
+            contentType: "application/json; charset=utf-8",
+            contentEncoding: nil
+        )
+        guard case .prettyPrinted(let objectText) = object else {
+            return XCTFail("expected pretty-printed object, got \(object)")
+        }
+        XCTAssertTrue(objectText.contains("\n"))
+        XCTAssertTrue(objectText.contains(#""a""#))
+        XCTAssertTrue(objectText.contains(#""z""#))
+        XCTAssertTrue(objectText.contains("https://example.com/a"))
+        XCTAssertFalse(objectText.contains("\\/"))
+
+        let array = JSONBodyView.render(
+            data: Data(#"[2,1]"#.utf8),
+            contentType: "application/json",
+            contentEncoding: "identity"
+        )
+        guard case .prettyPrinted(let arrayText) = array else {
+            return XCTFail("expected pretty-printed array, got \(array)")
+        }
+        XCTAssertTrue(arrayText.contains("\n"))
+        XCTAssertTrue(arrayText.contains("1"))
+        XCTAssertTrue(arrayText.contains("2"))
+    }
+
+    func testJSONBodyViewAcceptsSuffixJSONTypesAndSniffsCompactPayloads() {
+        let problem = JSONBodyView.render(
+            data: Data(#"{"title":"gone"}"#.utf8),
+            contentType: "application/problem+json",
+            contentEncoding: nil
+        )
+        guard case .prettyPrinted(let problemText) = problem else {
+            return XCTFail("expected pretty-printed problem+json, got \(problem)")
+        }
+        XCTAssertTrue(problemText.contains(#""title""#))
+
+        let sniffed = JSONBodyView.render(
+            data: Data(#"{"ok":true}"#.utf8),
+            contentType: "text/plain",
+            contentEncoding: nil
+        )
+        guard case .prettyPrinted(let sniffedText) = sniffed else {
+            return XCTFail("expected sniffed JSON, got \(sniffed)")
+        }
+        XCTAssertTrue(sniffedText.contains(#""ok""#))
+        XCTAssertTrue(sniffedText.contains("true"))
+    }
+
+    func testJSONBodyViewReportsInvalidJSONTruncationAndSizeLimits() {
+        let invalid = JSONBodyView.render(
+            data: Data(#"{"ok":"#.utf8),
+            contentType: "application/json",
+            contentEncoding: nil
+        )
+        guard case .unavailable(let invalidReason) = invalid else {
+            return XCTFail("expected invalid JSON, got \(invalid)")
+        }
+        XCTAssertTrue(invalidReason.hasPrefix("Invalid JSON:"))
+
+        let notJSON = JSONBodyView.render(
+            data: Data("hello".utf8),
+            contentType: "text/plain",
+            contentEncoding: nil
+        )
+        XCTAssertEqual(notJSON, .unavailable(reason: JSONBodyView.notJSONReason))
+
+        let truncated = JSONBodyView.render(
+            data: Data(#"{"ok":"#.utf8),
+            contentType: "application/json",
+            contentEncoding: nil,
+            isTruncated: true
+        )
+        XCTAssertEqual(truncated, .unavailable(reason: JSONBodyView.truncatedReason))
+
+        let oversized = Data(
+            repeating: UInt8(ascii: "x"),
+            count: JSONBodyView.maximumDecodedByteCount + 1
+        )
+        let limited = JSONBodyView.render(
+            data: Data("{\"a\":\"".utf8) + oversized + Data("\"}".utf8),
+            contentType: "application/json",
+            contentEncoding: nil
+        )
+        XCTAssertEqual(limited, .unavailable(reason: JSONBodyView.exceedsDisplayLimitReason))
+    }
+
+    func testJSONBodyViewUnwrapsGzipAndDeflateOnlyForDerivedInspection() throws {
+        let compact = Data(#"{"z":1,"a":2}"#.utf8)
+        let gzipped = try ZlibContentEncoding.compress(compact, format: .gzip)
+        let deflated = try ZlibContentEncoding.compress(compact, format: .zlib)
+        XCTAssertNotEqual(gzipped, compact)
+
+        let asRaw = JSONBodyView.render(
+            data: gzipped,
+            contentType: "application/octet-stream",
+            contentEncoding: nil
+        )
+        XCTAssertEqual(asRaw, .unavailable(reason: JSONBodyView.notJSONReason))
+
+        let fromGzip = JSONBodyView.render(
+            data: gzipped,
+            contentType: "application/json",
+            contentEncoding: "gzip"
+        )
+        guard case .prettyPrinted(let gzipText) = fromGzip else {
+            return XCTFail("expected gzip JSON, got \(fromGzip)")
+        }
+        XCTAssertTrue(gzipText.contains(#""a""#))
+        XCTAssertTrue(gzipText.contains(#""z""#))
+
+        let fromDeflate = JSONBodyView.render(
+            data: deflated,
+            contentType: "application/json",
+            contentEncoding: "deflate"
+        )
+        guard case .prettyPrinted(let deflateText) = fromDeflate else {
+            return XCTFail("expected deflate JSON, got \(fromDeflate)")
+        }
+        XCTAssertTrue(deflateText.contains(#""a""#))
+
+        let brotli = JSONBodyView.render(
+            data: compact,
+            contentType: "application/json",
+            contentEncoding: "br"
+        )
+        XCTAssertEqual(
+            brotli,
+            .unavailable(reason: JSONBodyView.unsupportedContentEncodingReason("br"))
+        )
+
+        let payload =
+            Data("{\"a\":\"".utf8)
+            + Data(repeating: UInt8(ascii: "x"), count: JSONBodyView.maximumDecodedByteCount + 8)
+            + Data("\"}".utf8)
+        let gzipBomb = try ZlibContentEncoding.compress(payload, format: .gzip)
+        XCTAssertLessThan(gzipBomb.count, JSONBodyView.maximumDecodedByteCount)
+        let exploded = JSONBodyView.render(
+            data: gzipBomb,
+            contentType: "application/json",
+            contentEncoding: "gzip"
+        )
+        XCTAssertEqual(exploded, .unavailable(reason: JSONBodyView.exceedsDisplayLimitReason))
+    }
 }

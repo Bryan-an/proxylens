@@ -525,24 +525,24 @@ final class TrafficConsoleViewModel: ObservableObject {
 
         let bodyReader = bodyReader
         bodyTask = Task { [weak self] in
-            async let requestBody = Self.loadBody(flow.request.body, reader: bodyReader)
-            async let responseBody = Self.loadBody(flow.response?.body, reader: bodyReader)
-            let loadedRequestBody = await requestBody
-            let loadedResponseBody = await responseBody
+            async let requestBodies = Self.loadBodies(flow.request.body, reader: bodyReader)
+            async let responseBodies = Self.loadBodies(flow.response?.body, reader: bodyReader)
+            let loadedRequestBodies = await requestBodies
+            let loadedResponseBodies = await responseBodies
             guard !Task.isCancelled, self?.store.selectedFlowID == flow.id else {
                 return
             }
             self?.applyLoadedBodies(
-                request: loadedRequestBody,
-                response: loadedResponseBody,
+                request: loadedRequestBodies,
+                response: loadedResponseBodies,
                 to: flow.id
             )
         }
     }
 
     private func applyLoadedBodies(
-        request: TrafficBodyPresentation,
-        response: TrafficBodyPresentation,
+        request: (body: TrafficBodyPresentation, json: TrafficBodyPresentation),
+        response: (body: TrafficBodyPresentation, json: TrafficBodyPresentation),
         to flowID: FlowID
     ) {
         guard inspection.flowID == flowID else {
@@ -552,14 +552,24 @@ final class TrafficConsoleViewModel: ObservableObject {
             flowID: inspection.flowID,
             title: inspection.title,
             request: inspection.request.map {
-                TrafficMessageInspection(title: $0.title, headers: $0.headers, body: request)
+                TrafficMessageInspection(
+                    title: $0.title,
+                    headers: $0.headers,
+                    body: request.body,
+                    json: request.json
+                )
             },
             response: inspection.response.map {
-                TrafficMessageInspection(title: $0.title, headers: $0.headers, body: response)
+                TrafficMessageInspection(
+                    title: $0.title,
+                    headers: $0.headers,
+                    body: response.body,
+                    json: response.json
+                )
             },
             rules: inspection.rules,
             breakpoint: inspection.breakpoint.map { breakpoint in
-                let body = breakpoint.phase == .response ? response : request
+                let body = breakpoint.phase == .response ? response.body : request.body
                 return TrafficBreakpointInspection(
                     phase: breakpoint.phase,
                     canEditBody: Self.bodyIsEditable(body)
@@ -585,13 +595,15 @@ final class TrafficConsoleViewModel: ObservableObject {
             request: TrafficMessageInspection(
                 title: "Request",
                 headers: requestHeadersText(flow.request),
-                body: initialBody(flow.request.body, emptyMessage: "This request has no body.")
+                body: initialBody(flow.request.body, emptyMessage: "This request has no body."),
+                json: initialJSON(flow.request.body)
             ),
             response: flow.response.map {
                 TrafficMessageInspection(
                     title: "Response",
                     headers: responseHeadersText($0),
-                    body: initialBody($0.body, emptyMessage: "This response has no body.")
+                    body: initialBody($0.body, emptyMessage: "This response has no body."),
+                    json: initialJSON($0.body)
                 )
             },
             rules: rulesText(flow.ruleTraces),
@@ -657,24 +669,59 @@ final class TrafficConsoleViewModel: ObservableObject {
         return .loading(BodyDisplayFormatter.metadata(for: reference))
     }
 
-    private static func loadBody(
+    private static func initialJSON(_ reference: BodyReference?) -> TrafficBodyPresentation {
+        guard let reference else {
+            return .none(JSONBodyView.notJSONReason)
+        }
+        return .loading(BodyDisplayFormatter.metadata(for: reference))
+    }
+
+    private static func loadBodies(
         _ reference: BodyReference?,
         reader: any TrafficBodyReading
-    ) async -> TrafficBodyPresentation {
+    ) async -> (body: TrafficBodyPresentation, json: TrafficBodyPresentation) {
         guard let reference else {
-            return .none("No body was captured.")
+            return (
+                body: .none("No body was captured."),
+                json: .none(JSONBodyView.notJSONReason)
+            )
         }
         let metadata = BodyDisplayFormatter.metadata(for: reference)
         do {
             let data = try await reader.read(reference)
             return await Task.detached(priority: .utility) {
-                .content(
-                    metadata: metadata,
-                    value: BodyDisplayFormatter.render(data, reference: reference)
+                (
+                    body: .content(
+                        metadata: metadata,
+                        value: BodyDisplayFormatter.render(data, reference: reference)
+                    ),
+                    json: jsonPresentation(from: data, reference: reference, metadata: metadata)
                 )
             }.value
         } catch {
-            return .failed(metadata: metadata, message: error.localizedDescription)
+            let failed = TrafficBodyPresentation.failed(
+                metadata: metadata,
+                message: error.localizedDescription
+            )
+            return (body: failed, json: failed)
+        }
+    }
+
+    nonisolated private static func jsonPresentation(
+        from data: Data,
+        reference: BodyReference,
+        metadata: String
+    ) -> TrafficBodyPresentation {
+        switch JSONBodyView.render(
+            data: data,
+            contentType: reference.contentType,
+            contentEncoding: reference.contentEncoding,
+            isTruncated: reference.isTruncated
+        ) {
+        case .prettyPrinted(let text):
+            .content(metadata: metadata, value: text)
+        case .unavailable(let reason):
+            .none(reason)
         }
     }
 }

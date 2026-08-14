@@ -933,6 +933,78 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertTrue(inspector.string.contains("requestHeaders"))
     }
 
+    func testInspectorShowsDerivedJSONWithoutReplacingRawBody() async throws {
+        let compact = #"{"z":1,"a":2}"#
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 3,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data(compact.utf8),
+            responseBody: Data(compact.utf8),
+            responseContentType: "application/json"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            guard case .content(_, let json) = viewModel.snapshot.inspection.response?.json,
+                case .content(_, let body) = viewModel.snapshot.inspection.response?.body
+            else {
+                return false
+            }
+            return json.contains(#""a""#) && body.contains(compact)
+        }
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let messageSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.message" }
+            )
+        )
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+            )
+        )
+        XCTAssertEqual(sectionSelector.segmentCount, 3)
+        XCTAssertEqual(sectionSelector.label(forSegment: 2), "JSON")
+
+        messageSelector.selectedSegment = 1
+        messageSelector.sendAction(messageSelector.action, to: messageSelector.target)
+        sectionSelector.selectedSegment = 1
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        let inspector = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+            )
+        )
+        XCTAssertTrue(inspector.string.contains(compact))
+
+        sectionSelector.selectedSegment = 2
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        XCTAssertTrue(inspector.string.contains(#""a""#))
+        XCTAssertTrue(inspector.string.contains(#""z""#))
+        XCTAssertTrue(inspector.string.contains("\n"))
+        XCTAssertFalse(inspector.string.contains(compact))
+    }
+
     private static var captureConfiguration: CaptureConfiguration {
         CaptureConfiguration(
             proxy: ProxyConfiguration(

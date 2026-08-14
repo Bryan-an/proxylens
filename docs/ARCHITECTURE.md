@@ -476,6 +476,12 @@ P0 rules currently implemented in the shared pipeline:
 
 Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.
 
+P0 JSON inspection currently implemented:
+
+- `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
+- gzip, x-gzip, and deflate are unwrapped only for this derived view, and decoded output is bounded to 1 MB. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
+- The inspector adds a read-only JSON segment next to Headers and Body. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, XML/form/Protobuf, and JSONPath remain out of scope.
+
 P0 export currently implemented:
 
 - Copy as cURL from a single captured flow. Hop-by-hop and auto-set headers (`Content-Length`, `Transfer-Encoding`, `Connection`, and related) are omitted. The request body is the captured raw bytes from `BodyStore`.
@@ -491,7 +497,7 @@ P0 session persistence currently implemented:
 
 P0 HTTPS certificate trust currently implemented:
 
-- `KeychainCertificateProvider` still owns CA material. The root private key stays non-extractable; the public certificate is stored both as a Keychain certificate item and as namespaced DER so the same CA is reloaded after relaunch. `SystemCertificateTrustStore` is a separate actor so the macOS password panel cannot stall leaf minting.
+- `KeychainCertificateProvider` still owns CA material. The root private key stays non-extractable; the public certificate is stored as a Keychain certificate item so the same CA is reloaded after relaunch. It is not stored as a generic password, because reading that secret prompts for the login keychain on unsigned debug builds. `SystemCertificateTrustStore` is a separate actor so the SecurityAgent password panel cannot stall leaf minting.
 - Trust is installed into the user domain with `SecTrustSettingsSetTrustSettings`. The app stays unprivileged; SecurityAgent prompts for the login password. Removal uses `SecTrustSettingsRemoveTrustSettings` and treats a missing setting as success.
 - The traffic console reports *effective* trust, not just stored settings: a probe leaf for `trust-probe.proxylens.invalid` is evaluated with `SecTrustEvaluateWithError`. That also reports trusted when the root was installed by hand in Keychain Access.
 - The header button opens a SwiftUI sheet to install trust, save the PEM, or remove trust. The sheet is not shown automatically on launch. A dismissed password panel is treated as cancellation, not a failure.

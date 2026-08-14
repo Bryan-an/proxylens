@@ -9,7 +9,12 @@ let package = Package(
         .library(name: "ProxyLensCore", targets: ["ProxyLensCore"])
     ],
     targets: [
-        .target(name: "ProxyLensCore"),
+        .target(
+            name: "ProxyLensCore",
+            linkerSettings: [
+                .linkedLibrary("z")
+            ]
+        ),
         .testTarget(name: "ProxyLensCoreTests", dependencies: ["ProxyLensCore"])
     ]
 )

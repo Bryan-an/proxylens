@@ -314,16 +314,17 @@ public actor KeychainCertificateProvider: CertificateProvider {
     }
 
     private func loadRootCertificateData() throws -> Data? {
-        if let data = try copyKeychainData(
-            query: rootCertificateDataQuery,
-            operation: "load root certificate data"
-        ) {
-            return data
-        }
-        return try copyKeychainData(
+        let data = try copyKeychainData(
             query: rootCertificateQuery,
             operation: "load root certificate"
         )
+        if data != nil {
+            try deleteKeychainItem(
+                query: rootCertificateDataQuery,
+                operation: "remove leftover root certificate secret"
+            )
+        }
+        return data
     }
 
     private func saveRootCertificateData(_ data: Data) throws {
@@ -336,7 +337,7 @@ public actor KeychainCertificateProvider: CertificateProvider {
         )
         try deleteKeychainItem(
             query: rootCertificateDataQuery,
-            operation: "replace root certificate data"
+            operation: "remove leftover root certificate secret"
         )
 
         var certificateItem = rootCertificateQuery
@@ -346,17 +347,6 @@ public actor KeychainCertificateProvider: CertificateProvider {
             throw CertificateProviderError.keychain(
                 operation: "store root certificate",
                 status: certificateStatus
-            )
-        }
-
-        var dataItem = rootCertificateDataQuery
-        dataItem[kSecValueData] = data
-        dataItem[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let dataStatus = SecItemAdd(dataItem as CFDictionary, nil)
-        guard dataStatus == errSecSuccess else {
-            throw CertificateProviderError.keychain(
-                operation: "store root certificate data",
-                status: dataStatus
             )
         }
     }
