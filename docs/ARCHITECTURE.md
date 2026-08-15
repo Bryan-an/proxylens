@@ -497,14 +497,14 @@ P0 session persistence currently implemented:
 
 P0 HTTPS certificate trust currently implemented:
 
-- `KeychainCertificateProvider` still owns CA material. The root private key stays non-extractable; the public certificate is stored as a Keychain certificate item so the same CA is reloaded after relaunch. It is not stored as a generic password, because reading that secret prompts for the login keychain on unsigned debug builds. `SystemCertificateTrustStore` is a separate actor so the SecurityAgent password panel cannot stall leaf minting.
+- `KeychainCertificateProvider` owns CA material. The root private key stays non-extractable and its signing ACL includes the current application. The public certificate is stored as a Keychain certificate item associated by public-key hash so the same CA is reloaded after relaunch. It is not stored as a generic password, because reading that secret prompts for the login keychain on unsigned debug builds. `SystemCertificateTrustStore` is a separate actor so the SecurityAgent password panel cannot stall leaf minting.
 - Trust is installed into the user domain with `SecTrustSettingsSetTrustSettings`. The app stays unprivileged; SecurityAgent prompts for the login password. Removal uses `SecTrustSettingsRemoveTrustSettings` and treats a missing setting as success.
-- The traffic console reports *effective* trust, not just stored settings: a probe leaf for `trust-probe.proxylens.invalid` is evaluated with `SecTrustEvaluateWithError`. That also reports trusted when the root was installed by hand in Keychain Access.
+- The traffic console reads the root certificate's user-domain trust settings without using the private key. It reports trusted only for an unrestricted root setting. This avoids signing a probe leaf, which would access the root key and could display a Keychain signing prompt during app launch.
 - The header button opens a SwiftUI sheet to install trust, save the PEM, or remove trust. The sheet is not shown automatically on launch. A dismissed password panel is treated as cancellation, not a failure.
 
 P0 system proxy configuration currently implemented:
 
-- `MacOSSystemProxyController` creates its `SCPreferences` session with `SCPreferencesCreateWithAuthorization` and an `AuthorizationRef`. An unauthorized session cannot take the write lock: `SCPreferencesLock` fails with `kSCStatusAccessError` for an unprivileged app. The authorization is released with the session, and the app stays unprivileged.
+- `MacOSSystemProxyController` creates `SCPreferences` sessions with `SCPreferencesCreateWithAuthorization` and retains one `AuthorizationRef` for its lifetime. An unauthorized session cannot take the write lock: `SCPreferencesLock` fails with `kSCStatusAccessError` for an unprivileged app. macOS may reuse credentials briefly, but the system authorization policy can expire them before a later restore and display another administrator prompt. Avoiding that prompt for long captures requires a separately signed, narrowly scoped privileged helper; retaining the authorization cannot override the system policy.
 - Taking the pre-activation snapshot only reads service configuration, so it does not hold the write lock. Applying and restoring proxy settings lock, commit, and apply.
 
 P0 distribution currently implemented:

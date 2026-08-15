@@ -1,5 +1,6 @@
 import Foundation
 import ProxyLensCore
+@preconcurrency import Security
 import X509
 import XCTest
 
@@ -143,6 +144,40 @@ final class ProxyLensPlatformTests: XCTestCase {
 
         try? FileManager.default.removeItem(at: exportURL)
         try await provider.removeCertificateAuthority()
+    }
+    func testTrustStateRecognizesOnlyUnrestrictedRootTrustSettings() {
+        XCTAssertTrue(SystemCertificateTrustStore.trustSettingsGrantUnrestrictedRootTrust([]))
+        XCTAssertTrue(
+            SystemCertificateTrustStore.trustSettingsGrantUnrestrictedRootTrust([[:]])
+        )
+        XCTAssertTrue(
+            SystemCertificateTrustStore.trustSettingsGrantUnrestrictedRootTrust([
+                [
+                    kSecTrustSettingsResult: NSNumber(
+                        value: SecTrustSettingsResult.trustRoot.rawValue
+                    )
+                ]
+            ])
+        )
+        XCTAssertFalse(
+            SystemCertificateTrustStore.trustSettingsGrantUnrestrictedRootTrust([
+                [
+                    kSecTrustSettingsResult: NSNumber(
+                        value: SecTrustSettingsResult.deny.rawValue
+                    )
+                ]
+            ])
+        )
+        XCTAssertFalse(
+            SystemCertificateTrustStore.trustSettingsGrantUnrestrictedRootTrust([
+                [
+                    kSecTrustSettingsPolicy: "ssl",
+                    kSecTrustSettingsResult: NSNumber(
+                        value: SecTrustSettingsResult.trustRoot.rawValue
+                    )
+                ]
+            ])
+        )
     }
 
     func testSystemProxyRecoveryIsNoOpWithoutSnapshot() async throws {

@@ -1,15 +1,12 @@
 import Foundation
 import ProxyLensCore
 @preconcurrency import Security
-import SwiftASN1
-import X509
 
 /// Installs the local interception CA into the macOS user trust domain.
 ///
 /// This actor is separate from `KeychainCertificateProvider` so the SecurityAgent
 /// password panel cannot stall leaf minting for live HTTPS traffic.
 public actor SystemCertificateTrustStore: CertificateTrustStore {
-    private static let probeHostname = "trust-probe.proxylens.invalid"
     /// `errAuthorizationCanceled` from Authorization.h; not always visible via Security.
     private static let authorizationCanceled: OSStatus = -60_006
 
@@ -28,7 +25,24 @@ public actor SystemCertificateTrustStore: CertificateTrustStore {
         guard let root = try await certificateProvider.storedRootCertificateReference() else {
             return .notGenerated
         }
-        return try await isEffectivelyTrusted(root: root) ? .trusted : .untrusted
+
+        var copiedSettings: CFArray?
+        let status = SecTrustSettingsCopyTrustSettings(root, .user, &copiedSettings)
+        if status == errSecItemNotFound {
+            return .untrusted
+        }
+        guard status == errSecSuccess else {
+            throw CertificateProviderError.trustSettings(
+                operation: "read user-domain trust",
+                status: status
+            )
+        }
+        guard let settings = copiedSettings as? [[String: Any]] else {
+            return .untrusted
+        }
+        return Self.trustSettingsGrantUnrestrictedRootTrust(settings)
+            ? .trusted
+            : .untrusted
     }
 
     public func installTrust() async throws {
@@ -64,40 +78,25 @@ public actor SystemCertificateTrustStore: CertificateTrustStore {
         )
     }
 
-    private func isEffectivelyTrusted(root: SecCertificate) async throws -> Bool {
-        let identity = try await certificateProvider.leafCertificate(for: Self.probeHostname)
-        let leaf = try Self.secCertificate(fromPEM: identity.certificateData)
-        var trust: SecTrust?
-        let policy = SecPolicyCreateSSL(true, Self.probeHostname as CFString)
-        let status = SecTrustCreateWithCertificates(
-            [leaf, root] as CFArray,
-            policy,
-            &trust
-        )
-        guard status == errSecSuccess, let trust else {
-            throw CertificateProviderError.trustSettings(
-                operation: "create trust evaluation",
-                status: status
-            )
+    static func trustSettingsGrantUnrestrictedRootTrust(
+        _ settings: [[String: Any]]
+    ) -> Bool {
+        if settings.isEmpty {
+            return true
         }
-        SecTrustSetNetworkFetchAllowed(trust, false)
-        return SecTrustEvaluateWithError(trust, nil)
-    }
 
-    private static func secCertificate(fromPEM data: Data) throws -> SecCertificate {
-        do {
-            let certificate = try Certificate(pemEncoded: String(decoding: data, as: UTF8.self))
-            var serializer = DER.Serializer()
-            try serializer.serialize(certificate)
-            let der = Data(serializer.serializedBytes)
-            guard let secCertificate = SecCertificateCreateWithData(nil, der as CFData) else {
-                throw CertificateProviderError.malformedStoredCertificate
+        return settings.contains { setting in
+            guard setting.keys.allSatisfy({ $0 == kSecTrustSettingsResult }) else {
+                return false
             }
-            return secCertificate
-        } catch let error as CertificateProviderError {
-            throw error
-        } catch {
-            throw CertificateProviderError.certificateGeneration(error.localizedDescription)
+            guard let value = setting[kSecTrustSettingsResult] else {
+                return true
+            }
+            guard let result = value as? NSNumber else {
+                return false
+            }
+            return result.uint32Value == SecTrustSettingsResult.trustRoot.rawValue
+                || result.uint32Value == SecTrustSettingsResult.trustAsRoot.rawValue
         }
     }
 

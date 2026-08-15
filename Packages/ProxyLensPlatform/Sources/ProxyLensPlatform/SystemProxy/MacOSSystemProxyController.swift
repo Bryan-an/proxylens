@@ -203,8 +203,8 @@ public actor MacOSSystemProxyController: SystemProxyController {
 
     /// Creates preferences sessions with one process-lifetime authorization.
     ///
-    /// The authorization retains credentials granted by macOS, so repeated
-    /// capture cycles in the same app process do not prompt again.
+    /// macOS may reuse credentials on this authorization while its policy allows.
+    /// A later write lock can still require authentication after that policy expires.
     private func makePreferences() throws -> SCPreferences {
         let authorization = try authorizationReference()
         guard
