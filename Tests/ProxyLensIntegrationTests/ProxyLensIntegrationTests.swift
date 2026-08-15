@@ -891,6 +891,17 @@ final class ProxyLensIntegrationTests: XCTestCase {
             accuracy: 0.05
         )
 
+        let requestedInspectorHeight: CGFloat = 280
+        detailSplit.setPosition(
+            detailSplit.bounds.height
+                - detailSplit.dividerThickness
+                - requestedInspectorHeight,
+            ofDividerAt: 0
+        )
+        controller.view.layoutSubtreeIfNeeded()
+        let rememberedInspectorHeight = inspectorPane.frame.height
+        XCTAssertEqual(rememberedInspectorHeight, requestedInspectorHeight, accuracy: 1)
+
         viewModel.selectFlow(nil)
         try await waitUntil {
             viewModel.snapshot.selectedFlowID == nil
@@ -900,6 +911,14 @@ final class ProxyLensIntegrationTests: XCTestCase {
         controller.view.layoutSubtreeIfNeeded()
         XCTAssertEqual(flowPane.frame.height, detailSplit.bounds.height, accuracy: 1)
         XCTAssertTrue(inspectorPane.visibleRect.isEmpty)
+
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowID == flow.id
+                && !inspectorPane.visibleRect.isEmpty
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(inspectorPane.frame.height, rememberedInspectorHeight, accuracy: 1)
     }
 
     func testTrafficConsoleRendersSplitMessageInspector() async throws {
@@ -1383,7 +1402,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 at: NSRange(keyRange, in: inspector.string).location,
                 effectiveRange: nil
             ) as? NSColor
-        XCTAssertEqual(keyColor, .systemBlue)
+        XCTAssertEqual(keyColor, InspectorSyntaxPalette.key)
     }
 
     func testInspectorDoesNotCopyJSONTabIntoBodyEditsDuringBreakpoint() throws {

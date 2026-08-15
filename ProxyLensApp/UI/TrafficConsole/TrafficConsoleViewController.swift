@@ -26,6 +26,7 @@ final class TrafficConsoleViewController: NSViewController {
     }()
     private var snapshotCancellable: AnyCancellable?
     private var didSetInitialDetailPosition = false
+    private var rememberedInspectorHeight: CGFloat?
     private weak var configuredWindow: NSWindow?
 
     init(viewModel: TrafficConsoleViewModel) {
@@ -177,6 +178,42 @@ final class TrafficConsoleViewController: NSViewController {
         detailSplitView.setPosition(detailSplitView.bounds.height * 0.36, ofDividerAt: 0)
     }
 
+    private func rememberInspectorHeight() {
+        let inspectorView = inspectorController.view
+        guard view.window != nil,
+            !inspectorView.visibleRect.isEmpty,
+            inspectorView.frame.height > 0
+        else {
+            return
+        }
+
+        rememberedInspectorHeight = inspectorView.frame.height
+    }
+
+    private func restoreInspectorHeightIfPossible() {
+        guard let rememberedInspectorHeight,
+            view.window != nil,
+            detailSplitViewController.splitViewItems.count == 2
+        else {
+            return
+        }
+
+        view.layoutSubtreeIfNeeded()
+        let detailSplitView = detailSplitViewController.splitView
+        let availableHeight = detailSplitView.bounds.height - detailSplitView.dividerThickness
+        let flowMinimumHeight = detailSplitViewController.splitViewItems[0].minimumThickness
+        let maximumInspectorHeight = max(0, availableHeight - flowMinimumHeight)
+        let minimumInspectorHeight = min(
+            inspectorSplitViewItem.minimumThickness,
+            maximumInspectorHeight
+        )
+        let inspectorHeight = min(
+            max(rememberedInspectorHeight, minimumInspectorHeight),
+            maximumInspectorHeight
+        )
+        detailSplitView.setPosition(availableHeight - inspectorHeight, ofDividerAt: 0)
+    }
+
     private func configureWindowTitle() {
         guard let window = view.window, configuredWindow !== window else {
             return
@@ -235,7 +272,13 @@ final class TrafficConsoleViewController: NSViewController {
 
         let shouldCollapseInspector = snapshot.selectedFlowID == nil
         if inspectorSplitViewItem.isCollapsed != shouldCollapseInspector {
-            inspectorSplitViewItem.isCollapsed = shouldCollapseInspector
+            if shouldCollapseInspector {
+                rememberInspectorHeight()
+                inspectorSplitViewItem.isCollapsed = true
+            } else {
+                inspectorSplitViewItem.isCollapsed = false
+                restoreInspectorHeightIfPossible()
+            }
         }
         if !shouldCollapseInspector,
             !didSetInitialDetailPosition,

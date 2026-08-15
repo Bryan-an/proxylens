@@ -11,14 +11,25 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
 
         XCTAssertEqual(highlighted.string, json)
         XCTAssertEqual(
-            foregroundColor(at: json.range(of: #""name""#)!, in: highlighted), .systemBlue)
+            foregroundColor(at: json.range(of: #""name""#)!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
         XCTAssertEqual(
             foregroundColor(at: json.range(of: #""ProxyLens""#)!, in: highlighted),
-            .systemRed
+            InspectorSyntaxPalette.string
         )
-        XCTAssertEqual(foregroundColor(at: json.range(of: "42")!, in: highlighted), .systemPurple)
-        XCTAssertEqual(foregroundColor(at: json.range(of: "true")!, in: highlighted), .systemOrange)
-        XCTAssertEqual(foregroundColor(at: json.range(of: "null")!, in: highlighted), .systemOrange)
+        XCTAssertEqual(
+            foregroundColor(at: json.range(of: "42")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: json.range(of: "true")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: json.range(of: "null")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
     }
 
     func testHighlightsHTTPHeaderNamesAndValues() {
@@ -28,7 +39,7 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
         XCTAssertEqual(highlighted.string, headers)
         XCTAssertEqual(
             foregroundColor(at: headers.range(of: "Content-Type")!, in: highlighted),
-            .systemBlue
+            InspectorSyntaxPalette.key
         )
         XCTAssertEqual(
             foregroundColor(at: headers.range(of: "application/json")!, in: highlighted),
@@ -58,8 +69,15 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
         )
         XCTAssertEqual(
             foregroundColor(at: text.range(of: #""count""#)!, in: highlighted),
-            .systemBlue
+            InspectorSyntaxPalette.key
         )
+    }
+
+    func testUsesMutedColorsInsteadOfTheSaturatedSystemPalette() {
+        XCTAssertNotEqual(InspectorSyntaxPalette.key, .systemBlue)
+        XCTAssertNotEqual(InspectorSyntaxPalette.string, .systemRed)
+        XCTAssertNotEqual(InspectorSyntaxPalette.number, .systemPurple)
+        XCTAssertNotEqual(InspectorSyntaxPalette.literal, .systemOrange)
     }
 
     private func foregroundColor(
