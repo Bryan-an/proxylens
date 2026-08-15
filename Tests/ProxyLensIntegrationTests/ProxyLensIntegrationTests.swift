@@ -805,7 +805,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
     }
 
-    func testTrafficConsoleCentersWindowTitleAndHidesInspectorWithoutSelection() async throws {
+    func testTrafficConsoleHidesWindowTitleAndInspectorWithoutSelection() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
             eventSource: FinishedEventSource(),
@@ -868,15 +868,14 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertTrue(inspectorPane.visibleRect.isEmpty)
 
         let titlebarRoot = try XCTUnwrap(window.contentView?.superview)
-        let centeredTitle = try XCTUnwrap(
-            Self.descendant(
-                of: NSTextField.self,
-                in: titlebarRoot,
-                matching: { $0.accessibilityIdentifier() == "window.title.centered" }
-            )
+        let title = Self.descendant(
+            of: NSTextField.self,
+            in: titlebarRoot,
+            matching: { $0.accessibilityIdentifier() == "window.title.centered" }
         )
-        let titleFrame = centeredTitle.convert(centeredTitle.bounds, to: titlebarRoot)
-        XCTAssertEqual(titleFrame.midX, titlebarRoot.bounds.midX, accuracy: 1)
+        XCTAssertNil(title)
+        XCTAssertEqual(window.titleVisibility, .hidden)
+        XCTAssertNil(window.toolbar)
 
         viewModel.selectFlow(flow.id)
         try await waitUntil {

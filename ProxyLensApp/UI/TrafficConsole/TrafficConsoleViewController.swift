@@ -10,7 +10,6 @@ final class TrafficConsoleViewController: NSViewController {
     private let inspectorController: InspectorViewController
     private let splitViewController = NSSplitViewController()
     private let detailSplitViewController = NSSplitViewController()
-    private let windowTitleToolbarDelegate = WindowTitleToolbarDelegate()
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
     private let certificateButton = NSButton()
@@ -160,7 +159,7 @@ final class TrafficConsoleViewController: NSViewController {
     override func viewDidAppear() {
         super.viewDidAppear()
 
-        configureWindowTitle()
+        hideWindowTitle()
         setInitialSourcePositionIfNeeded()
         setInitialDetailPositionIfNeeded()
     }
@@ -236,19 +235,13 @@ final class TrafficConsoleViewController: NSViewController {
         detailSplitView.setPosition(availableHeight - inspectorHeight, ofDividerAt: 0)
     }
 
-    private func configureWindowTitle() {
+    private func hideWindowTitle() {
         guard let window = view.window, configuredWindow !== window else {
             return
         }
 
-        let toolbar = NSToolbar(identifier: WindowTitleToolbarDelegate.toolbarIdentifier)
-        toolbar.delegate = windowTitleToolbarDelegate
-        toolbar.allowsUserCustomization = false
-        toolbar.displayMode = .iconOnly
-        toolbar.centeredItemIdentifiers = [WindowTitleToolbarDelegate.titleItemIdentifier]
         window.titleVisibility = .hidden
-        window.toolbarStyle = .unifiedCompact
-        window.toolbar = toolbar
+        window.toolbar = nil
         configuredWindow = window
     }
 
@@ -381,41 +374,6 @@ final class TrafficConsoleViewController: NSViewController {
                 }
             }
         }
-    }
-}
-
-@MainActor
-private final class WindowTitleToolbarDelegate: NSObject, NSToolbarDelegate {
-    static let toolbarIdentifier = NSToolbar.Identifier("com.proxylens.window-title")
-    static let titleItemIdentifier = NSToolbarItem.Identifier("com.proxylens.window-title.label")
-
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.titleItemIdentifier]
-    }
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.titleItemIdentifier]
-    }
-
-    func toolbar(
-        _ toolbar: NSToolbar,
-        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
-        willBeInsertedIntoToolbar flag: Bool
-    ) -> NSToolbarItem? {
-        guard itemIdentifier == Self.titleItemIdentifier else {
-            return nil
-        }
-
-        let titleField = NSTextField(labelWithString: "ProxyLens")
-        titleField.font = .systemFont(ofSize: 13, weight: .semibold)
-        titleField.setAccessibilityIdentifier("window.title.centered")
-
-        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-        item.label = "ProxyLens"
-        item.paletteLabel = "ProxyLens"
-        item.view = titleField
-        item.visibilityPriority = .high
-        return item
     }
 }
 
