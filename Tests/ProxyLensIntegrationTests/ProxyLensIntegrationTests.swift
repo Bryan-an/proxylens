@@ -755,7 +755,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
     }
 
-    func testTrafficConsoleRendersSourceSidebarOverStackedRequestListAndInspector() async throws {
+    func testTrafficConsoleRendersSplitMessageInspector() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
             eventSource: FinishedEventSource(),
@@ -817,11 +817,18 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { !($0 is NSOutlineView) }
             )
         )
-        let inspector = try XCTUnwrap(
+        let requestInspector = try XCTUnwrap(
             Self.descendant(
                 of: NSTextView.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+                matching: { $0.accessibilityIdentifier() == "inspector.request.content" }
+            )
+        )
+        let responseInspector = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.response.content" }
             )
         )
         let searchField = try XCTUnwrap(
@@ -895,22 +902,65 @@ final class ProxyLensIntegrationTests: XCTestCase {
             accuracy: 0.05
         )
 
-        let messageSelector = try XCTUnwrap(
+        let messageSplit = try XCTUnwrap(
+            Self.descendant(
+                of: NSSplitView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.split.messages"
+                }
+            )
+        )
+        let requestPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request" }
+            )
+        )
+        let responsePane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.response" }
+            )
+        )
+        XCTAssertTrue(messageSplit.isVertical)
+        let requestPaneFrame = requestPane.convert(requestPane.bounds, to: inspectorPane)
+        let responsePaneFrame = responsePane.convert(responsePane.bounds, to: inspectorPane)
+        XCTAssertLessThanOrEqual(requestPaneFrame.maxX, responsePaneFrame.minX)
+        XCTAssertEqual(requestPaneFrame.minY, responsePaneFrame.minY, accuracy: 1)
+        XCTAssertEqual(requestPaneFrame.height, responsePaneFrame.height, accuracy: 1)
+        XCTAssertEqual(requestPaneFrame.width, responsePaneFrame.width, accuracy: 2)
+
+        let modeSelector = try XCTUnwrap(
             Self.descendant(
                 of: NSSegmentedControl.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.message" }
+                matching: { $0.accessibilityIdentifier() == "inspector.mode" }
             )
         )
-        let sectionSelector = try XCTUnwrap(
+        let requestSectionSelector = try XCTUnwrap(
             Self.descendant(
                 of: NSSegmentedControl.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.section"
+                }
             )
         )
-        XCTAssertLessThan(messageSelector.frame.width, inspectorPaneFrame.width / 2)
-        XCTAssertLessThan(sectionSelector.frame.width, inspectorPaneFrame.width / 2)
+        let responseSectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.section"
+                }
+            )
+        )
+        XCTAssertLessThan(modeSelector.frame.width, inspectorPaneFrame.width / 2)
+        XCTAssertLessThan(requestSectionSelector.frame.width, requestPaneFrame.width)
+        XCTAssertLessThan(responseSectionSelector.frame.width, responsePaneFrame.width)
         for identifier in [
             "traffic.filter.method",
             "traffic.filter.status",
@@ -927,7 +977,8 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
         XCTAssertEqual(sourceOutline.numberOfRows, 5)
         XCTAssertEqual(flowTable.numberOfRows, flows.count)
-        XCTAssertTrue(inspector.string.contains("POST /v1/items/3?source=test HTTP/1.1"))
+        XCTAssertTrue(requestInspector.string.contains("POST /v1/items/3?source=test HTTP/1.1"))
+        XCTAssertTrue(responseInspector.string.contains("HTTP/1.1 404 Result"))
 
         searchField.stringValue = "api.example.com"
         XCTAssertTrue(searchField.sendAction(searchField.action, to: searchField.target))
@@ -995,15 +1046,23 @@ final class ProxyLensIntegrationTests: XCTestCase {
         window.contentView?.layoutSubtreeIfNeeded()
         XCTAssertLessThanOrEqual(controller.view.fittingSize.width, frame.width)
 
-        let sectionSelector = try XCTUnwrap(
-            Self.descendant(
-                of: NSSegmentedControl.self,
-                in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+        for identifier in [
+            "inspector.request.section",
+            "inspector.response.section"
+        ] {
+            let sectionSelector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSSegmentedControl.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == identifier }
+                )
             )
-        )
-        let selectorFrame = sectionSelector.convert(sectionSelector.bounds, to: controller.view)
-        XCTAssertLessThanOrEqual(selectorFrame.maxX, controller.view.bounds.maxX)
+            let selectorFrame = sectionSelector.convert(
+                sectionSelector.bounds,
+                to: controller.view
+            )
+            XCTAssertLessThanOrEqual(selectorFrame.maxX, controller.view.bounds.maxX)
+        }
 
         let representation = try XCTUnwrap(
             controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds)
@@ -1051,20 +1110,22 @@ final class ProxyLensIntegrationTests: XCTestCase {
         let controller = InspectorViewController()
         _ = controller.view
         controller.render(viewModel.snapshot)
-        let messageSelector = try XCTUnwrap(
+        let modeSelector = try XCTUnwrap(
             Self.descendant(
                 of: NSSegmentedControl.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.message" }
+                matching: { $0.accessibilityIdentifier() == "inspector.mode" }
             )
         )
-        messageSelector.selectedSegment = 2
-        messageSelector.sendAction(messageSelector.action, to: messageSelector.target)
+        modeSelector.selectedSegment = 1
+        modeSelector.sendAction(modeSelector.action, to: modeSelector.target)
         let inspector = try XCTUnwrap(
             Self.descendant(
                 of: NSTextView.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.rules.content"
+                }
             )
         )
         XCTAssertTrue(inspector.string.contains("Block ads.example.com"))
@@ -1105,32 +1166,27 @@ final class ProxyLensIntegrationTests: XCTestCase {
         let controller = InspectorViewController()
         _ = controller.view
         controller.render(viewModel.snapshot)
-        let messageSelector = try XCTUnwrap(
-            Self.descendant(
-                of: NSSegmentedControl.self,
-                in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.message" }
-            )
-        )
         let sectionSelector = try XCTUnwrap(
             Self.descendant(
                 of: NSSegmentedControl.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.section"
+                }
             )
         )
         XCTAssertEqual(sectionSelector.segmentCount, 3)
         XCTAssertEqual(sectionSelector.label(forSegment: 2), "JSON")
 
-        messageSelector.selectedSegment = 1
-        messageSelector.sendAction(messageSelector.action, to: messageSelector.target)
         sectionSelector.selectedSegment = 1
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         let inspector = try XCTUnwrap(
             Self.descendant(
                 of: NSTextView.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.content"
+                }
             )
         )
         XCTAssertTrue(inspector.string.contains(compact))
@@ -1179,14 +1235,18 @@ final class ProxyLensIntegrationTests: XCTestCase {
             Self.descendant(
                 of: NSSegmentedControl.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.section"
+                }
             )
         )
         let inspector = try XCTUnwrap(
             Self.descendant(
                 of: NSTextView.self,
                 in: controller.view,
-                matching: { $0.accessibilityIdentifier() == "inspector.content" }
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.content"
+                }
             )
         )
 

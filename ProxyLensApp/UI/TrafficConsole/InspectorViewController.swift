@@ -2,30 +2,33 @@ import AppKit
 import ProxyLensCore
 
 @MainActor
-final class InspectorViewController: NSViewController, NSTextViewDelegate {
+final class InspectorViewController: NSViewController {
     private let viewModel: TrafficConsoleViewModel?
     private let titleField = NSTextField(labelWithString: "No Flow Selected")
     private let continueButton = NSButton(title: "Continue", target: nil, action: nil)
     private let abortButton = NSButton(title: "Abort", target: nil, action: nil)
-    private let messageSelector = NSSegmentedControl(
-        labels: ["Request", "Response", "Rules"],
+    private let modeSelector = NSSegmentedControl(
+        labels: ["Content", "Rules"],
         trackingMode: .selectOne,
         target: nil,
         action: nil
     )
-    private let sectionSelector = NSSegmentedControl(
-        labels: ["Headers", "Body", "JSON"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
+    private let requestPane = MessageInspectorPaneViewController(
+        title: "Request",
+        accessibilityPrefix: "inspector.request"
     )
-    private let textView = NSTextView()
+    private let responsePane = MessageInspectorPaneViewController(
+        title: "Response",
+        accessibilityPrefix: "inspector.response"
+    )
+    private let contentSplitViewController = NSSplitViewController()
+    private let rulesTextView = NSTextView()
+    private let rulesScrollView = NSScrollView()
     private var inspection = TrafficFlowInspection.empty
     private var editedHeaders: [Int: String] = [:]
     private var editedBodies: [Int: String] = [:]
     private var hasUserEdits = false
-    private var displayedMessageSegment = 0
-    private var displayedSectionSegment = 0
+    private var didSetInitialContentPosition = false
 
     init(viewModel: TrafficConsoleViewModel? = nil) {
         self.viewModel = viewModel
@@ -38,62 +41,11 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
     }
 
     override func loadView() {
-        titleField.translatesAutoresizingMaskIntoConstraints = false
-        titleField.font = .systemFont(ofSize: 13, weight: .semibold)
-        titleField.lineBreakMode = .byTruncatingMiddle
-        titleField.maximumNumberOfLines = 1
-        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        continueButton.translatesAutoresizingMaskIntoConstraints = false
-        continueButton.bezelStyle = .rounded
-        continueButton.target = self
-        continueButton.action = #selector(continueBreakpoint)
-        continueButton.setAccessibilityIdentifier("inspector.continue")
-
-        abortButton.translatesAutoresizingMaskIntoConstraints = false
-        abortButton.bezelStyle = .rounded
-        abortButton.target = self
-        abortButton.action = #selector(abortBreakpoint)
-        abortButton.setAccessibilityIdentifier("inspector.abort")
-
-        messageSelector.translatesAutoresizingMaskIntoConstraints = false
-        messageSelector.selectedSegment = 0
-        messageSelector.target = self
-        messageSelector.action = #selector(selectionChanged)
-        messageSelector.setAccessibilityIdentifier("inspector.message")
-
-        sectionSelector.translatesAutoresizingMaskIntoConstraints = false
-        sectionSelector.selectedSegment = 0
-        sectionSelector.target = self
-        sectionSelector.action = #selector(selectionChanged)
-        sectionSelector.setAccessibilityIdentifier("inspector.section")
-
-        textView.delegate = self
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isRichText = false
-        textView.usesFindBar = true
-        textView.isIncrementalSearchingEnabled = true
-        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.textContainerInset = NSSize(width: 10, height: 10)
-        textView.backgroundColor = .textBackgroundColor
-        textView.setAccessibilityIdentifier("inspector.content")
-        textView.isHorizontallyResizable = true
-        textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textContainer?.widthTracksTextView = false
-
-        let scrollView = NSScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .noBorder
+        configureTitle()
+        configureBreakpointControls()
+        configureModeSelector()
+        configureMessagePanes()
+        configureRulesView()
 
         let breakpointStack = NSStackView(views: [continueButton, abortButton])
         breakpointStack.translatesAutoresizingMaskIntoConstraints = false
@@ -101,26 +53,26 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         breakpointStack.spacing = 8
         breakpointStack.alignment = .centerY
 
-        messageSelector.setContentHuggingPriority(.required, for: .horizontal)
-        sectionSelector.setContentHuggingPriority(.required, for: .horizontal)
-
         let selectorSpacer = NSView()
         selectorSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         selectorSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let selectorStack = NSStackView(
-            views: [messageSelector, sectionSelector, selectorSpacer]
-        )
-        selectorStack.translatesAutoresizingMaskIntoConstraints = false
-        selectorStack.orientation = .horizontal
-        selectorStack.spacing = 8
-        selectorStack.distribution = .fill
+        let modeStack = NSStackView(views: [modeSelector, selectorSpacer])
+        modeStack.translatesAutoresizingMaskIntoConstraints = false
+        modeStack.orientation = .horizontal
+        modeStack.spacing = 8
+        modeStack.distribution = .fill
+
+        let contentSplitView = contentSplitViewController.view
+        contentSplitView.translatesAutoresizingMaskIntoConstraints = false
 
         let container = NSView()
+        addChild(contentSplitViewController)
         container.addSubview(titleField)
         container.addSubview(breakpointStack)
-        container.addSubview(selectorStack)
-        container.addSubview(scrollView)
+        container.addSubview(modeStack)
+        container.addSubview(contentSplitView)
+        container.addSubview(rulesScrollView)
         NSLayoutConstraint.activate([
             titleField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
             titleField.trailingAnchor.constraint(
@@ -133,17 +85,38 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
                 constant: -10
             ),
             breakpointStack.centerYAnchor.constraint(equalTo: titleField.centerYAnchor),
-            selectorStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            selectorStack.trailingAnchor.constraint(
-                equalTo: container.trailingAnchor, constant: -10),
-            selectorStack.topAnchor.constraint(equalTo: titleField.bottomAnchor, constant: 8),
-            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: selectorStack.bottomAnchor, constant: 8),
-            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            modeStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            modeStack.trailingAnchor.constraint(
+                equalTo: container.trailingAnchor,
+                constant: -10
+            ),
+            modeStack.topAnchor.constraint(equalTo: titleField.bottomAnchor, constant: 8),
+            contentSplitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            contentSplitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            contentSplitView.topAnchor.constraint(equalTo: modeStack.bottomAnchor, constant: 8),
+            contentSplitView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            rulesScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            rulesScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            rulesScrollView.topAnchor.constraint(equalTo: modeStack.bottomAnchor, constant: 8),
+            rulesScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         view = container
         render(.initial)
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+
+        let splitView = contentSplitViewController.splitView
+        guard !didSetInitialContentPosition,
+            contentSplitViewController.splitViewItems.count == 2,
+            splitView.bounds.width > 0
+        else {
+            return
+        }
+
+        didSetInitialContentPosition = true
+        splitView.setPosition(splitView.bounds.width * 0.5, ofDividerAt: 0)
     }
 
     func render(_ snapshot: TrafficConsoleSnapshot) {
@@ -155,79 +128,203 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
             editedBodies.removeAll()
             hasUserEdits = false
         }
+
         titleField.stringValue = inspection.title
         let isPaused = inspection.breakpoint != nil
         continueButton.isHidden = !isPaused
         abortButton.isHidden = !isPaused
         continueButton.isEnabled = isPaused
         abortButton.isEnabled = isPaused
-        messageSelector.isEnabled = inspection.flowID != nil
-        messageSelector.setEnabled(inspection.request != nil, forSegment: 0)
-        messageSelector.setEnabled(inspection.response != nil, forSegment: 1)
-        messageSelector.setEnabled(inspection.flowID != nil, forSegment: 2)
-        sectionSelector.isEnabled =
-            inspection.request != nil && messageSelector.selectedSegment != 2
-        if inspection.response == nil, messageSelector.selectedSegment == 1 {
-            messageSelector.selectedSegment = 0
+        modeSelector.isEnabled = inspection.flowID != nil
+        if inspection.flowID == nil {
+            modeSelector.selectedSegment = 0
         }
-        if previousBreakpoint == nil, let breakpoint = inspection.breakpoint {
-            messageSelector.selectedSegment = breakpoint.phase == .response ? 1 : 0
-        }
+        rulesTextView.string = inspection.rules
+        updateModeVisibility()
+
         if hasUserEdits, previousFlowID == inspection.flowID {
             updateEditingState()
             return
         }
-        updateContent()
+
+        updateMessagePane(requestPane, messageIndex: 0, message: inspection.request)
+        updateMessagePane(responsePane, messageIndex: 1, message: inspection.response)
     }
 
-    @objc private func selectionChanged(_ sender: Any?) {
-        saveCurrentEdits()
-        updateContent()
+    private func configureTitle() {
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        titleField.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleField.lineBreakMode = .byTruncatingMiddle
+        titleField.maximumNumberOfLines = 1
+        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     }
 
-    func textDidChange(_ notification: Notification) {
-        guard textView.isEditable else {
+    private func configureBreakpointControls() {
+        continueButton.translatesAutoresizingMaskIntoConstraints = false
+        continueButton.bezelStyle = .rounded
+        continueButton.target = self
+        continueButton.action = #selector(continueBreakpoint)
+        continueButton.setAccessibilityIdentifier("inspector.continue")
+
+        abortButton.translatesAutoresizingMaskIntoConstraints = false
+        abortButton.bezelStyle = .rounded
+        abortButton.target = self
+        abortButton.action = #selector(abortBreakpoint)
+        abortButton.setAccessibilityIdentifier("inspector.abort")
+    }
+
+    private func configureModeSelector() {
+        modeSelector.translatesAutoresizingMaskIntoConstraints = false
+        modeSelector.selectedSegment = 0
+        modeSelector.target = self
+        modeSelector.action = #selector(modeSelectionChanged)
+        modeSelector.setAccessibilityIdentifier("inspector.mode")
+        modeSelector.setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    private func configureMessagePanes() {
+        requestPane.onSelectionChange = { [weak self] pane in
+            self?.selectionChanged(in: pane, messageIndex: 0)
+        }
+        requestPane.onTextChange = { [weak self] pane in
+            self?.textChanged(in: pane, messageIndex: 0)
+        }
+        responsePane.onSelectionChange = { [weak self] pane in
+            self?.selectionChanged(in: pane, messageIndex: 1)
+        }
+        responsePane.onTextChange = { [weak self] pane in
+            self?.textChanged(in: pane, messageIndex: 1)
+        }
+
+        contentSplitViewController.splitView.isVertical = true
+        contentSplitViewController.splitView.dividerStyle = .thin
+        contentSplitViewController.splitView.setAccessibilityIdentifier(
+            "inspector.split.messages"
+        )
+
+        let requestItem = NSSplitViewItem(viewController: requestPane)
+        requestItem.minimumThickness = 260
+        requestItem.preferredThicknessFraction = 0.5
+
+        let responseItem = NSSplitViewItem(viewController: responsePane)
+        responseItem.minimumThickness = 260
+        responseItem.preferredThicknessFraction = 0.5
+
+        contentSplitViewController.addSplitViewItem(requestItem)
+        contentSplitViewController.addSplitViewItem(responseItem)
+    }
+
+    private func configureRulesView() {
+        rulesTextView.isEditable = false
+        rulesTextView.isSelectable = true
+        rulesTextView.isRichText = false
+        rulesTextView.usesFindBar = true
+        rulesTextView.isIncrementalSearchingEnabled = true
+        rulesTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        rulesTextView.textContainerInset = NSSize(width: 10, height: 10)
+        rulesTextView.backgroundColor = .textBackgroundColor
+        rulesTextView.setAccessibilityIdentifier("inspector.rules.content")
+        rulesTextView.isHorizontallyResizable = true
+        rulesTextView.isVerticallyResizable = true
+        rulesTextView.autoresizingMask = [.width]
+        rulesTextView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        rulesTextView.textContainer?.widthTracksTextView = false
+
+        rulesScrollView.translatesAutoresizingMaskIntoConstraints = false
+        rulesScrollView.documentView = rulesTextView
+        rulesScrollView.hasVerticalScroller = true
+        rulesScrollView.hasHorizontalScroller = true
+        rulesScrollView.autohidesScrollers = true
+        rulesScrollView.borderType = .noBorder
+    }
+
+    @objc private func modeSelectionChanged(_ sender: Any?) {
+        updateModeVisibility()
+        if modeSelector.selectedSegment == 1 {
+            rulesTextView.scrollToBeginningOfDocument(nil)
+        }
+    }
+
+    private func updateModeVisibility() {
+        let showsRules = modeSelector.selectedSegment == 1 && inspection.flowID != nil
+        contentSplitViewController.view.isHidden = showsRules
+        rulesScrollView.isHidden = !showsRules
+    }
+
+    private func selectionChanged(
+        in pane: MessageInspectorPaneViewController,
+        messageIndex: Int
+    ) {
+        saveCurrentEdits(in: pane, messageIndex: messageIndex)
+        let message = messageIndex == 0 ? inspection.request : inspection.response
+        updateMessagePane(pane, messageIndex: messageIndex, message: message)
+    }
+
+    private func textChanged(
+        in pane: MessageInspectorPaneViewController,
+        messageIndex: Int
+    ) {
+        guard pane.isContentEditable else {
             return
         }
         hasUserEdits = true
-        saveCurrentEdits()
+        saveCurrentEdits(in: pane, messageIndex: messageIndex)
     }
 
-    private func updateContent() {
-        sectionSelector.isEnabled = inspection.flowID != nil && messageSelector.selectedSegment != 2
-        defer { rememberDisplayedSelection() }
-        if messageSelector.selectedSegment == 2 {
-            textView.string = inspection.rules
-            textView.isEditable = false
-            textView.scrollToBeginningOfDocument(nil)
+    private func updateMessagePane(
+        _ pane: MessageInspectorPaneViewController,
+        messageIndex: Int,
+        message: TrafficMessageInspection?
+    ) {
+        guard let message else {
+            let placeholder =
+                messageIndex == 0
+                ? "Select a captured flow to inspect its request."
+                : "No response has been captured for this flow."
+            pane.display(
+                placeholder,
+                isEditable: false,
+                isSelectorEnabled: false
+            )
             return
         }
-        guard let message = selectedMessage else {
-            textView.string = "Select a captured flow to inspect its request and response."
-            textView.isEditable = false
-            return
-        }
-        if sectionSelector.selectedSegment == 0 {
-            textView.string =
-                editedHeaders[messageSelector.selectedSegment] ?? message.headers
-        } else if sectionSelector.selectedSegment == 2 {
-            textView.string = Self.bodyText(message.json, editable: false)
-        } else if let editedBody = editedBodies[messageSelector.selectedSegment] {
-            textView.string = editedBody
+
+        let content: String
+        if pane.selectedSectionSegment == 0 {
+            content = editedHeaders[messageIndex] ?? message.headers
+        } else if pane.selectedSectionSegment == 2 {
+            content = Self.bodyText(message.json, editable: false)
+        } else if let editedBody = editedBodies[messageIndex] {
+            content = editedBody
         } else {
-            textView.string = Self.bodyText(message.body, editable: isEditingCurrentMessage)
+            content = Self.bodyText(
+                message.body,
+                editable: isEditingMessage(messageIndex)
+            )
         }
-        updateEditingState()
-        textView.scrollToBeginningOfDocument(nil)
+
+        pane.display(
+            content,
+            isEditable: isEditingSection(
+                pane.selectedSectionSegment,
+                messageIndex: messageIndex
+            ),
+            isSelectorEnabled: true
+        )
     }
 
     private func updateEditingState() {
-        textView.isEditable = isEditingCurrentSection
-    }
-
-    private func rememberDisplayedSelection() {
-        displayedMessageSegment = messageSelector.selectedSegment
-        displayedSectionSegment = sectionSelector.selectedSegment
+        requestPane.isContentEditable = isEditingSection(
+            requestPane.selectedSectionSegment,
+            messageIndex: 0
+        )
+        responsePane.isContentEditable = isEditingSection(
+            responsePane.selectedSectionSegment,
+            messageIndex: 1
+        )
     }
 
     private func isEditingMessage(_ messageIndex: Int) -> Bool {
@@ -242,36 +339,38 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         }
     }
 
-    private var selectedMessage: TrafficMessageInspection? {
-        messageSelector.selectedSegment == 1 ? inspection.response : inspection.request
-    }
-
-    private var isEditingCurrentMessage: Bool {
-        isEditingMessage(messageSelector.selectedSegment)
-    }
-
-    private var isEditingCurrentSection: Bool {
-        guard isEditingCurrentMessage, messageSelector.selectedSegment != 2 else {
+    private func isEditingSection(_ sectionIndex: Int, messageIndex: Int) -> Bool {
+        guard isEditingMessage(messageIndex) else {
             return false
         }
-        if sectionSelector.selectedSegment == 0 {
+        if sectionIndex == 0 {
             return true
         }
-        if sectionSelector.selectedSegment == 1 {
+        if sectionIndex == 1 {
             return inspection.breakpoint?.canEditBody == true
         }
         return false
     }
 
-    private func saveCurrentEdits() {
-        guard isEditingMessage(displayedMessageSegment), displayedMessageSegment != 2 else {
+    private func saveCurrentEdits(
+        in pane: MessageInspectorPaneViewController,
+        messageIndex: Int
+    ) {
+        guard isEditingMessage(messageIndex) else {
             return
         }
-        if displayedSectionSegment == 0 {
-            editedHeaders[displayedMessageSegment] = textView.string
-        } else if displayedSectionSegment == 1, inspection.breakpoint?.canEditBody == true {
-            editedBodies[displayedMessageSegment] = textView.string
+        if pane.displayedSectionSegment == 0 {
+            editedHeaders[messageIndex] = pane.content
+        } else if pane.displayedSectionSegment == 1,
+            inspection.breakpoint?.canEditBody == true
+        {
+            editedBodies[messageIndex] = pane.content
         }
+    }
+
+    private func saveCurrentEdits() {
+        saveCurrentEdits(in: requestPane, messageIndex: 0)
+        saveCurrentEdits(in: responsePane, messageIndex: 1)
     }
 
     @objc private func continueBreakpoint() {
@@ -321,5 +420,137 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         case .failed(let metadata, let message):
             return "\(metadata)\n\nUnable to read captured bytes:\n\(message)"
         }
+    }
+}
+
+@MainActor
+private final class MessageInspectorPaneViewController: NSViewController, NSTextViewDelegate {
+    let paneTitle: String
+    let accessibilityPrefix: String
+    let sectionSelector = NSSegmentedControl(
+        labels: ["Headers", "Body", "JSON"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    let textView = NSTextView()
+    var onSelectionChange: ((MessageInspectorPaneViewController) -> Void)?
+    var onTextChange: ((MessageInspectorPaneViewController) -> Void)?
+    private(set) var displayedSectionSegment = 0
+    private var isUpdatingContent = false
+
+    var selectedSectionSegment: Int {
+        sectionSelector.selectedSegment
+    }
+
+    var content: String {
+        textView.string
+    }
+
+    var isContentEditable: Bool {
+        get { textView.isEditable }
+        set { textView.isEditable = newValue }
+    }
+
+    init(title: String, accessibilityPrefix: String) {
+        self.paneTitle = title
+        self.accessibilityPrefix = accessibilityPrefix
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let titleField = NSTextField(labelWithString: paneTitle)
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        titleField.font = .systemFont(ofSize: 12, weight: .semibold)
+
+        sectionSelector.translatesAutoresizingMaskIntoConstraints = false
+        sectionSelector.selectedSegment = 0
+        sectionSelector.target = self
+        sectionSelector.action = #selector(selectionChanged)
+        sectionSelector.setAccessibilityIdentifier("\(accessibilityPrefix).section")
+        sectionSelector.setContentHuggingPriority(.required, for: .horizontal)
+
+        let selectorSpacer = NSView()
+        selectorSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        selectorSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let headerStack = NSStackView(views: [titleField, sectionSelector, selectorSpacer])
+        headerStack.translatesAutoresizingMaskIntoConstraints = false
+        headerStack.orientation = .horizontal
+        headerStack.spacing = 8
+        headerStack.distribution = .fill
+        headerStack.alignment = .centerY
+
+        textView.delegate = self
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textContainerInset = NSSize(width: 10, height: 10)
+        textView.backgroundColor = .textBackgroundColor
+        textView.setAccessibilityIdentifier("\(accessibilityPrefix).content")
+        textView.isHorizontallyResizable = true
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = false
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+
+        let container = NSView()
+        container.setAccessibilityIdentifier(accessibilityPrefix)
+        container.addSubview(headerStack)
+        container.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            headerStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            headerStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            headerStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: headerStack.bottomAnchor, constant: 8),
+            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        view = container
+    }
+
+    func display(
+        _ content: String,
+        isEditable: Bool,
+        isSelectorEnabled: Bool
+    ) {
+        isUpdatingContent = true
+        textView.string = content
+        textView.isEditable = isEditable
+        sectionSelector.isEnabled = isSelectorEnabled
+        displayedSectionSegment = sectionSelector.selectedSegment
+        textView.scrollToBeginningOfDocument(nil)
+        isUpdatingContent = false
+    }
+
+    @objc private func selectionChanged(_ sender: Any?) {
+        onSelectionChange?(self)
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard !isUpdatingContent, textView.isEditable else {
+            return
+        }
+        onTextChange?(self)
     }
 }
