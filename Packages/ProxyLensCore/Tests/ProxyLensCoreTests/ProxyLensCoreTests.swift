@@ -138,6 +138,32 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertTrue(flow.state.isTerminal)
     }
 
+    func testFlowApplicationUsesStableGroupingIdentifiers() {
+        XCTAssertEqual(
+            FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "COM.APPLE.SAFARI",
+                bundlePath: "/Applications/Other.app",
+                executablePath: "/bin/other"
+            ).groupingIdentifier,
+            "bundle:com.apple.safari"
+        )
+        XCTAssertEqual(
+            FlowApplication(name: "curl", executablePath: "/usr/bin/curl").groupingIdentifier,
+            "executable:/usr/bin/curl"
+        )
+    }
+
+    func testFlowSourceDecodesSnapshotsWrittenBeforeApplicationAttribution() throws {
+        let source = try JSONDecoder().decode(
+            FlowSource.self,
+            from: Data(#"{"kind":"desktopProxy","label":"Desktop proxy"}"#.utf8)
+        )
+
+        XCTAssertEqual(source, .desktopProxy)
+        XCTAssertNil(source.application)
+    }
+
     func testFlowTimingCalculatesPhaseDurations() {
         let start = Date(timeIntervalSince1970: 2_000)
         var timing = FlowTiming(startedAt: start)

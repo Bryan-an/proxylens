@@ -63,6 +63,56 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.displayFilter.searchText, "api")
     }
 
+    func testConsoleStoreGroupsAndFiltersDesktopApplicationsWithUnknownFallback() throws {
+        let safari = FlowSource(
+            kind: .desktopProxy,
+            label: "Safari",
+            application: FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari",
+                bundlePath: "/System/Applications/Safari.app",
+                executablePath: "/System/Applications/Safari.app/Contents/MacOS/Safari",
+                processIdentifier: 101
+            )
+        )
+        let curl = FlowSource(
+            kind: .desktopProxy,
+            label: "curl",
+            application: FlowApplication(
+                name: "curl",
+                executablePath: "/usr/bin/curl",
+                processIdentifier: 202
+            )
+        )
+        let imported = FlowSource(kind: .importedSession, label: "Saved capture")
+        let flows = try [
+            Self.makeFlow(index: 1, host: "one.example.com", statusCode: 200, source: safari),
+            Self.makeFlow(index: 2, host: "two.example.com", statusCode: 200, source: safari),
+            Self.makeFlow(index: 3, host: "three.example.com", statusCode: 200, source: curl),
+            Self.makeFlow(index: 4, host: "four.example.com", statusCode: 200),
+            Self.makeFlow(index: 5, host: "five.example.com", statusCode: 200, source: imported)
+        ]
+        var store = TrafficConsoleStore()
+
+        store.apply(flows.map(FlowEvent.finished))
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+
+        XCTAssertEqual(snapshot.applications.map(\.name), ["curl", "Safari", "Unknown App"])
+        XCTAssertEqual(snapshot.applications.map(\.flowCount), [1, 2, 1])
+
+        let safariID = try XCTUnwrap(snapshot.applications.first { $0.name == "Safari" }?.id)
+        store.selectSource(.application(safariID))
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [flows[0].id, flows[1].id])
+
+        let unknownID = try XCTUnwrap(
+            snapshot.applications.first { $0.name == "Unknown App" }?.id
+        )
+        store.selectSource(.application(unknownID))
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [flows[3].id])
+    }
+
     func testDisplayFilterComposesSearchFacetsAndDomainSelection() throws {
         let matching = try Self.makeFlow(
             index: 1,
@@ -765,8 +815,23 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         await viewModel.prepare()
 
+        let safariSource = FlowSource(
+            kind: .desktopProxy,
+            label: "Safari",
+            application: FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari",
+                bundlePath: "/System/Applications/Safari.app",
+                processIdentifier: 501
+            )
+        )
         let flows = try [
-            Self.makeFlow(index: 1, host: "api.example.com", statusCode: 201),
+            Self.makeFlow(
+                index: 1,
+                host: "api.example.com",
+                statusCode: 201,
+                source: safariSource
+            ),
             Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 304),
             Self.makeFlow(
                 index: 3,
@@ -975,7 +1040,24 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 )
             )
         }
-        XCTAssertEqual(sourceOutline.numberOfRows, 5)
+        XCTAssertEqual(sourceOutline.numberOfRows, 8)
+        let sourceLabels = (0..<sourceOutline.numberOfRows).compactMap { row in
+            sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                .accessibilityLabel()
+        }
+        XCTAssertEqual(
+            sourceLabels,
+            [
+                "All Traffic, 4 flows",
+                "Apps, 2 applications",
+                "Safari, 1 flow",
+                "Unknown App, 3 flows",
+                "Domains, 3 domains",
+                "api.example.com, 2 flows",
+                "auth.example.net, 1 flow",
+                "cdn.example.com, 1 flow"
+            ]
+        )
         XCTAssertEqual(flowTable.numberOfRows, flows.count)
         XCTAssertTrue(requestInspector.string.contains("POST /v1/items/3?source=test HTTP/1.1"))
         XCTAssertTrue(responseInspector.string.contains("HTTP/1.1 404 Result"))
@@ -1216,6 +1298,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             workspaceWarning: nil,
             certificateTrust: nil,
             allFlowCount: 1,
+            applications: [],
             domains: [],
             selectedSource: .allTraffic,
             displayFilter: .all,

@@ -476,6 +476,13 @@ P0 rules currently implemented in the shared pipeline:
 
 Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.
 
+P0 application source attribution currently implemented:
+
+- When the listener accepts a local proxy connection, `MacOSFlowSourceResolver` inspects the TCP socket owner with `libproc` and resolves the process to application metadata with AppKit and the process APIs. The scan runs on a dedicated serial utility queue before the HTTP pipeline is installed, so it does not block a SwiftNIO event-loop thread.
+- The immutable `FlowSource` stores the display name, bundle identifier, outermost application-bundle path, executable path, process identifier, and client endpoint. Helper processes inside an application bundle group under the outermost host application.
+- The source sidebar groups desktop-proxy flows under **Apps**, uses installed application icons when a bundle path is available, and supports selecting an application as a traffic filter. Attribution failures degrade to **Unknown App** without interrupting capture. Imported and replayed flows are not presented as locally attributed applications.
+- This is best-effort attribution for explicit local proxy connections. It does not require a privileged helper or `NetworkExtension`, and short-lived sockets or processes hidden by operating-system permissions may remain unknown.
+
 P0 JSON inspection currently implemented:
 
 - `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
@@ -521,6 +528,7 @@ All macOS-specific security behavior belongs in `ProxyLensPlatform`:
 - Keychain storage of private keys and certificates.
 - Certificate trust guidance or installation via `CertificateTrustStore` / `SystemCertificateTrustStore`.
 - System HTTP/HTTPS proxy configuration and restoration.
+- Local TCP socket ownership and application metadata attribution.
 - OSLog categories and redaction.
 - Future login-item or helper-process registration.
 

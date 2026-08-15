@@ -6,15 +6,57 @@ public enum FlowSourceKind: String, Codable, Equatable, Hashable, Sendable {
     case replay
 }
 
+public struct FlowApplication: Codable, Equatable, Hashable, Sendable {
+    public let name: String
+    public let bundleIdentifier: String?
+    public let bundlePath: String?
+    public let executablePath: String?
+    public let processIdentifier: Int32?
+
+    public init(
+        name: String,
+        bundleIdentifier: String? = nil,
+        bundlePath: String? = nil,
+        executablePath: String? = nil,
+        processIdentifier: Int32? = nil
+    ) {
+        self.name = name
+        self.bundleIdentifier = bundleIdentifier
+        self.bundlePath = bundlePath
+        self.executablePath = executablePath
+        self.processIdentifier = processIdentifier
+    }
+
+    public var groupingIdentifier: String {
+        if let bundleIdentifier, !bundleIdentifier.isEmpty {
+            return "bundle:\(bundleIdentifier.lowercased())"
+        }
+        if let bundlePath, !bundlePath.isEmpty {
+            return "bundle-path:\(bundlePath)"
+        }
+        if let executablePath, !executablePath.isEmpty {
+            return "executable:\(executablePath)"
+        }
+        return "name:\(name.lowercased())"
+    }
+}
+
 public struct FlowSource: Codable, Equatable, Hashable, Sendable {
     public let kind: FlowSourceKind
     public let label: String
     public let clientAddress: String?
+    public let application: FlowApplication?
 
-    public init(kind: FlowSourceKind, label: String, clientAddress: String? = nil) {
+    public init(
+        kind: FlowSourceKind,
+        label: String,
+        clientAddress: String? = nil,
+        application: FlowApplication? = nil
+    ) {
         self.kind = kind
         self.label = label
         self.clientAddress = clientAddress
+        self.application = application
     }
 
     public static let desktopProxy = FlowSource(kind: .desktopProxy, label: "Desktop proxy")

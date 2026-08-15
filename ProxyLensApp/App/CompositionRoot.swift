@@ -31,13 +31,15 @@ final class CompositionRoot {
         )
         let ruleEngine = RuleEngine()
         let breakpointCoordinator = BreakpointCoordinator()
+        let flowSourceResolver = MacOSFlowSourceResolver()
         let proxyEngine = NIOProxyEngine(
             eventSink: persistenceSink,
             bodyStore: bodyStore,
             maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes,
             certificateProvider: certificateProvider,
             ruleSnapshot: ruleEngine.snapshot,
-            breakpointGate: breakpointCoordinator
+            breakpointGate: breakpointCoordinator,
+            flowSourceResolver: flowSourceResolver
         )
         let systemProxyController = MacOSSystemProxyController(
             snapshotURL:

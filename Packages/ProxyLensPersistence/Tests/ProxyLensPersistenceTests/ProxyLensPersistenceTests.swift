@@ -104,11 +104,21 @@ final class ProxyLensPersistenceTests: XCTestCase {
             Data("response bytes".utf8),
             metadata: BodyMetadata(contentType: "application/json")
         )
+        let source = FlowSource(
+            kind: .desktopProxy,
+            label: "Safari",
+            application: FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari",
+                processIdentifier: 501
+            )
+        )
         let flow = try Self.makeCompletedFlow(
             sessionID: session.id,
             index: 1,
             requestBody: requestBody,
-            responseBody: responseBody
+            responseBody: responseBody,
+            source: source
         )
         try await fixture.sessionStore.save(flow)
 
@@ -363,11 +373,13 @@ final class ProxyLensPersistenceTests: XCTestCase {
         sessionID: SessionID,
         index: Int,
         requestBody: BodyReference? = nil,
-        responseBody: BodyReference? = nil
+        responseBody: BodyReference? = nil,
+        source: FlowSource = .desktopProxy
     ) throws -> Flow {
         let startedAt = Date(timeIntervalSince1970: 10_000 + Double(index))
         var flow = Flow(
             sessionID: sessionID,
+            source: source,
             request: HTTPRequest(
                 method: .post,
                 url: URL(string: "https://example.test/items/\(index)")!,

@@ -155,6 +155,64 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
+    func testHTTPForwardingAttachesTheResolvedApplicationSource() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "attributed response")
+        let eventSink = RecordingFlowEventSink()
+        let expectedSource = FlowSource(
+            kind: .desktopProxy,
+            label: "Safari",
+            clientAddress: "127.0.0.1:54321",
+            application: FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari",
+                processIdentifier: 101
+            )
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            flowSourceResolver: FixedFlowSourceResolver(source: expectedSource)
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            _ = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/attributed",
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFinished()
+
+            let events = await eventSink.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                events.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            XCTAssertEqual(finishedFlow.source, expectedSource)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
     func testHTTPBlockRuleReturnsForbiddenWithoutConnectingUpstream() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
         let eventSink = RecordingFlowEventSink()
@@ -1431,6 +1489,17 @@ private actor TestSystemProxyController: SystemProxyController {
     func prepareForProxyActivation() {}
     func apply(_: SystemProxyConfiguration) {}
     func restorePreviousConfiguration() {}
+}
+
+private struct FixedFlowSourceResolver: FlowSourceResolver {
+    let source: FlowSource
+
+    func resolveSource(
+        clientEndpoint _: NetworkEndpoint,
+        proxyEndpoint _: NetworkEndpoint
+    ) async -> FlowSource {
+        source
+    }
 }
 
 private actor RecordingFlowEventSink: FlowEventSink {

@@ -21,6 +21,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private let tunnelTarget: ConnectTarget?
     private let ruleSnapshot: (any RuleSnapshotSource)?
     private let breakpointGate: any BreakpointGate
+    private let flowSource: FlowSource
 
     private var requestHead: HTTPRequestHead?
     private var upstreamChannel: Channel?
@@ -54,7 +55,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         upstreamTLSContext: NIOSSLContext? = nil,
         tunnelTarget: ConnectTarget? = nil,
         ruleSnapshot: (any RuleSnapshotSource)? = nil,
-        breakpointGate: any BreakpointGate = ImmediateBreakpointGate()
+        breakpointGate: any BreakpointGate = ImmediateBreakpointGate(),
+        flowSource: FlowSource = .desktopProxy
     ) {
         self.sessionID = sessionID
         self.eventSink = eventSink
@@ -67,6 +69,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.tunnelTarget = tunnelTarget
         self.ruleSnapshot = ruleSnapshot
         self.breakpointGate = breakpointGate
+        self.flowSource = flowSource
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -186,7 +189,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         )
         let requestPlan = RulePlanner.plan(
             rules: ruleSnapshot?.currentRules() ?? RuleSet(),
-            context: RuleMatchContext(request: request, source: .desktopProxy),
+            context: RuleMatchContext(request: request, source: flowSource),
             phase: .requestHeaders
         )
         if requestPlan.applyNoCache {
@@ -235,7 +238,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             upstreamPort: UInt16(target.port),
             tlsIntercepted: originalTarget.usesTLS
         )
-        let flow = Flow(sessionID: sessionID, request: request, connection: connection)
+        let flow = Flow(
+            sessionID: sessionID,
+            source: flowSource,
+            request: request,
+            connection: connection
+        )
         let transaction = FlowTransaction(flow: flow, eventSink: eventSink)
         if let bodyStore {
             requestBodyRecorder = StreamingBodyRecorder(
@@ -446,6 +454,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         let certificateProvider = self.certificateProvider
         let ruleSnapshot = self.ruleSnapshot
         let breakpointGate = self.breakpointGate
+        let flowSource = self.flowSource
         channel.writeAndFlush(HTTPServerResponsePart.end(nil)).flatMap {
             HTTPServerPipeline.removePlaintextHTTPHandlers(from: channel)
         }.flatMapThrowing {
@@ -467,7 +476,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     upstreamTLSContext: upstreamTLSContext,
                     tunnelTarget: target,
                     ruleSnapshot: ruleSnapshot,
-                    breakpointGate: breakpointGate
+                    breakpointGate: breakpointGate,
+                    flowSource: flowSource
                 )
             )
         }.flatMap {
@@ -826,13 +836,14 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
         let ruleSnapshot = self.ruleSnapshot
         let breakpointGate = self.breakpointGate
+        let flowSource = self.flowSource
         let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
         let bootstrap = ClientBootstrap(group: clientChannel.eventLoop)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelInitializer {
                 [
                     upstreamTLSContext, bodyStore, maximumCapturedBodyBytes, loopBoundSelf,
-                    request, ruleSnapshot, breakpointGate
+                    request, ruleSnapshot, breakpointGate, flowSource
                 ] channel in
                 let tlsFuture: EventLoopFuture<Void>
                 if target.usesTLS {
@@ -866,7 +877,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                             bodyStore: bodyStore,
                             maximumCapturedBodyBytes: maximumCapturedBodyBytes,
                             ruleSnapshot: ruleSnapshot,
-                            breakpointGate: breakpointGate
+                            breakpointGate: breakpointGate,
+                            flowSource: flowSource
                         )
                     )
                 }
@@ -1012,6 +1024,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
     private let maximumCapturedBodyBytes: Int64
     private let ruleSnapshot: (any RuleSnapshotSource)?
     private let breakpointGate: any BreakpointGate
+    private let flowSource: FlowSource
     private var responseStarted = false
     private var responseBodyRecorder: StreamingBodyRecorder?
     private var responseHeadTask: Task<Void, Never>?
@@ -1040,7 +1053,8 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         bodyStore: (any BodyStore)?,
         maximumCapturedBodyBytes: Int64,
         ruleSnapshot: (any RuleSnapshotSource)?,
-        breakpointGate: any BreakpointGate
+        breakpointGate: any BreakpointGate,
+        flowSource: FlowSource
     ) {
         self.clientChannel = clientChannel
         self.clientHandler = clientHandler
@@ -1051,6 +1065,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
         self.ruleSnapshot = ruleSnapshot
         self.breakpointGate = breakpointGate
+        self.flowSource = flowSource
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -1072,7 +1087,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                     context: RuleMatchContext(
                         request: request,
                         response: response,
-                        source: .desktopProxy
+                        source: flowSource
                     ),
                     phase: .responseHeaders
                 )

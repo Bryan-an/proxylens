@@ -51,10 +51,29 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
             symbolName: "tray.full",
             selection: .allTraffic
         )
+        let applications = SourceOutlineNode(
+            id: "applications",
+            title: "Apps",
+            count: snapshot.applications.count,
+            countSingular: "application",
+            symbolName: "square.grid.2x2",
+            selection: nil,
+            children: snapshot.applications.map {
+                SourceOutlineNode(
+                    id: "application:\($0.id)",
+                    title: $0.name,
+                    count: $0.flowCount,
+                    symbolName: $0.name == "Unknown App" ? "questionmark.app" : "app",
+                    bundlePath: $0.bundlePath,
+                    selection: .application($0.id)
+                )
+            }
+        )
         let domains = SourceOutlineNode(
             id: "domains",
             title: "Domains",
             count: snapshot.domains.count,
+            countSingular: "domain",
             symbolName: "globe",
             selection: nil,
             children: snapshot.domains.map {
@@ -67,8 +86,9 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
                 )
             }
         )
-        roots = [allTraffic, domains]
+        roots = [allTraffic, applications, domains]
         outlineView.reloadData()
+        outlineView.expandItem(applications)
         outlineView.expandItem(domains)
 
         let nodes = roots.flatMap { root in
@@ -116,7 +136,13 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         let cell =
             (outlineView.makeView(withIdentifier: identifier, owner: self) as? SourceCellView)
             ?? SourceCellView(identifier: identifier)
-        cell.render(title: node.title, count: node.count, symbolName: node.symbolName)
+        cell.render(
+            title: node.title,
+            count: node.count,
+            countSingular: node.countSingular,
+            symbolName: node.symbolName,
+            bundlePath: node.bundlePath
+        )
         return cell
     }
 
@@ -141,7 +167,9 @@ private final class SourceOutlineNode: NSObject {
     let id: String
     let title: String
     let count: Int
+    let countSingular: String
     let symbolName: String
+    let bundlePath: String?
     let selection: TrafficSourceSelection?
     let children: [SourceOutlineNode]
 
@@ -149,14 +177,18 @@ private final class SourceOutlineNode: NSObject {
         id: String,
         title: String,
         count: Int,
+        countSingular: String = "flow",
         symbolName: String,
+        bundlePath: String? = nil,
         selection: TrafficSourceSelection?,
         children: [SourceOutlineNode] = []
     ) {
         self.id = id
         self.title = title
         self.count = count
+        self.countSingular = countSingular
         self.symbolName = symbolName
+        self.bundlePath = bundlePath
         self.selection = selection
         self.children = children
     }
@@ -182,6 +214,7 @@ private final class SourceCellView: NSTableCellView {
         countField.textColor = .secondaryLabelColor
         countField.font = .monospacedDigitSystemFont(
             ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        setAccessibilityElement(true)
 
         addSubview(symbolView)
         addSubview(titleField)
@@ -205,9 +238,23 @@ private final class SourceCellView: NSTableCellView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func render(title: String, count: Int, symbolName: String) {
-        symbolView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+    func render(
+        title: String,
+        count: Int,
+        countSingular: String,
+        symbolName: String,
+        bundlePath: String?
+    ) {
+        if let bundlePath {
+            symbolView.image = NSWorkspace.shared.icon(forFile: bundlePath)
+            symbolView.contentTintColor = nil
+        } else {
+            symbolView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+            symbolView.contentTintColor = .secondaryLabelColor
+        }
         titleField.stringValue = title
         countField.stringValue = count.formatted()
+        let countDescription = count == 1 ? countSingular : "\(countSingular)s"
+        setAccessibilityLabel("\(title), \(count) \(countDescription)")
     }
 }

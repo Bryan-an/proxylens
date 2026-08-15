@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import ProxyLensCore
 @preconcurrency import Security
@@ -233,6 +234,59 @@ final class ProxyLensPlatformTests: XCTestCase {
         }
     }
 
+    func testApplicationSourceResolverUsesSocketOwnerMetadataAndPreservesClientAddress() async {
+        let application = FlowApplication(
+            name: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            bundlePath: "/System/Applications/Safari.app",
+            executablePath: "/System/Applications/Safari.app/Contents/MacOS/Safari",
+            processIdentifier: 501
+        )
+        let resolver = MacOSFlowSourceResolver(
+            socketLocator: FixedProcessSocketLocator(processIdentifier: 501),
+            applicationInspector: FixedProcessApplicationInspector(application: application)
+        )
+
+        let source = await resolver.resolveSource(
+            clientEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 54_321),
+            proxyEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 9_090)
+        )
+
+        XCTAssertEqual(source.kind, .desktopProxy)
+        XCTAssertEqual(source.label, "Safari")
+        XCTAssertEqual(source.clientAddress, "127.0.0.1:54321")
+        XCTAssertEqual(source.application, application)
+    }
+
+    func testApplicationSourceResolverFallsBackWhenTheSocketOwnerIsUnavailable() async {
+        let resolver = MacOSFlowSourceResolver(
+            socketLocator: FixedProcessSocketLocator(processIdentifier: nil),
+            applicationInspector: FixedProcessApplicationInspector(application: nil)
+        )
+
+        let source = await resolver.resolveSource(
+            clientEndpoint: NetworkEndpoint(host: "::1", port: 54_321),
+            proxyEndpoint: NetworkEndpoint(host: "::1", port: 9_090)
+        )
+
+        XCTAssertEqual(source.kind, .desktopProxy)
+        XCTAssertEqual(source.label, "Desktop proxy")
+        XCTAssertEqual(source.clientAddress, "[::1]:54321")
+        XCTAssertNil(source.application)
+    }
+
+    func testLibprocSocketLocatorFindsTheCurrentProcessLocalConnection() throws {
+        let connection = try LocalTCPConnection()
+        defer { connection.close() }
+
+        let processIdentifier = LibprocProcessSocketLocator().processIdentifier(
+            clientPort: connection.clientPort,
+            proxyPort: connection.serverPort
+        )
+
+        XCTAssertEqual(processIdentifier, getpid())
+    }
+
     private func makeProvider() -> KeychainCertificateProvider {
         KeychainCertificateProvider(
             configuration: .init(
@@ -244,6 +298,113 @@ final class ProxyLensPlatformTests: XCTestCase {
 
     private func parseCertificate(_ data: Data) throws -> Certificate {
         try Certificate(pemEncoded: String(decoding: data, as: UTF8.self))
+    }
+}
+
+private struct FixedProcessSocketLocator: ProcessSocketLocating {
+    let processIdentifier: pid_t?
+
+    func processIdentifier(clientPort _: UInt16, proxyPort _: UInt16) -> pid_t? {
+        processIdentifier
+    }
+}
+
+private struct FixedProcessApplicationInspector: ProcessApplicationInspecting {
+    let application: FlowApplication?
+
+    func application(processIdentifier _: pid_t) -> FlowApplication? {
+        application
+    }
+}
+
+private final class LocalTCPConnection {
+    let clientPort: UInt16
+    let serverPort: UInt16
+
+    private let listener: Int32
+    private let client: Int32
+    private let accepted: Int32
+
+    init() throws {
+        let listenerDescriptor = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard listenerDescriptor >= 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listenerDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0, Darwin.listen(listenerDescriptor, 1) == 0 else {
+            Darwin.close(listenerDescriptor)
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+
+        var addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(listenerDescriptor, $0, &addressLength)
+            }
+        }
+        guard nameResult == 0 else {
+            Darwin.close(listenerDescriptor)
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        let resolvedServerPort = UInt16(bigEndian: address.sin_port)
+
+        let clientDescriptor = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard clientDescriptor >= 0 else {
+            Darwin.close(listenerDescriptor)
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        let connectResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(clientDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connectResult == 0 else {
+            Darwin.close(clientDescriptor)
+            Darwin.close(listenerDescriptor)
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+
+        let acceptedDescriptor = Darwin.accept(listenerDescriptor, nil, nil)
+        guard acceptedDescriptor >= 0 else {
+            Darwin.close(clientDescriptor)
+            Darwin.close(listenerDescriptor)
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+
+        var clientAddress = sockaddr_in()
+        addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let clientNameResult = withUnsafeMutablePointer(to: &clientAddress) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(clientDescriptor, $0, &addressLength)
+            }
+        }
+        guard clientNameResult == 0 else {
+            Darwin.close(acceptedDescriptor)
+            Darwin.close(clientDescriptor)
+            Darwin.close(listenerDescriptor)
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        listener = listenerDescriptor
+        client = clientDescriptor
+        accepted = acceptedDescriptor
+        serverPort = resolvedServerPort
+        clientPort = UInt16(bigEndian: clientAddress.sin_port)
+    }
+
+    func close() {
+        Darwin.close(accepted)
+        Darwin.close(client)
+        Darwin.close(listener)
     }
 }
 
