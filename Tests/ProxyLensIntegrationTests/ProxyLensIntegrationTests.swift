@@ -805,6 +805,103 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
     }
 
+    func testTrafficConsoleCentersWindowTitleAndHidesInspectorWithoutSelection() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 12,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        XCTAssertNil(viewModel.snapshot.selectedFlowID)
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ProxyLens"
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        defer {
+            window.orderOut(nil)
+            window.contentViewController = nil
+        }
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+
+        let detailSplit = try XCTUnwrap(
+            Self.descendant(
+                of: NSSplitView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.split.detail" }
+            )
+        )
+        let flowPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.flows" }
+            )
+        )
+        let inspectorPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.inspector" }
+            )
+        )
+        XCTAssertEqual(flowPane.frame.height, detailSplit.bounds.height, accuracy: 1)
+        XCTAssertTrue(inspectorPane.visibleRect.isEmpty)
+
+        let titlebarRoot = try XCTUnwrap(window.contentView?.superview)
+        let centeredTitle = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: titlebarRoot,
+                matching: { $0.accessibilityIdentifier() == "window.title.centered" }
+            )
+        )
+        let titleFrame = centeredTitle.convert(centeredTitle.bounds, to: titlebarRoot)
+        XCTAssertEqual(titleFrame.midX, titlebarRoot.bounds.midX, accuracy: 1)
+
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowID == flow.id
+                && !inspectorPane.visibleRect.isEmpty
+                && inspectorPane.frame.height >= 240
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            flowPane.frame.height / detailSplit.bounds.height,
+            0.36,
+            accuracy: 0.05
+        )
+
+        viewModel.selectFlow(nil)
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowID == nil
+                && inspectorPane.visibleRect.isEmpty
+                && abs(flowPane.frame.height - detailSplit.bounds.height) <= 1
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(flowPane.frame.height, detailSplit.bounds.height, accuracy: 1)
+        XCTAssertTrue(inspectorPane.visibleRect.isEmpty)
+    }
+
     func testTrafficConsoleRendersSplitMessageInspector() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),

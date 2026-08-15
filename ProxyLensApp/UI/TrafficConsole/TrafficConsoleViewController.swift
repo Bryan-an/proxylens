@@ -10,14 +10,23 @@ final class TrafficConsoleViewController: NSViewController {
     private let inspectorController: InspectorViewController
     private let splitViewController = NSSplitViewController()
     private let detailSplitViewController = NSSplitViewController()
+    private let windowTitleToolbarDelegate = WindowTitleToolbarDelegate()
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
     private let certificateButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
+    private lazy var inspectorSplitViewItem: NSSplitViewItem = {
+        let item = NSSplitViewItem(viewController: inspectorController)
+        item.minimumThickness = 240
+        item.preferredThicknessFraction = 0.64
+        item.canCollapse = true
+        return item
+    }()
     private var snapshotCancellable: AnyCancellable?
     private var didSetInitialDetailPosition = false
+    private weak var configuredWindow: NSWindow?
 
     init(viewModel: TrafficConsoleViewModel) {
         self.viewModel = viewModel
@@ -149,8 +158,15 @@ final class TrafficConsoleViewController: NSViewController {
     override func viewDidAppear() {
         super.viewDidAppear()
 
+        configureWindowTitle()
+        setInitialDetailPositionIfNeeded()
+    }
+
+    private func setInitialDetailPositionIfNeeded() {
         let detailSplitView = detailSplitViewController.splitView
         guard !didSetInitialDetailPosition,
+            view.window != nil,
+            !inspectorSplitViewItem.isCollapsed,
             detailSplitViewController.splitViewItems.count == 2,
             detailSplitView.bounds.height > 0
         else {
@@ -159,6 +175,22 @@ final class TrafficConsoleViewController: NSViewController {
 
         didSetInitialDetailPosition = true
         detailSplitView.setPosition(detailSplitView.bounds.height * 0.36, ofDividerAt: 0)
+    }
+
+    private func configureWindowTitle() {
+        guard let window = view.window, configuredWindow !== window else {
+            return
+        }
+
+        let toolbar = NSToolbar(identifier: WindowTitleToolbarDelegate.toolbarIdentifier)
+        toolbar.delegate = windowTitleToolbarDelegate
+        toolbar.allowsUserCustomization = false
+        toolbar.displayMode = .iconOnly
+        toolbar.centeredItemIdentifiers = [WindowTitleToolbarDelegate.titleItemIdentifier]
+        window.titleVisibility = .hidden
+        window.toolbarStyle = .unifiedCompact
+        window.toolbar = toolbar
+        configuredWindow = window
     }
 
     private func configureSplitView() {
@@ -190,13 +222,8 @@ final class TrafficConsoleViewController: NSViewController {
             NSLayoutConstraint.Priority.defaultLow.rawValue + 1
         )
 
-        let inspector = NSSplitViewItem(viewController: inspectorController)
-        inspector.minimumThickness = 240
-        inspector.preferredThicknessFraction = 0.64
-        inspector.canCollapse = true
-
         detailSplitViewController.addSplitViewItem(flows)
-        detailSplitViewController.addSplitViewItem(inspector)
+        detailSplitViewController.addSplitViewItem(inspectorSplitViewItem)
         splitViewController.addSplitViewItem(sources)
         splitViewController.addSplitViewItem(workspace)
     }
@@ -205,6 +232,18 @@ final class TrafficConsoleViewController: NSViewController {
         sourceController.render(snapshot)
         flowController.render(snapshot)
         inspectorController.render(snapshot)
+
+        let shouldCollapseInspector = snapshot.selectedFlowID == nil
+        if inspectorSplitViewItem.isCollapsed != shouldCollapseInspector {
+            inspectorSplitViewItem.isCollapsed = shouldCollapseInspector
+        }
+        if !shouldCollapseInspector,
+            !didSetInitialDetailPosition,
+            view.window != nil
+        {
+            view.layoutSubtreeIfNeeded()
+            setInitialDetailPositionIfNeeded()
+        }
 
         let presentation = CaptureControlPresentation(snapshot.capture)
         statusImage.image = NSImage(
@@ -277,6 +316,41 @@ final class TrafficConsoleViewController: NSViewController {
                 }
             }
         }
+    }
+}
+
+@MainActor
+private final class WindowTitleToolbarDelegate: NSObject, NSToolbarDelegate {
+    static let toolbarIdentifier = NSToolbar.Identifier("com.proxylens.window-title")
+    static let titleItemIdentifier = NSToolbarItem.Identifier("com.proxylens.window-title.label")
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [Self.titleItemIdentifier]
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [Self.titleItemIdentifier]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        guard itemIdentifier == Self.titleItemIdentifier else {
+            return nil
+        }
+
+        let titleField = NSTextField(labelWithString: "ProxyLens")
+        titleField.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleField.setAccessibilityIdentifier("window.title.centered")
+
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = "ProxyLens"
+        item.paletteLabel = "ProxyLens"
+        item.view = titleField
+        item.visibilityPriority = .high
+        return item
     }
 }
 
