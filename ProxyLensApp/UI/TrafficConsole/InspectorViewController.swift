@@ -300,17 +300,27 @@ final class InspectorViewController: NSViewController {
             syntaxLanguage = .httpHeaders
         } else if pane.selectedSectionSegment == 2 {
             content = Self.bodyText(message.json, editable: false)
-            highlightedRange = Self.bodyContentRange(message.json)
+            highlightedRange = Self.bodyContentRange(message.json, editable: false)
             if highlightedRange != nil {
                 syntaxLanguage = .json
             }
         } else if let editedBody = editedBodies[messageIndex] {
             content = editedBody
+            syntaxLanguage = InspectorSyntaxHighlighter.language(
+                forContentType: message.bodyContentType
+            )
         } else {
+            let isEditable = isEditingMessage(messageIndex)
             content = Self.bodyText(
                 message.body,
-                editable: isEditingMessage(messageIndex)
+                editable: isEditable
             )
+            highlightedRange = Self.bodyContentRange(message.body, editable: isEditable)
+            if highlightedRange != nil {
+                syntaxLanguage = InspectorSyntaxHighlighter.language(
+                    forContentType: message.bodyContentType
+                )
+            }
         }
 
         pane.display(
@@ -431,11 +441,17 @@ final class InspectorViewController: NSViewController {
         }
     }
 
-    private static func bodyContentRange(_ body: TrafficBodyPresentation) -> NSRange? {
+    private static func bodyContentRange(
+        _ body: TrafficBodyPresentation,
+        editable: Bool
+    ) -> NSRange? {
         guard case .content(let metadata, let value) = body else {
             return nil
         }
-        return NSRange(location: metadata.utf16.count + 2, length: value.utf16.count)
+        return NSRange(
+            location: editable ? 0 : metadata.utf16.count + 2,
+            length: value.utf16.count
+        )
     }
 }
 

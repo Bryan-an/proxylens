@@ -110,6 +110,7 @@ struct TrafficMessageInspection: Equatable, Sendable {
     let headers: String
     let body: TrafficBodyPresentation
     let json: TrafficBodyPresentation
+    let bodyContentType: String?
 }
 
 struct TrafficFlowInspection: Equatable, Sendable {

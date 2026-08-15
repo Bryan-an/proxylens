@@ -483,11 +483,11 @@ P0 application source attribution currently implemented:
 - The source sidebar groups desktop-proxy flows under **Apps**, uses installed application icons when a bundle path is available, and supports selecting an application as a traffic filter. Attribution failures degrade to **Unknown App** without interrupting capture. Imported and replayed flows are not presented as locally attributed applications.
 - This is best-effort attribution for explicit local proxy connections. It does not require a privileged helper or `NetworkExtension`, and short-lived sockets or processes hidden by operating-system permissions may remain unknown.
 
-P0 JSON inspection currently implemented:
+P0 body inspection currently implemented:
 
 - `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
 - gzip, x-gzip, and deflate are unwrapped only for this derived view, and decoded output is bounded to 1 MB. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
-- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens and HTTP header names/values while leaving captured and edited text unchanged. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, XML/form/Protobuf, and JSONPath remain out of scope.
+- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens, HTTP header names/values, XML in the raw Body tab, and URL-encoded form keys/values while leaving captured and edited text unchanged. Raw Body highlighting uses the declared content type; `application/xml`, `text/xml`, and `+xml` types are treated as XML, and `application/x-www-form-urlencoded` is treated as form data. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, decoded XML/form tabs, multipart parsing, Protobuf, and JSONPath remain out of scope.
 
 P0 export currently implemented:
 

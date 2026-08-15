@@ -556,7 +556,8 @@ final class TrafficConsoleViewModel: ObservableObject {
                     title: $0.title,
                     headers: $0.headers,
                     body: request.body,
-                    json: request.json
+                    json: request.json,
+                    bodyContentType: $0.bodyContentType
                 )
             },
             response: inspection.response.map {
@@ -564,7 +565,8 @@ final class TrafficConsoleViewModel: ObservableObject {
                     title: $0.title,
                     headers: $0.headers,
                     body: response.body,
-                    json: response.json
+                    json: response.json,
+                    bodyContentType: $0.bodyContentType
                 )
             },
             rules: inspection.rules,
@@ -596,14 +598,16 @@ final class TrafficConsoleViewModel: ObservableObject {
                 title: "Request",
                 headers: requestHeadersText(flow.request),
                 body: initialBody(flow.request.body, emptyMessage: "This request has no body."),
-                json: initialJSON(flow.request.body)
+                json: initialJSON(flow.request.body),
+                bodyContentType: flow.request.body?.contentType
             ),
             response: flow.response.map {
                 TrafficMessageInspection(
                     title: "Response",
                     headers: responseHeadersText($0),
                     body: initialBody($0.body, emptyMessage: "This response has no body."),
-                    json: initialJSON($0.body)
+                    json: initialJSON($0.body),
+                    bodyContentType: $0.body?.contentType
                 )
             },
             rules: rulesText(flow.ruleTraces),

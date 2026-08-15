@@ -37,10 +37,34 @@ enum InspectorSyntaxPalette {
 
 /// Produces presentation-only colors for inspector text without changing captured bytes.
 enum InspectorSyntaxHighlighter {
-    enum Language {
+    enum Language: Equatable {
         case plainText
         case httpHeaders
         case json
+        case urlEncodedForm
+        case xml
+    }
+
+    static func language(forContentType contentType: String?) -> Language {
+        guard
+            let mediaType = contentType?
+                .split(separator: ";", maxSplits: 1)
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        else {
+            return .plainText
+        }
+
+        if mediaType == "application/x-www-form-urlencoded" {
+            return .urlEncodedForm
+        }
+        if mediaType == "application/xml" || mediaType == "text/xml"
+            || mediaType.hasSuffix("+xml")
+        {
+            return .xml
+        }
+        return .plainText
     }
 
     static func highlight(
@@ -87,6 +111,62 @@ enum InspectorSyntaxHighlighter {
                 }
                 result.addAttribute(.foregroundColor, value: color, range: match.range)
             }
+        case .urlEncodedForm:
+            urlEncodedFormPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match, match.numberOfRanges == 3 else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.key,
+                    range: match.range(at: 1)
+                )
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.string,
+                    range: match.range(at: 2)
+                )
+            }
+        case .xml:
+            xmlTagPattern.enumerateMatches(in: text, range: syntaxRange) { tag, _, _ in
+                guard let tag else { return }
+                if let element = xmlElementPattern.firstMatch(in: text, range: tag.range) {
+                    result.addAttribute(
+                        .foregroundColor,
+                        value: InspectorSyntaxPalette.key,
+                        range: element.range(at: 1)
+                    )
+                }
+                xmlAttributePattern.enumerateMatches(in: text, range: tag.range) {
+                    attribute, _, _ in
+                    guard let attribute, attribute.numberOfRanges == 4 else { return }
+                    result.addAttribute(
+                        .foregroundColor,
+                        value: InspectorSyntaxPalette.number,
+                        range: attribute.range(at: 1)
+                    )
+                    result.addAttribute(
+                        .foregroundColor,
+                        value: InspectorSyntaxPalette.string,
+                        range: attribute.range(at: 3)
+                    )
+                }
+            }
+            xmlEntityPattern.enumerateMatches(in: text, range: syntaxRange) { match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.literal,
+                    range: match.range
+                )
+            }
+            xmlMarkupPattern.enumerateMatches(in: text, range: syntaxRange) { match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.literal,
+                    range: match.range
+                )
+            }
         }
 
         return result
@@ -100,5 +180,30 @@ enum InspectorSyntaxHighlighter {
     private static let jsonPattern = try! NSRegularExpression(
         pattern:
             #"("(?:\\.|[^"\\])*")(?=\s*:)|("(?:\\.|[^"\\])*")|(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(?:true|false|null)\b"#
+    )
+
+    private static let urlEncodedFormPattern = try! NSRegularExpression(
+        pattern: #"([^=&\r\n]+)=([^&\r\n]*)"#
+    )
+
+    private static let xmlElementPattern = try! NSRegularExpression(
+        pattern: #"</?\s*([A-Za-z_][A-Za-z0-9_.:-]*)"#
+    )
+
+    private static let xmlTagPattern = try! NSRegularExpression(
+        pattern: #"<(?![!?])(?:[^"'<>]|"[^"]*"|'[^']*')+>"#
+    )
+
+    private static let xmlAttributePattern = try! NSRegularExpression(
+        pattern: #"\s([A-Za-z_][A-Za-z0-9_.:-]*)(\s*=\s*)((?:"[^"]*")|(?:'[^']*'))"#
+    )
+
+    private static let xmlEntityPattern = try! NSRegularExpression(
+        pattern: #"&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z_][A-Za-z0-9_.:-]*);"#
+    )
+
+    private static let xmlMarkupPattern = try! NSRegularExpression(
+        pattern: #"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>"#,
+        options: [.dotMatchesLineSeparators]
     )
 }

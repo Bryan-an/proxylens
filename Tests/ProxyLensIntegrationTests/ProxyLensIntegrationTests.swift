@@ -1405,6 +1405,95 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(keyColor, InspectorSyntaxPalette.key)
     }
 
+    func testInspectorHighlightsBodyFromDeclaredContentTypeWithoutColoringMetadata() throws {
+        let requestXML = #"<root id="42"/>"#
+        let responseForm = "name=ProxyLens&enabled=true"
+        let flowID = FlowID()
+        let snapshot = TrafficConsoleSnapshot(
+            capture: .stopped,
+            workspaceWarning: nil,
+            certificateTrust: nil,
+            allFlowCount: 1,
+            applications: [],
+            domains: [],
+            selectedSource: .allTraffic,
+            displayFilter: .all,
+            visibleRows: [],
+            selectedFlowID: flowID,
+            inspection: TrafficFlowInspection(
+                flowID: flowID,
+                title: "POST https://api.example.com/v1",
+                request: TrafficMessageInspection(
+                    title: "Request",
+                    headers: "POST /v1 HTTP/1.1\nHost: api.example.com",
+                    body: .content(metadata: "15 B • application/xml", value: requestXML),
+                    json: .none("This body is not JSON."),
+                    bodyContentType: "application/xml"
+                ),
+                response: TrafficMessageInspection(
+                    title: "Response",
+                    headers: "HTTP/1.1 200 OK",
+                    body: .content(
+                        metadata: "27 B • application/x-www-form-urlencoded",
+                        value: responseForm
+                    ),
+                    json: .none("This body is not JSON."),
+                    bodyContentType: "application/x-www-form-urlencoded"
+                ),
+                rules: "No rules applied to this flow.",
+                breakpoint: nil
+            )
+        )
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(snapshot)
+
+        for (prefix, token, expectedColor) in [
+            ("request", "root", InspectorSyntaxPalette.key),
+            ("response", "name", InspectorSyntaxPalette.key),
+            ("response", "ProxyLens", InspectorSyntaxPalette.string)
+        ] {
+            let sectionSelector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSSegmentedControl.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "inspector.\(prefix).section"
+                    }
+                )
+            )
+            sectionSelector.selectedSegment = 1
+            sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+            let inspector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSTextView.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "inspector.\(prefix).content"
+                    }
+                )
+            )
+            let tokenRange = try XCTUnwrap(inspector.string.range(of: token))
+            let tokenColor =
+                inspector.textStorage?.attribute(
+                    .foregroundColor,
+                    at: NSRange(tokenRange, in: inspector.string).location,
+                    effectiveRange: nil
+                ) as? NSColor
+            XCTAssertEqual(tokenColor, expectedColor)
+            XCTAssertEqual(
+                inspector.textStorage?.attribute(
+                    .foregroundColor,
+                    at: 0,
+                    effectiveRange: nil
+                ) as? NSColor,
+                .textColor
+            )
+        }
+    }
+
     func testInspectorDoesNotCopyJSONTabIntoBodyEditsDuringBreakpoint() throws {
         let compact = #"{"z":1,"a":2}"#
         let pretty = "{\n  \"a\" : 2,\n  \"z\" : 1\n}"
@@ -1427,7 +1516,8 @@ final class ProxyLensIntegrationTests: XCTestCase {
                     title: "Request",
                     headers: "POST /v1 HTTP/1.1\nHost: api.example.com",
                     body: .content(metadata: "11 B", value: compact),
-                    json: .content(metadata: "11 B", value: pretty)
+                    json: .content(metadata: "11 B", value: pretty),
+                    bodyContentType: "application/json"
                 ),
                 response: nil,
                 rules: "No rules applied to this flow.",
