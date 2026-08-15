@@ -25,6 +25,7 @@ final class TrafficConsoleViewController: NSViewController {
         return item
     }()
     private var snapshotCancellable: AnyCancellable?
+    private var didSetInitialSourcePosition = false
     private var didSetInitialDetailPosition = false
     private var rememberedInspectorHeight: CGFloat?
     private weak var configuredWindow: NSWindow?
@@ -160,7 +161,28 @@ final class TrafficConsoleViewController: NSViewController {
         super.viewDidAppear()
 
         configureWindowTitle()
+        setInitialSourcePositionIfNeeded()
         setInitialDetailPositionIfNeeded()
+    }
+
+    private func setInitialSourcePositionIfNeeded() {
+        let splitView = splitViewController.splitView
+        guard !didSetInitialSourcePosition,
+            view.window != nil,
+            splitViewController.splitViewItems.count == 2,
+            splitView.bounds.width > 0
+        else {
+            return
+        }
+
+        didSetInitialSourcePosition = true
+        let sourceItem = splitViewController.splitViewItems[0]
+        let preferredWidth = splitView.bounds.width * sourceItem.preferredThicknessFraction
+        let sourceWidth = min(
+            max(preferredWidth, sourceItem.minimumThickness),
+            sourceItem.maximumThickness
+        )
+        splitView.setPosition(sourceWidth, ofDividerAt: 0)
     }
 
     private func setInitialDetailPositionIfNeeded() {
@@ -244,13 +266,13 @@ final class TrafficConsoleViewController: NSViewController {
 
         let sources = NSSplitViewItem(sidebarWithViewController: sourceController)
         sources.minimumThickness = 170
-        sources.maximumThickness = 320
-        sources.preferredThicknessFraction = 0.18
+        sources.maximumThickness = 400
+        sources.preferredThicknessFraction = 0.22
         sources.canCollapse = true
 
         let workspace = NSSplitViewItem(viewController: detailSplitViewController)
         workspace.minimumThickness = 640
-        workspace.preferredThicknessFraction = 0.82
+        workspace.preferredThicknessFraction = 0.78
 
         let flows = NSSplitViewItem(viewController: flowController)
         flows.minimumThickness = 180

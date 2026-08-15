@@ -1066,6 +1066,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
 
         let sourcePaneFrame = sourcePane.convert(sourcePane.bounds, to: controller.view)
         let workspaceFrame = detailSplit.convert(detailSplit.bounds, to: controller.view)
+        XCTAssertGreaterThanOrEqual(sourcePaneFrame.width, 250)
         XCTAssertGreaterThanOrEqual(sourcePaneFrame.minY, workspaceFrame.minY)
         XCTAssertLessThanOrEqual(sourcePaneFrame.maxY, workspaceFrame.maxY)
         XCTAssertGreaterThan(sourcePaneFrame.height, workspaceFrame.height * 0.9)
