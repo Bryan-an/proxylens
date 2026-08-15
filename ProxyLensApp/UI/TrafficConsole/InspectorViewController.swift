@@ -101,11 +101,20 @@ final class InspectorViewController: NSViewController, NSTextViewDelegate {
         breakpointStack.spacing = 8
         breakpointStack.alignment = .centerY
 
-        let selectorStack = NSStackView(views: [messageSelector, sectionSelector])
+        messageSelector.setContentHuggingPriority(.required, for: .horizontal)
+        sectionSelector.setContentHuggingPriority(.required, for: .horizontal)
+
+        let selectorSpacer = NSView()
+        selectorSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        selectorSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let selectorStack = NSStackView(
+            views: [messageSelector, sectionSelector, selectorSpacer]
+        )
         selectorStack.translatesAutoresizingMaskIntoConstraints = false
         selectorStack.orientation = .horizontal
         selectorStack.spacing = 8
-        selectorStack.distribution = .fillEqually
+        selectorStack.distribution = .fill
 
         let container = NSView()
         container.addSubview(titleField)

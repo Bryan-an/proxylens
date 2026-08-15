@@ -755,7 +755,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
     }
 
-    func testTrafficConsoleRendersPopulatedThreePaneWorkspace() async throws {
+    func testTrafficConsoleRendersSourceSidebarOverStackedRequestListAndInspector() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
             eventSource: FinishedEventSource(),
@@ -838,6 +838,79 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "traffic.filter.clear" }
             )
         )
+        let rootSplit = try XCTUnwrap(
+            Self.descendant(
+                of: NSSplitView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.split.root" }
+            )
+        )
+        let detailSplit = try XCTUnwrap(
+            Self.descendant(
+                of: NSSplitView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.split.detail" }
+            )
+        )
+        XCTAssertTrue(rootSplit.isVertical)
+        XCTAssertFalse(detailSplit.isVertical)
+        let sourcePane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.sources" }
+            )
+        )
+        let flowPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.flows" }
+            )
+        )
+        let inspectorPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.inspector" }
+            )
+        )
+
+        let sourcePaneFrame = sourcePane.convert(sourcePane.bounds, to: controller.view)
+        let workspaceFrame = detailSplit.convert(detailSplit.bounds, to: controller.view)
+        XCTAssertGreaterThanOrEqual(sourcePaneFrame.minY, workspaceFrame.minY)
+        XCTAssertLessThanOrEqual(sourcePaneFrame.maxY, workspaceFrame.maxY)
+        XCTAssertGreaterThan(sourcePaneFrame.height, workspaceFrame.height * 0.9)
+
+        let flowPaneFrame = flowPane.convert(flowPane.bounds, to: controller.view)
+        let inspectorPaneFrame = inspectorPane.convert(inspectorPane.bounds, to: controller.view)
+        XCTAssertLessThanOrEqual(sourcePaneFrame.maxX, flowPaneFrame.minX)
+        XCTAssertEqual(flowPaneFrame.minX, inspectorPaneFrame.minX, accuracy: 1)
+        XCTAssertEqual(flowPaneFrame.width, inspectorPaneFrame.width, accuracy: 1)
+        XCTAssertGreaterThan(flowPaneFrame.minY, inspectorPaneFrame.minY)
+        XCTAssertLessThanOrEqual(inspectorPaneFrame.maxY, flowPaneFrame.minY)
+        XCTAssertEqual(
+            flowPaneFrame.height / workspaceFrame.height,
+            0.36,
+            accuracy: 0.05
+        )
+
+        let messageSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.message" }
+            )
+        )
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.section" }
+            )
+        )
+        XCTAssertLessThan(messageSelector.frame.width, inspectorPaneFrame.width / 2)
+        XCTAssertLessThan(sectionSelector.frame.width, inspectorPaneFrame.width / 2)
         for identifier in [
             "traffic.filter.method",
             "traffic.filter.status",
@@ -873,7 +946,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertGreaterThan(png.count, 10_000)
 
         let attachment = XCTAttachment(data: png, uniformTypeIdentifier: "public.png")
-        attachment.name = "ProxyLens populated traffic console"
+        attachment.name = "ProxyLens stacked traffic workspace"
         attachment.lifetime = .keepAlways
         add(attachment)
         window.orderOut(nil)

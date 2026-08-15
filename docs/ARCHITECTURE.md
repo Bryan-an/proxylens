@@ -412,7 +412,7 @@ Use SwiftUI for:
 
 Use AppKit for the traffic workspace:
 
-- `NSSplitViewController` for the three-pane layout.
+- Nested `NSSplitViewController` instances for a full-height source sidebar beside a request list stacked above the content inspector.
 - `NSOutlineView` for grouping by source, host, or domain.
 - `NSTableView` for sortable flows and high-volume updates.
 - `NSTextView` for raw request/response editing and replay.

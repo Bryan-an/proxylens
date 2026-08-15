@@ -9,6 +9,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let flowController: FlowTableViewController
     private let inspectorController: InspectorViewController
     private let splitViewController = NSSplitViewController()
+    private let detailSplitViewController = NSSplitViewController()
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
     private let certificateButton = NSButton()
@@ -16,6 +17,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
     private var snapshotCancellable: AnyCancellable?
+    private var didSetInitialDetailPosition = false
 
     init(viewModel: TrafficConsoleViewModel) {
         self.viewModel = viewModel
@@ -144,9 +146,32 @@ final class TrafficConsoleViewController: NSViewController {
         }
     }
 
+    override func viewDidAppear() {
+        super.viewDidAppear()
+
+        let detailSplitView = detailSplitViewController.splitView
+        guard !didSetInitialDetailPosition,
+            detailSplitViewController.splitViewItems.count == 2,
+            detailSplitView.bounds.height > 0
+        else {
+            return
+        }
+
+        didSetInitialDetailPosition = true
+        detailSplitView.setPosition(detailSplitView.bounds.height * 0.36, ofDividerAt: 0)
+    }
+
     private func configureSplitView() {
         splitViewController.splitView.isVertical = true
         splitViewController.splitView.dividerStyle = .thin
+        splitViewController.splitView.setAccessibilityIdentifier("traffic.split.root")
+
+        detailSplitViewController.splitView.isVertical = false
+        detailSplitViewController.splitView.dividerStyle = .thin
+        detailSplitViewController.splitView.setAccessibilityIdentifier("traffic.split.detail")
+        sourceController.view.setAccessibilityIdentifier("traffic.pane.sources")
+        flowController.view.setAccessibilityIdentifier("traffic.pane.flows")
+        inspectorController.view.setAccessibilityIdentifier("traffic.pane.inspector")
 
         let sources = NSSplitViewItem(sidebarWithViewController: sourceController)
         sources.minimumThickness = 170
@@ -154,21 +179,26 @@ final class TrafficConsoleViewController: NSViewController {
         sources.preferredThicknessFraction = 0.18
         sources.canCollapse = true
 
+        let workspace = NSSplitViewItem(viewController: detailSplitViewController)
+        workspace.minimumThickness = 640
+        workspace.preferredThicknessFraction = 0.82
+
         let flows = NSSplitViewItem(viewController: flowController)
-        flows.minimumThickness = 420
-        flows.preferredThicknessFraction = 0.5
+        flows.minimumThickness = 180
+        flows.preferredThicknessFraction = 0.36
         flows.holdingPriority = NSLayoutConstraint.Priority(
             NSLayoutConstraint.Priority.defaultLow.rawValue + 1
         )
 
         let inspector = NSSplitViewItem(viewController: inspectorController)
-        inspector.minimumThickness = 300
-        inspector.preferredThicknessFraction = 0.32
+        inspector.minimumThickness = 240
+        inspector.preferredThicknessFraction = 0.64
         inspector.canCollapse = true
 
+        detailSplitViewController.addSplitViewItem(flows)
+        detailSplitViewController.addSplitViewItem(inspector)
         splitViewController.addSplitViewItem(sources)
-        splitViewController.addSplitViewItem(flows)
-        splitViewController.addSplitViewItem(inspector)
+        splitViewController.addSplitViewItem(workspace)
     }
 
     private func render(_ snapshot: TrafficConsoleSnapshot) {
