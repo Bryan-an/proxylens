@@ -24,7 +24,9 @@
 		D12D1930AFFC6F304E1E311C /* ProxyLensPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 4BA26ACD4944A3F84274EAF3 /* ProxyLensPersistence */; };
 		E2ADD2C913BA3F1C77422AB3 /* SourceListViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA8306A5410C88C25029B8B2 /* SourceListViewController.swift */; };
 		E71EF203BB3608CDB20BB228 /* CertificateTrustView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AE0BEE39E9A130D9B186A1E /* CertificateTrustView.swift */; };
+		EBAD3832AD7D9319D09637A5 /* InspectorSyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E12CC40779A6FCE6502DDAF /* InspectorSyntaxHighlighter.swift */; };
 		EE3A98841B72146F45F0B436 /* TrafficConsoleViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D28AC7F10EA69837809C4FFD /* TrafficConsoleViewModel.swift */; };
+		F54AA97088095502C3ED139A /* InspectorSyntaxHighlighterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD3F594423C38E94C9B9171B /* InspectorSyntaxHighlighterTests.swift */; };
 		FA792C2FA4A58DD1F3A4199A /* TrafficConsoleViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5431991724785D72596AB045 /* TrafficConsoleViewController.swift */; };
 		FD2D0BEA2060B361193FE458 /* InspectorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD2DD7A3E5DBFDEBDAAB8019 /* InspectorViewController.swift */; };
 /* End PBXBuildFile section */
@@ -49,6 +51,7 @@
 /* Begin PBXFileReference section */
 		07B2D15FC28073283A671F99 /* ProxyLensIntegrationTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ProxyLensIntegrationTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		0D5BA0765D03EAF524893CFC /* ProxyLensUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyLensUITests.swift; sourceTree = "<group>"; };
+		0E12CC40779A6FCE6502DDAF /* InspectorSyntaxHighlighter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InspectorSyntaxHighlighter.swift; sourceTree = "<group>"; };
 		24F1B0636038D75081A25CB1 /* TrafficConsoleModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficConsoleModels.swift; sourceTree = "<group>"; };
 		3C4C2E7B48C286D7CB4F53ED /* TrafficDisplayFilter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficDisplayFilter.swift; sourceTree = "<group>"; };
 		485699450B3F68111CF42269 /* ProxyLensApplication */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensApplication; path = Packages/ProxyLensApplication; sourceTree = SOURCE_ROOT; };
@@ -59,6 +62,7 @@
 		743A909ABF3FCA97B1C842A4 /* ProxyLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyLensApp.swift; sourceTree = "<group>"; };
 		7A5B8979CB766DA0883293A7 /* FlowTableViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowTableViewController.swift; sourceTree = "<group>"; };
 		857CBA8B74A3413E49C76FF0 /* ProxyLensUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ProxyLensUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		AD3F594423C38E94C9B9171B /* InspectorSyntaxHighlighterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InspectorSyntaxHighlighterTests.swift; sourceTree = "<group>"; };
 		B56F3F9C9B942B5BC3B2D5B1 /* ProxyLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProxyLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C0611AF5853FFCC3AA99B0E1 /* ProxyLensCapture */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensCapture; path = Packages/ProxyLensCapture; sourceTree = SOURCE_ROOT; };
 		C19617C5B9D59052C996587E /* ProxyLensPersistence */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensPersistence; path = Packages/ProxyLensPersistence; sourceTree = SOURCE_ROOT; };
@@ -153,6 +157,7 @@
 			isa = PBXGroup;
 			children = (
 				7A5B8979CB766DA0883293A7 /* FlowTableViewController.swift */,
+				0E12CC40779A6FCE6502DDAF /* InspectorSyntaxHighlighter.swift */,
 				CD2DD7A3E5DBFDEBDAAB8019 /* InspectorViewController.swift */,
 				DA8306A5410C88C25029B8B2 /* SourceListViewController.swift */,
 				24F1B0636038D75081A25CB1 /* TrafficConsoleModels.swift */,
@@ -168,6 +173,7 @@
 		ADA7BF26DCA280261421A468 /* ProxyLensIntegrationTests */ = {
 			isa = PBXGroup;
 			children = (
+				AD3F594423C38E94C9B9171B /* InspectorSyntaxHighlighterTests.swift */,
 				5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */,
 			);
 			path = ProxyLensIntegrationTests;
@@ -314,6 +320,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F54AA97088095502C3ED139A /* InspectorSyntaxHighlighterTests.swift in Sources */,
 				02AA3E5CF2D3A84FDEDDA24C /* ProxyLensIntegrationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -334,6 +341,7 @@
 				E71EF203BB3608CDB20BB228 /* CertificateTrustView.swift in Sources */,
 				4ACD51C43F2085541678203F /* CompositionRoot.swift in Sources */,
 				1F3E0E42713E3EC5C701FC01 /* FlowTableViewController.swift in Sources */,
+				EBAD3832AD7D9319D09637A5 /* InspectorSyntaxHighlighter.swift in Sources */,
 				FD2D0BEA2060B361193FE458 /* InspectorViewController.swift in Sources */,
 				CB41E5410231F1DF25E24FB3 /* ProxyLensApp.swift in Sources */,
 				E2ADD2C913BA3F1C77422AB3 /* SourceListViewController.swift in Sources */,

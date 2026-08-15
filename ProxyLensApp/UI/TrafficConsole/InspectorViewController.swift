@@ -293,10 +293,17 @@ final class InspectorViewController: NSViewController {
         }
 
         let content: String
+        var syntaxLanguage = InspectorSyntaxHighlighter.Language.plainText
+        var highlightedRange: NSRange?
         if pane.selectedSectionSegment == 0 {
             content = editedHeaders[messageIndex] ?? message.headers
+            syntaxLanguage = .httpHeaders
         } else if pane.selectedSectionSegment == 2 {
             content = Self.bodyText(message.json, editable: false)
+            highlightedRange = Self.bodyContentRange(message.json)
+            if highlightedRange != nil {
+                syntaxLanguage = .json
+            }
         } else if let editedBody = editedBodies[messageIndex] {
             content = editedBody
         } else {
@@ -308,6 +315,8 @@ final class InspectorViewController: NSViewController {
 
         pane.display(
             content,
+            language: syntaxLanguage,
+            highlightedRange: highlightedRange,
             isEditable: isEditingSection(
                 pane.selectedSectionSegment,
                 messageIndex: messageIndex
@@ -421,6 +430,13 @@ final class InspectorViewController: NSViewController {
             return "\(metadata)\n\nUnable to read captured bytes:\n\(message)"
         }
     }
+
+    private static func bodyContentRange(_ body: TrafficBodyPresentation) -> NSRange? {
+        guard case .content(let metadata, let value) = body else {
+            return nil
+        }
+        return NSRange(location: metadata.utf16.count + 2, length: value.utf16.count)
+    }
 }
 
 @MainActor
@@ -531,11 +547,19 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
 
     func display(
         _ content: String,
+        language: InspectorSyntaxHighlighter.Language = .plainText,
+        highlightedRange: NSRange? = nil,
         isEditable: Bool,
         isSelectorEnabled: Bool
     ) {
         isUpdatingContent = true
-        textView.string = content
+        textView.textStorage?.setAttributedString(
+            InspectorSyntaxHighlighter.highlight(
+                content,
+                as: language,
+                in: highlightedRange
+            )
+        )
         textView.isEditable = isEditable
         sectionSelector.isEnabled = isSelectorEnabled
         displayedSectionSegment = sectionSelector.selectedSegment

@@ -1197,6 +1197,14 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertTrue(inspector.string.contains(#""z""#))
         XCTAssertTrue(inspector.string.contains("\n"))
         XCTAssertFalse(inspector.string.contains(compact))
+        let keyRange = try XCTUnwrap(inspector.string.range(of: #""a""#))
+        let keyColor =
+            inspector.textStorage?.attribute(
+                .foregroundColor,
+                at: NSRange(keyRange, in: inspector.string).location,
+                effectiveRange: nil
+            ) as? NSColor
+        XCTAssertEqual(keyColor, .systemBlue)
     }
 
     func testInspectorDoesNotCopyJSONTabIntoBodyEditsDuringBreakpoint() throws {
