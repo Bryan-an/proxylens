@@ -70,7 +70,12 @@ public actor KeychainCertificateProvider: CertificateProvider {
                 fromDERData: try Self.derData(for: cachedRootMaterial.certificate)
             )
         }
-        guard let data = try loadRootCertificateData() else {
+        guard let secKey = try loadRootPrivateKey() else {
+            return nil
+        }
+        let privateKey = try Self.certificatePrivateKey(from: secKey)
+        let publicKeyHash = Self.publicKeyHash(for: privateKey.publicKey)
+        guard let data = try loadRootCertificateData(publicKeyHash: publicKeyHash) else {
             return nil
         }
         return try Self.secCertificate(fromDERData: data)
@@ -106,6 +111,7 @@ public actor KeychainCertificateProvider: CertificateProvider {
     /// Removes only the CA material owned by this provider configuration.
     /// This supports reversible onboarding and isolated test cleanup.
     public func removeCertificateAuthority() async throws {
+        let publicKeyHash = try storedRootPublicKeyHash()
         try deleteKeychainItem(
             query: [
                 kSecClass: kSecClassKey,
@@ -114,10 +120,12 @@ public actor KeychainCertificateProvider: CertificateProvider {
             ],
             operation: "remove root private key"
         )
-        try deleteKeychainItem(
-            query: rootCertificateQuery,
-            operation: "remove root certificate"
-        )
+        if let publicKeyHash {
+            try deleteKeychainItem(
+                query: rootCertificateQuery(publicKeyHash: publicKeyHash),
+                operation: "remove root certificate"
+            )
+        }
         try deleteKeychainItem(
             query: rootCertificateDataQuery,
             operation: "remove root certificate data"
@@ -136,14 +144,27 @@ public actor KeychainCertificateProvider: CertificateProvider {
         return attributes[kSecAttrIsExtractable] as? Bool ?? false
     }
 
+    func rootPrivateKeyTrustsCurrentApplicationForTesting() throws -> Bool {
+        guard let key = try loadRootPrivateKey() else {
+            return false
+        }
+        let (_, signingACLs) = try signingAccess(for: key)
+        let currentApplication = try Self.currentTrustedApplication()
+        let currentApplicationData = try Self.trustedApplicationData(currentApplication)
+        return try signingACLsContain(
+            applicationData: currentApplicationData,
+            signingACLs: signingACLs
+        )
+    }
+
     private var rootPrivateKeyTag: Data {
         Data("\(configuration.keychainNamespace).root-ca.private-key".utf8)
     }
 
-    private var rootCertificateQuery: [CFString: Any] {
+    private func rootCertificateQuery(publicKeyHash: Data) -> [CFString: Any] {
         [
             kSecClass: kSecClassCertificate,
-            kSecAttrLabel: "\(configuration.keychainNamespace).root-ca.certificate"
+            kSecAttrPublicKeyHash: publicKeyHash
         ]
     }
 
@@ -161,14 +182,11 @@ public actor KeychainCertificateProvider: CertificateProvider {
         }
 
         let secKey = try loadRootPrivateKey() ?? createRootPrivateKey()
-        let privateKey: Certificate.PrivateKey
-        do {
-            privateKey = try Certificate.PrivateKey(secKey)
-        } catch {
-            throw CertificateProviderError.keyGeneration(error.localizedDescription)
-        }
+        try ensureCurrentApplicationCanSign(with: secKey)
+        let privateKey = try Self.certificatePrivateKey(from: secKey)
+        let publicKeyHash = Self.publicKeyHash(for: privateKey.publicKey)
 
-        if let storedData = try loadRootCertificateData(),
+        if let storedData = try loadRootCertificateData(publicKeyHash: publicKeyHash),
             let storedCertificate = try? Self.certificate(fromDERData: storedData),
             storedCertificate.publicKey == privateKey.publicKey,
             storedCertificate.notValidAfter > Date().addingTimeInterval(30 * 24 * 60 * 60)
@@ -183,7 +201,10 @@ public actor KeychainCertificateProvider: CertificateProvider {
         }
 
         let material = try makeRootMaterial(privateKey: privateKey, now: Date())
-        try saveRootCertificateData(try Self.derData(for: material.certificate))
+        try saveRootCertificateData(
+            try Self.derData(for: material.certificate),
+            publicKeyHash: publicKeyHash
+        )
         cachedRootMaterial = material
         return material
     }
@@ -287,13 +308,188 @@ public actor KeychainCertificateProvider: CertificateProvider {
         return (result as! SecKey)
     }
 
+    private struct ACLContents {
+        let applications: [SecTrustedApplication]
+        let description: String
+        let promptSelector: SecKeychainPromptSelector
+    }
+
+    private func storedRootPublicKeyHash() throws -> Data? {
+        if let cachedRootMaterial {
+            return Self.publicKeyHash(for: cachedRootMaterial.privateKey.publicKey)
+        }
+        guard let key = try loadRootPrivateKey() else {
+            return nil
+        }
+        return Self.publicKeyHash(for: try Self.certificatePrivateKey(from: key).publicKey)
+    }
+
+    private func makeRootKeyAccess() throws -> SecAccess {
+        let currentApplication = try Self.currentTrustedApplication()
+        var access: SecAccess?
+        let status = SecAccessCreate(
+            configuration.rootCommonName as CFString,
+            [currentApplication] as CFArray,
+            &access
+        )
+        guard status == errSecSuccess, let access else {
+            throw CertificateProviderError.keychain(
+                operation: "create root private key access",
+                status: status
+            )
+        }
+        return access
+    }
+
+    private func ensureCurrentApplicationCanSign(with key: SecKey) throws {
+        let (access, signingACLs) = try signingAccess(for: key)
+        let currentApplication = try Self.currentTrustedApplication()
+        let currentApplicationData = try Self.trustedApplicationData(currentApplication)
+        guard
+            try !signingACLsContain(
+                applicationData: currentApplicationData,
+                signingACLs: signingACLs
+            )
+        else {
+            return
+        }
+
+        let signingACL = signingACLs[0]
+        let contents = try aclContents(signingACL)
+        let applications = contents.applications + [currentApplication]
+        let updateStatus = SecACLSetContents(
+            signingACL,
+            applications as CFArray,
+            contents.description as CFString,
+            contents.promptSelector
+        )
+        guard updateStatus == errSecSuccess else {
+            throw CertificateProviderError.keychain(
+                operation: "update root private key signing access",
+                status: updateStatus
+            )
+        }
+        let saveStatus = SecKeychainItemSetAccess(Self.keychainItem(from: key), access)
+        guard saveStatus == errSecSuccess else {
+            throw CertificateProviderError.keychain(
+                operation: "save root private key signing access",
+                status: saveStatus
+            )
+        }
+    }
+
+    private func signingAccess(for key: SecKey) throws -> (SecAccess, [SecACL]) {
+        var access: SecAccess?
+        let accessStatus = SecKeychainItemCopyAccess(Self.keychainItem(from: key), &access)
+        guard accessStatus == errSecSuccess, let access else {
+            throw CertificateProviderError.keychain(
+                operation: "load root private key access",
+                status: accessStatus
+            )
+        }
+        guard
+            let signingACLs =
+                SecAccessCopyMatchingACLList(access, kSecACLAuthorizationSign) as? [SecACL],
+            !signingACLs.isEmpty
+        else {
+            throw CertificateProviderError.keychain(
+                operation: "load root private key signing access",
+                status: errSecItemNotFound
+            )
+        }
+        return (access, signingACLs)
+    }
+
+    private func signingACLsContain(
+        applicationData: Data,
+        signingACLs: [SecACL]
+    ) throws -> Bool {
+        for signingACL in signingACLs {
+            let contents = try aclContents(signingACL)
+            for application in contents.applications
+            where try Self.trustedApplicationData(application) == applicationData {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func aclContents(_ acl: SecACL) throws -> ACLContents {
+        var applicationList: CFArray?
+        var description: CFString?
+        var promptSelector = SecKeychainPromptSelector()
+        let status = SecACLCopyContents(
+            acl,
+            &applicationList,
+            &description,
+            &promptSelector
+        )
+        guard status == errSecSuccess else {
+            throw CertificateProviderError.keychain(
+                operation: "load root private key signing ACL",
+                status: status
+            )
+        }
+        return ACLContents(
+            applications: applicationList as? [SecTrustedApplication] ?? [],
+            description: description as String? ?? configuration.rootCommonName,
+            promptSelector: promptSelector
+        )
+    }
+
+    private static func currentTrustedApplication() throws -> SecTrustedApplication {
+        var application: SecTrustedApplication?
+        let status = SecTrustedApplicationCreateFromPath(nil, &application)
+        guard status == errSecSuccess, let application else {
+            throw CertificateProviderError.keychain(
+                operation: "identify current application",
+                status: status
+            )
+        }
+        return application
+    }
+
+    private static func trustedApplicationData(
+        _ application: SecTrustedApplication
+    ) throws -> Data {
+        var data: CFData?
+        let status = SecTrustedApplicationCopyData(application, &data)
+        guard status == errSecSuccess, let data else {
+            throw CertificateProviderError.keychain(
+                operation: "read trusted application identity",
+                status: status
+            )
+        }
+        return data as Data
+    }
+
+    private static func certificatePrivateKey(from key: SecKey) throws
+        -> Certificate.PrivateKey
+    {
+        do {
+            return try Certificate.PrivateKey(key)
+        } catch {
+            throw CertificateProviderError.keyGeneration(error.localizedDescription)
+        }
+    }
+
+    private static func publicKeyHash(for publicKey: Certificate.PublicKey) -> Data {
+        Data(SubjectKeyIdentifier(hash: publicKey).keyIdentifier)
+    }
+
+    private static func keychainItem(from key: SecKey) -> SecKeychainItem {
+        // Legacy Keychain ACL APIs model stored keys as SecKeychainItem.
+        unsafeBitCast(key, to: SecKeychainItem.self)
+    }
+
     private func createRootPrivateKey() throws -> SecKey {
-        let privateAttributes: [CFString: Any] = [
+        var privateAttributes: [CFString: Any] = [
             kSecAttrIsPermanent: true,
             kSecAttrApplicationTag: rootPrivateKeyTag,
             kSecAttrIsExtractable: false,
             kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
+        privateAttributes[kSecAttrAccess] = try makeRootKeyAccess()
         let attributes: [CFString: Any] = [
             kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits: 256,
@@ -313,9 +509,9 @@ public actor KeychainCertificateProvider: CertificateProvider {
         return key
     }
 
-    private func loadRootCertificateData() throws -> Data? {
+    private func loadRootCertificateData(publicKeyHash: Data) throws -> Data? {
         let data = try copyKeychainData(
-            query: rootCertificateQuery,
+            query: rootCertificateQuery(publicKeyHash: publicKeyHash),
             operation: "load root certificate"
         )
         if data != nil {
@@ -327,12 +523,12 @@ public actor KeychainCertificateProvider: CertificateProvider {
         return data
     }
 
-    private func saveRootCertificateData(_ data: Data) throws {
+    private func saveRootCertificateData(_ data: Data, publicKeyHash: Data) throws {
         guard let certificate = SecCertificateCreateWithData(nil, data as CFData) else {
             throw CertificateProviderError.malformedStoredCertificate
         }
         try deleteKeychainItem(
-            query: rootCertificateQuery,
+            query: rootCertificateQuery(publicKeyHash: publicKeyHash),
             operation: "replace root certificate"
         )
         try deleteKeychainItem(
@@ -340,8 +536,10 @@ public actor KeychainCertificateProvider: CertificateProvider {
             operation: "remove leftover root certificate secret"
         )
 
-        var certificateItem = rootCertificateQuery
-        certificateItem[kSecValueRef] = certificate
+        let certificateItem: [CFString: Any] = [
+            kSecClass: kSecClassCertificate,
+            kSecValueRef: certificate
+        ]
         let certificateStatus = SecItemAdd(certificateItem as CFDictionary, nil)
         guard certificateStatus == errSecSuccess else {
             throw CertificateProviderError.keychain(

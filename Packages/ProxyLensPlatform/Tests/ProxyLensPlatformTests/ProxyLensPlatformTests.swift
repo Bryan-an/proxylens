@@ -31,6 +31,22 @@ final class ProxyLensPlatformTests: XCTestCase {
 
         try await provider.removeCertificateAuthority()
     }
+    func testRootPrivateKeyAllowsCurrentApplicationToSignWithoutPrompt() async throws {
+        let provider = makeProvider()
+
+        do {
+            _ = try await provider.rootCertificate()
+            let trustsCurrentApplication =
+                try await provider.rootPrivateKeyTrustsCurrentApplicationForTesting()
+            XCTAssertTrue(trustsCurrentApplication)
+            _ = try await provider.leafCertificate(for: "localhost")
+        } catch {
+            try? await provider.removeCertificateAuthority()
+            throw error
+        }
+
+        try await provider.removeCertificateAuthority()
+    }
 
     func testLeafCertificateIsCachedAndSignedByRoot() async throws {
         let provider = makeProvider()
@@ -138,6 +154,15 @@ final class ProxyLensPlatformTests: XCTestCase {
         try await controller.recoverInterruptedConfiguration()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: snapshotURL.path))
+    }
+    func testSystemProxyControllerCachesAuthorizationForItsLifetime() async throws {
+        let snapshotURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensSystemProxyTests-\(UUID().uuidString)")
+            .appendingPathComponent("PreviousConfiguration.plist")
+        let controller = MacOSSystemProxyController(snapshotURL: snapshotURL)
+
+        let authorizationIsCached = try await controller.authorizationIsCachedForTesting()
+        XCTAssertTrue(authorizationIsCached)
     }
 
     func testSystemProxyRecoveryFailsClosedForCorruptSnapshot() async throws {

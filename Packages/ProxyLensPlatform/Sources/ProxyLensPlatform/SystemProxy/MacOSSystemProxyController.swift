@@ -39,6 +39,16 @@ public enum SystemProxyControllerError: LocalizedError, Equatable, Sendable {
 }
 
 public actor MacOSSystemProxyController: SystemProxyController {
+    private final class AuthorizationStorage: @unchecked Sendable {
+        var reference: AuthorizationRef?
+
+        deinit {
+            if let reference {
+                AuthorizationFree(reference, [])
+            }
+        }
+    }
+
     private struct Snapshot: Codable {
         static let currentVersion = 1
 
@@ -53,6 +63,7 @@ public actor MacOSSystemProxyController: SystemProxyController {
 
     private let snapshotURL: URL
     private let fileManager: FileManager
+    private let authorizationStorage = AuthorizationStorage()
 
     public init(snapshotURL: URL, fileManager: FileManager = .default) {
         self.snapshotURL = snapshotURL.standardizedFileURL
@@ -72,10 +83,9 @@ public actor MacOSSystemProxyController: SystemProxyController {
         }
 
         // Snapshotting only reads configuration, so it must not take the write lock.
-        let session = try makePreferences()
-        defer { session.invalidate() }
+        let preferences = try makePreferences()
 
-        let snapshots = try enabledProxyProtocols(in: session.preferences).map {
+        let snapshots = try enabledProxyProtocols(in: preferences).map {
             serviceID, protocolRef in
             ServiceSnapshot(
                 serviceID: serviceID,
@@ -103,9 +113,7 @@ public actor MacOSSystemProxyController: SystemProxyController {
 
     public func apply(_ configuration: SystemProxyConfiguration) async throws {
         let snapshot = try loadSnapshot(requireExisting: true)
-        let session = try makePreferences()
-        defer { session.invalidate() }
-        let preferences = session.preferences
+        let preferences = try makePreferences()
         try lock(preferences)
         defer { SCPreferencesUnlock(preferences) }
 
@@ -150,9 +158,7 @@ public actor MacOSSystemProxyController: SystemProxyController {
 
     private func restoreSnapshot(requireExisting: Bool) throws {
         let snapshot = try loadSnapshot(requireExisting: requireExisting)
-        let session = try makePreferences()
-        defer { session.invalidate() }
-        let preferences = session.preferences
+        let preferences = try makePreferences()
         try lock(preferences)
         defer { SCPreferencesUnlock(preferences) }
 
@@ -195,40 +201,43 @@ public actor MacOSSystemProxyController: SystemProxyController {
         }
     }
 
-    /// An `SCPreferences` session paired with the authorization that keeps it writable.
+    /// Creates preferences sessions with one process-lifetime authorization.
     ///
-    /// Modifying network preferences requires an `AuthorizationRef`; without one
-    /// `SCPreferencesLock` fails with `kSCStatusAccessError` for an unprivileged app.
-    private struct PreferencesSession {
-        let preferences: SCPreferences
-        let authorization: AuthorizationRef
-
-        func invalidate() {
-            AuthorizationFree(authorization, [])
+    /// The authorization retains credentials granted by macOS, so repeated
+    /// capture cycles in the same app process do not prompt again.
+    private func makePreferences() throws -> SCPreferences {
+        let authorization = try authorizationReference()
+        guard
+            let preferences = SCPreferencesCreateWithAuthorization(
+                nil,
+                "ProxyLens" as CFString,
+                nil,
+                authorization
+            )
+        else {
+            throw SystemProxyControllerError.preferencesUnavailable(Self.lastSCError())
         }
+        return preferences
     }
 
-    private func makePreferences() throws -> PreferencesSession {
-        var authorization: AuthorizationRef?
-        let authorizationStatus = AuthorizationCreate(nil, nil, [], &authorization)
-        guard authorizationStatus == errAuthorizationSuccess, let authorization else {
-            throw SystemProxyControllerError.preferencesUnavailable(
-                "authorization could not be created (status \(authorizationStatus))"
-            )
+    private func authorizationReference() throws -> AuthorizationRef {
+        if let authorization = authorizationStorage.reference {
+            return authorization
         }
 
-        let created = SCPreferencesCreateWithAuthorization(
-            nil,
-            "ProxyLens" as CFString,
-            nil,
-            authorization
-        )
-        guard let preferences = created else {
-            let message = Self.lastSCError()
-            AuthorizationFree(authorization, [])
-            throw SystemProxyControllerError.preferencesUnavailable(message)
+        var createdAuthorization: AuthorizationRef?
+        let status = AuthorizationCreate(nil, nil, [], &createdAuthorization)
+        guard status == errAuthorizationSuccess, let createdAuthorization else {
+            throw SystemProxyControllerError.preferencesUnavailable(
+                "authorization could not be created (status \(status))"
+            )
         }
-        return PreferencesSession(preferences: preferences, authorization: authorization)
+        authorizationStorage.reference = createdAuthorization
+        return createdAuthorization
+    }
+
+    func authorizationIsCachedForTesting() throws -> Bool {
+        try authorizationReference() == authorizationReference()
     }
 
     private func lock(_ preferences: SCPreferences) throws {
