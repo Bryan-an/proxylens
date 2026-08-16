@@ -12,6 +12,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let detailSplitViewController = NSSplitViewController()
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
+    private let composeButton = NSButton()
     private let certificateButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
@@ -75,6 +76,15 @@ final class TrafficConsoleViewController: NSViewController {
         clearSessionButton.action = #selector(clearSession)
         clearSessionButton.setAccessibilityIdentifier("session.clear")
 
+        composeButton.translatesAutoresizingMaskIntoConstraints = false
+        composeButton.title = "Compose Request…"
+        composeButton.bezelStyle = .rounded
+        composeButton.target = self
+        composeButton.action = #selector(composeRequest(_:))
+        composeButton.keyEquivalent = "n"
+        composeButton.keyEquivalentModifierMask = [.command]
+        composeButton.setAccessibilityIdentifier("request.compose")
+
         certificateButton.translatesAutoresizingMaskIntoConstraints = false
         certificateButton.title = "Trust HTTPS Certificate…"
         certificateButton.bezelStyle = .rounded
@@ -87,6 +97,7 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
+        header.addSubview(composeButton)
         header.addSubview(certificateButton)
         header.addSubview(clearSessionButton)
         header.addSubview(captureButton)
@@ -100,7 +111,10 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.leadingAnchor.constraint(equalTo: statusImage.trailingAnchor, constant: 5),
             statusField.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusField.trailingAnchor.constraint(
-                lessThanOrEqualTo: certificateButton.leadingAnchor, constant: -12),
+                lessThanOrEqualTo: composeButton.leadingAnchor, constant: -12),
+            composeButton.trailingAnchor.constraint(
+                equalTo: certificateButton.leadingAnchor, constant: -8),
+            composeButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             certificateButton.trailingAnchor.constraint(
                 equalTo: clearSessionButton.leadingAnchor, constant: -8),
             certificateButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -359,6 +373,62 @@ final class TrafficConsoleViewController: NSViewController {
 
     @objc private func toggleCapture() {
         viewModel.toggleCapture()
+    }
+
+    @objc private func composeRequest(_: NSButton) {
+        Task { @MainActor in
+            await presentRequestComposer()
+        }
+    }
+
+    private func presentRequestComposer() async {
+        let editor = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: """
+                    GET https://example.com/ HTTP/1.1
+                    Accept: application/json
+                    """,
+                bodyText: "",
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        )
+        addChild(editor)
+        defer { editor.removeFromParent() }
+
+        let alert = NSAlert()
+        alert.messageText = "Compose Request"
+        alert.informativeText =
+            "Enter an absolute HTTP or HTTPS URL in the request line, then edit headers and body."
+        alert.addButton(withTitle: "Send Request")
+        let cancelButton = alert.addButton(withTitle: "Cancel")
+        cancelButton.keyEquivalent = "\u{1b}"
+        alert.accessoryView = editor.view
+        alert.window.initialFirstResponder = editor.initialFirstResponder
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        do {
+            try await viewModel.composeRequest(
+                headersText: editor.headersText,
+                bodyText: editor.bodyText.isEmpty ? nil : editor.bodyText
+            )
+        } catch {
+            let errorAlert = NSAlert(error: error)
+            if let window = view.window {
+                await errorAlert.beginSheetModal(for: window)
+            } else {
+                errorAlert.runModal()
+            }
+        }
     }
 
     @objc private func clearSession() {

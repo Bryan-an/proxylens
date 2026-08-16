@@ -503,7 +503,7 @@ Useful internal metrics include:
 - Throttling.
 - Script hooks.
 - Richer decoders and request builders.
-- Request-composer workflows; HTTP/HTTPS Repeat and Edit & Repeat are implemented.
+- Request-composer workflows; raw HTTP/HTTPS Compose, Repeat, and Edit & Repeat are implemented. cURL import, presets, and composer history remain future increments.
 - Session organization, annotations, and improved search.
 
 ### P2 — expansion beyond desktop proxying

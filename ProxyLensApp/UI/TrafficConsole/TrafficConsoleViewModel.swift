@@ -43,6 +43,7 @@ struct TrafficRequestEditDraft: Equatable, Sendable {
 protocol TrafficSessionLoading: Sendable {
     func loadWorkspace() async throws -> [Flow]
     func clearWorkspace() async throws
+    func sessionIDForNewFlow() async throws -> SessionID
 }
 
 extension SessionService: TrafficSessionLoading {}
@@ -270,6 +271,49 @@ final class TrafficConsoleViewModel: ObservableObject {
         let replayedFlow = try await requestReplayer.repeatRequest(
             flow.request,
             sessionID: flow.sessionID
+        )
+        applyReplayedFlow(replayedFlow)
+        return replayedFlow.id
+    }
+
+    @discardableResult
+    func composeRequest(headersText: String, bodyText: String?) async throws -> FlowID {
+        guard let requestReplayer else {
+            throw ProxyLensError.unsupportedOperation("Compose Request is not available")
+        }
+        guard let sessionService else {
+            throw ProxyLensError.unsupportedOperation("Workspace sessions are not available")
+        }
+
+        let request: HTTPRequest
+        if let bodyText {
+            let decodedBody = Data(bodyText.utf8)
+            guard Int64(decodedBody.count) <= maximumEditableRequestBodyBytes else {
+                throw ProxyLensError.unsupportedOperation(requestBodyEditingLimitMessage)
+            }
+            let headersOnlyRequest = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: nil
+            )
+            let encodedBody = try HTTPContentCoding.encode(
+                decodedBody,
+                contentEncoding: headersOnlyRequest.headers.firstValue(for: "Content-Encoding")
+            )
+            request = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: encodedBody
+            )
+        } else {
+            request = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: nil
+            )
+        }
+
+        let sessionID = try await sessionService.sessionIDForNewFlow()
+        let replayedFlow = try await requestReplayer.repeatRequest(
+            request,
+            sessionID: sessionID
         )
         applyReplayedFlow(replayedFlow)
         return replayedFlow.id

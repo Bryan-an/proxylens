@@ -438,11 +438,15 @@ AppKit views
 
 The view model may maintain a display projection for sorting and grouping. It hydrates that projection from `SessionService` on launch and retains the body store for inspection and export.
 
-Repeat Request and Edit & Repeat are explicit control-plane actions. `ReplayService` sends the
-captured or edited request through the core `RequestReplayClient` port, persists the returned flow
-in the original session, and exposes it to the traffic console as a new `.replay` source. The
-editor accepts a request line, headers, and UTF-8 body text. gzip, x-gzip, and deflate text bodies
-are decoded for editing and re-encoded before replay; unsupported encodings remain unchanged.
+Compose Request, Repeat Request, and Edit & Repeat are explicit control-plane actions.
+`ReplayService` sends the composed, captured, or edited request through the core
+`RequestReplayClient` port, persists the returned flow in the current workspace session, and
+exposes it to the traffic console as a new `.replay` source. A composed request requires an
+absolute HTTP or HTTPS URL because it has no captured request from which to infer an upstream.
+When the workspace is empty, `SessionService` creates a stopped local session to own the new flow.
+The editor accepts a request line, headers, and UTF-8 body text. Captured gzip, x-gzip, and
+deflate text bodies are decoded for editing and re-encoded before replay; unsupported captured
+encodings remain unchanged. A composed body may use identity, gzip, x-gzip, or deflate encoding.
 Both stored and decoded body loading are capped at 1 MiB, and edits are checked against the same
 limit before sending. Binary and larger bodies remain unchanged. The SwiftNIO adapter connects
 directly to the selected HTTP or HTTPS upstream, verifies TLS, strips hop-by-hop headers,
@@ -503,7 +507,7 @@ P0 body inspection currently implemented:
 
 - `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
 - `HTTPContentCoding` unwraps gzip, x-gzip, and deflate with a bounded decoded size for the derived JSON view and Edit & Repeat. Edited compressed text is re-encoded before replay. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
-- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens, HTTP header names/values, XML in the raw Body tab, and URL-encoded form keys/values. The Edit & Repeat window reuses the same palette, initially pretty-prints valid JSON, and refreshes highlighting after edits. Opening and sending an untouched formatted body still replays the authoritative captured bytes. Raw Body highlighting uses the declared content type; `application/xml`, `text/xml`, and `+xml` types are treated as XML, and `application/x-www-form-urlencoded` is treated as form data. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, decoded XML/form tabs, multipart parsing, Protobuf, and JSONPath remain out of scope.
+- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens, HTTP header names/values, XML in the raw Body tab, and URL-encoded form keys/values. The Compose Request and Edit & Repeat windows reuse the same palette, initially pretty-print valid JSON, and refresh body highlighting when either headers or body text changes. Opening and sending an untouched formatted captured body still replays the authoritative captured bytes. Raw Body highlighting uses the declared content type; `application/xml`, `text/xml`, and `+xml` types are treated as XML, and `application/x-www-form-urlencoded` is treated as form data. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, decoded XML/form tabs, multipart parsing, Protobuf, and JSONPath remain out of scope.
 
 P0 export currently implemented:
 

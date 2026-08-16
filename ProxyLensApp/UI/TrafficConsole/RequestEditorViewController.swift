@@ -5,7 +5,7 @@ import ProxyLensCore
 final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
     private let draft: TrafficRequestEditDraft
     private let initialBodyText: String
-    private let bodyLanguage: InspectorSyntaxHighlighter.Language
+    private var bodyLanguage: InspectorSyntaxHighlighter.Language
     private let headersTextView = NSTextView()
     private let bodyTextView = NSTextView()
     private let bodyMessageField = NSTextField(wrappingLabelWithString: "")
@@ -124,15 +124,24 @@ final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
         }
         guard textView === bodyTextView else {
             applySyntaxHighlighting(to: textView, as: .httpHeaders)
+            refreshBodyHighlighting()
             return
         }
+        refreshBodyHighlighting()
+    }
+
+    private func refreshBodyHighlighting() {
         bodyHighlightTask?.cancel()
-        bodyHighlightTask = Task { @MainActor [weak self, weak textView] in
+        bodyHighlightTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(60))
-            guard !Task.isCancelled, let self, let textView else {
+            guard !Task.isCancelled, let self else {
                 return
             }
-            self.applySyntaxHighlighting(to: textView, as: self.bodyLanguage)
+            self.bodyLanguage = Self.bodyLanguage(
+                contentType: Self.contentType(in: self.headersText),
+                bodyText: self.bodyText
+            )
+            self.applySyntaxHighlighting(to: self.bodyTextView, as: self.bodyLanguage)
         }
     }
 

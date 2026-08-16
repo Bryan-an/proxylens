@@ -21,4 +21,17 @@ public struct SessionService: Sendable {
             try await sessionStore.removeSession(sessionID: session.id)
         }
     }
+
+    /// Returns the most recent workspace session, creating a stopped session when the
+    /// workspace is empty so a standalone request has a durable local owner.
+    public func sessionIDForNewFlow() async throws -> SessionID {
+        let sessions = try await sessionStore.listSessions()
+        if let newest = sessions.max(by: { $0.startedAt < $1.startedAt }) {
+            return newest.id
+        }
+
+        let session = try await sessionStore.createSession()
+        try await sessionStore.stopSession(sessionID: session.id)
+        return session.id
+    }
 }

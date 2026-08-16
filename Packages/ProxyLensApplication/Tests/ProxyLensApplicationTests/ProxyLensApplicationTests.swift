@@ -533,6 +533,41 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertTrue(remainingSessions.isEmpty)
     }
 
+    func testSessionServiceReusesTheNewestSessionAndCreatesOneForAnEmptyWorkspace()
+        async throws
+    {
+        let recorder = CallRecorder()
+        let createdSessionID = SessionID()
+        let sessionStore = RecordingSessionStore(
+            sessionID: createdSessionID,
+            recorder: recorder
+        )
+        let olderSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let newerSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        await sessionStore.seed(session: olderSession, flows: [])
+        await sessionStore.seed(session: newerSession, flows: [])
+        let service = SessionService(sessionStore: sessionStore)
+
+        let reusedSessionID = try await service.sessionIDForNewFlow()
+
+        XCTAssertEqual(reusedSessionID, newerSession.id)
+
+        try await service.clearWorkspace()
+        let newSessionID = try await service.sessionIDForNewFlow()
+
+        XCTAssertEqual(newSessionID, createdSessionID)
+        let createdSession = await sessionStore.loadSession(sessionID: createdSessionID)
+        XCTAssertEqual(createdSession?.state, .stopped)
+        let calls = await recorder.snapshot()
+        XCTAssertEqual(Array(calls.suffix(2)), ["session.create", "session.stop"])
+    }
+
     func testCertificateTrustServiceDelegatesInstallRemoveExportAndState() async throws {
         let store = RecordingCertificateTrustStore(state: .notGenerated)
         let service = CertificateTrustService(trustStore: store)

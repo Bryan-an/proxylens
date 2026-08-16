@@ -961,6 +961,68 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
     }
 
+    func testViewModelComposesARequestIntoTheCurrentWorkspace() async throws {
+        let sessionID = SessionID()
+        let replayed = try Self.makeFlow(
+            index: 40,
+            host: "api.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let sessionService = RecordingSessionService(composeSessionID: sessionID)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer,
+            sessionService: sessionService
+        )
+        await viewModel.prepare()
+
+        let replayedID = try await viewModel.composeRequest(
+            headersText: """
+                POST https://api.example.com/v1/events HTTP/1.1
+                Content-Type: application/json
+                """,
+            bodyText: #"{"name":"ProxyLens"}"#
+        )
+
+        XCTAssertEqual(replayedID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, replayed.id)
+        let received = await replayer.receivedRequests()
+        let request = try XCTUnwrap(received.first?.request)
+        XCTAssertEqual(request.method, .post)
+        XCTAssertEqual(request.url.absoluteString, "https://api.example.com/v1/events")
+        XCTAssertEqual(request.body?.inlineData, Data(#"{"name":"ProxyLens"}"#.utf8))
+        XCTAssertEqual(
+            request.headers.firstValue(for: "Content-Length"),
+            "20"
+        )
+        XCTAssertEqual(received.first?.sessionID, sessionID)
+        let composeSessionRequestCount = await sessionService.composeSessionRequestCount()
+        XCTAssertEqual(composeSessionRequestCount, 1)
+
+        do {
+            try await viewModel.composeRequest(
+                headersText: "GET /relative HTTP/1.1\nHost: api.example.com",
+                bodyText: nil
+            )
+            XCTFail("Expected a relative composed target to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Invalid HTTP message: A composed request must use an absolute HTTP or HTTPS URL"
+            )
+        }
+        let requestsAfterInvalidInput = await replayer.receivedRequests()
+        let sessionsAfterInvalidInput = await sessionService.composeSessionRequestCount()
+        XCTAssertEqual(requestsAfterInvalidInput.count, 1)
+        XCTAssertEqual(sessionsAfterInvalidInput, 1)
+    }
+
     func testViewModelRepeatsAFlowAndSelectsTheVisibleReplayResult() async throws {
         let original = try Self.makeFlow(
             index: 41,
@@ -1286,6 +1348,18 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertNil(title)
         XCTAssertEqual(window.titleVisibility, .hidden)
         XCTAssertNil(window.toolbar)
+
+        let composeButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "request.compose" }
+            )
+        )
+        XCTAssertEqual(composeButton.title, "Compose Request…")
+        XCTAssertEqual(composeButton.action, NSSelectorFromString("composeRequest:"))
+        XCTAssertEqual(composeButton.keyEquivalent, "n")
+        XCTAssertEqual(composeButton.keyEquivalentModifierMask, [.command])
 
         viewModel.selectFlow(flow.id)
         try await waitUntil {
@@ -2247,10 +2321,17 @@ private actor RecordingSessionService: TrafficSessionLoading {
     private var flows: [Flow]
     private var didClear = false
     private let loadError: (any Error)?
+    private let composeSessionID: SessionID
+    private var composeSessionRequests = 0
 
-    init(flows: [Flow] = [], loadError: (any Error)? = nil) {
+    init(
+        flows: [Flow] = [],
+        loadError: (any Error)? = nil,
+        composeSessionID: SessionID = SessionID()
+    ) {
         self.flows = flows
         self.loadError = loadError
+        self.composeSessionID = composeSessionID
     }
 
     func loadWorkspace() throws -> [Flow] {
@@ -2265,8 +2346,17 @@ private actor RecordingSessionService: TrafficSessionLoading {
         didClear = true
     }
 
+    func sessionIDForNewFlow() -> SessionID {
+        composeSessionRequests += 1
+        return composeSessionID
+    }
+
     func cleared() -> Bool {
         didClear
+    }
+
+    func composeSessionRequestCount() -> Int {
+        composeSessionRequests
     }
 }
 

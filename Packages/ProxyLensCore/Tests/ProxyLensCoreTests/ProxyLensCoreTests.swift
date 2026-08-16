@@ -845,6 +845,48 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertEqual(parsedResponse.body?.inlineData, Data("created".utf8))
     }
 
+    func testHTTPMessageTextParsesAComposedAbsoluteRequestWithoutAnOriginal() throws {
+        let request = try HTTPMessageText.parseRequest(
+            headersText: """
+                POST https://api.example.com/v1/events?source=compose HTTP/1.1
+                Content-Type: application/json
+                """,
+            body: Data(#"{"ok":true}"#.utf8)
+        )
+
+        XCTAssertEqual(request.method, .post)
+        XCTAssertEqual(
+            request.url.absoluteString,
+            "https://api.example.com/v1/events?source=compose"
+        )
+        XCTAssertEqual(
+            request.rawTarget,
+            "https://api.example.com/v1/events?source=compose"
+        )
+        XCTAssertEqual(request.headers.firstValue(for: "Content-Length"), "11")
+        XCTAssertEqual(request.body?.inlineData, Data(#"{"ok":true}"#.utf8))
+
+        XCTAssertThrowsError(
+            try HTTPMessageText.parseRequest(
+                headersText: "GET /v1/events HTTP/1.1\nHost: api.example.com",
+                body: nil
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .invalidHTTPMessage(
+                    "A composed request must use an absolute HTTP or HTTPS URL"
+                )
+            )
+        }
+        XCTAssertThrowsError(
+            try HTTPMessageText.parseRequest(
+                headersText: "GET https:/missing-host HTTP/1.1",
+                body: nil
+            )
+        )
+    }
+
     func testHTTPMessageTextRejectsAnInvalidEditedRequestMethod() throws {
         let original = HTTPRequest(
             method: .get,
