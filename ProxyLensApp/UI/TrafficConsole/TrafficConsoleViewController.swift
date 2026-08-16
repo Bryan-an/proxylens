@@ -14,6 +14,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let clearSessionButton = NSButton()
     private let composeButton = NSButton()
     private let certificateButton = NSButton()
+    private let sourceToggleButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
@@ -21,6 +22,14 @@ final class TrafficConsoleViewController: NSViewController {
         let item = NSSplitViewItem(viewController: inspectorController)
         item.minimumThickness = 240
         item.preferredThicknessFraction = 0.64
+        item.canCollapse = true
+        return item
+    }()
+    private lazy var sourceSplitViewItem: NSSplitViewItem = {
+        let item = NSSplitViewItem(sidebarWithViewController: sourceController)
+        item.minimumThickness = 170
+        item.maximumThickness = 400
+        item.preferredThicknessFraction = 0.22
         item.canCollapse = true
         return item
     }()
@@ -50,6 +59,21 @@ final class TrafficConsoleViewController: NSViewController {
         let appTitle = NSTextField(labelWithString: "ProxyLens")
         appTitle.translatesAutoresizingMaskIntoConstraints = false
         appTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+
+        sourceToggleButton.translatesAutoresizingMaskIntoConstraints = false
+        sourceToggleButton.image = NSImage(
+            systemSymbolName: "sidebar.left",
+            accessibilityDescription: "Hide Source List"
+        )
+        sourceToggleButton.imagePosition = .imageOnly
+        sourceToggleButton.bezelStyle = .texturedRounded
+        sourceToggleButton.isBordered = false
+        sourceToggleButton.target = self
+        sourceToggleButton.action = #selector(toggleSourceList)
+        sourceToggleButton.keyEquivalent = "s"
+        sourceToggleButton.keyEquivalentModifierMask = [.control, .command]
+        sourceToggleButton.setAccessibilityIdentifier("sourceList.toggle")
+        updateSourceTogglePresentation()
 
         statusImage.translatesAutoresizingMaskIntoConstraints = false
         statusImage.symbolConfiguration = NSImage.SymbolConfiguration(
@@ -94,6 +118,7 @@ final class TrafficConsoleViewController: NSViewController {
 
         let header = NSView()
         header.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(sourceToggleButton)
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
@@ -102,7 +127,12 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(clearSessionButton)
         header.addSubview(captureButton)
         NSLayoutConstraint.activate([
-            appTitle.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 12),
+            sourceToggleButton.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 8),
+            sourceToggleButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            sourceToggleButton.widthAnchor.constraint(equalToConstant: 28),
+            sourceToggleButton.heightAnchor.constraint(equalToConstant: 28),
+            appTitle.leadingAnchor.constraint(
+                equalTo: sourceToggleButton.trailingAnchor, constant: 6),
             appTitle.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusImage.leadingAnchor.constraint(equalTo: appTitle.trailingAnchor, constant: 16),
             statusImage.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -182,6 +212,7 @@ final class TrafficConsoleViewController: NSViewController {
         let splitView = splitViewController.splitView
         guard !didSetInitialSourcePosition,
             view.window != nil,
+            !sourceSplitViewItem.isCollapsed,
             splitViewController.splitViewItems.count == 2,
             splitView.bounds.width > 0
         else {
@@ -189,11 +220,10 @@ final class TrafficConsoleViewController: NSViewController {
         }
 
         didSetInitialSourcePosition = true
-        let sourceItem = splitViewController.splitViewItems[0]
-        let preferredWidth = splitView.bounds.width * sourceItem.preferredThicknessFraction
+        let preferredWidth = splitView.bounds.width * sourceSplitViewItem.preferredThicknessFraction
         let sourceWidth = min(
-            max(preferredWidth, sourceItem.minimumThickness),
-            sourceItem.maximumThickness
+            max(preferredWidth, sourceSplitViewItem.minimumThickness),
+            sourceSplitViewItem.maximumThickness
         )
         splitView.setPosition(sourceWidth, ofDividerAt: 0)
     }
@@ -271,12 +301,6 @@ final class TrafficConsoleViewController: NSViewController {
         flowController.view.setAccessibilityIdentifier("traffic.pane.flows")
         inspectorController.view.setAccessibilityIdentifier("traffic.pane.inspector")
 
-        let sources = NSSplitViewItem(sidebarWithViewController: sourceController)
-        sources.minimumThickness = 170
-        sources.maximumThickness = 400
-        sources.preferredThicknessFraction = 0.22
-        sources.canCollapse = true
-
         let workspace = NSSplitViewItem(viewController: detailSplitViewController)
         workspace.minimumThickness = 640
         workspace.preferredThicknessFraction = 0.78
@@ -290,8 +314,19 @@ final class TrafficConsoleViewController: NSViewController {
 
         detailSplitViewController.addSplitViewItem(flows)
         detailSplitViewController.addSplitViewItem(inspectorSplitViewItem)
-        splitViewController.addSplitViewItem(sources)
+        splitViewController.addSplitViewItem(sourceSplitViewItem)
         splitViewController.addSplitViewItem(workspace)
+    }
+
+    @objc private func toggleSourceList() {
+        sourceSplitViewItem.isCollapsed.toggle()
+        updateSourceTogglePresentation()
+    }
+
+    private func updateSourceTogglePresentation() {
+        let title = sourceSplitViewItem.isCollapsed ? "Show Source List" : "Hide Source List"
+        sourceToggleButton.setAccessibilityLabel(title)
+        sourceToggleButton.toolTip = "\(title) (⌃⌘S)"
     }
 
     private func render(_ snapshot: TrafficConsoleSnapshot) {

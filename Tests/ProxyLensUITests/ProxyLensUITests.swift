@@ -30,6 +30,9 @@ final class ProxyLensUITests: XCTestCase {
         XCTAssertTrue(app.buttons["capture.toggle"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["session.clear"].exists)
         XCTAssertTrue(app.buttons["certificate.trust"].exists)
+        let sourceToggle = app.buttons["sourceList.toggle"]
+        XCTAssertTrue(sourceToggle.exists)
+        XCTAssertEqual(sourceToggle.label, "Hide Source List")
         XCTAssertTrue(app.searchFields["traffic.search"].exists)
         XCTAssertTrue(app.popUpButtons["traffic.filter.method"].exists)
         XCTAssertTrue(app.popUpButtons["traffic.filter.status"].exists)
@@ -47,6 +50,11 @@ final class ProxyLensUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["All Traffic"].exists)
         XCTAssertTrue(app.staticTexts["Domains"].exists)
         XCTAssertTrue(app.staticTexts["No traffic captured yet"].exists)
+
+        sourceToggle.click()
+        XCTAssertEqual(sourceToggle.label, "Show Source List")
+        sourceToggle.click()
+        XCTAssertEqual(sourceToggle.label, "Hide Source List")
 
         let searchField = app.searchFields["traffic.search"]
         searchField.click()

@@ -73,6 +73,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let requestReplayer: (any TrafficRequestReplaying)?
     private let sessionService: (any TrafficSessionLoading)?
     private let certificateTrust: (any TrafficCertificateTrusting)?
+    private let pinnedDomainsStore: any TrafficPinnedDomainsStoring
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -99,7 +100,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         exportService: ExportService? = nil,
         requestReplayer: (any TrafficRequestReplaying)? = nil,
         sessionService: (any TrafficSessionLoading)? = nil,
-        certificateTrust: (any TrafficCertificateTrusting)? = nil
+        certificateTrust: (any TrafficCertificateTrusting)? = nil,
+        pinnedDomainsStore: any TrafficPinnedDomainsStoring = InMemoryTrafficPinnedDomainsStore()
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -113,6 +115,10 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.requestReplayer = requestReplayer
         self.sessionService = sessionService
         self.certificateTrust = certificateTrust
+        self.pinnedDomainsStore = pinnedDomainsStore
+        for domain in pinnedDomainsStore.domains {
+            store.setPinnedDomain(domain, isPinned: true)
+        }
     }
 
     deinit {
@@ -166,6 +172,12 @@ final class TrafficConsoleViewModel: ObservableObject {
             bodyTask?.cancel()
             inspection = .empty
         }
+        publishSnapshot()
+    }
+
+    func setPinnedDomain(_ host: String, isPinned: Bool) {
+        store.setPinnedDomain(host, isPinned: isPinned)
+        pinnedDomainsStore.save(store.pinnedDomainHosts)
         publishSnapshot()
     }
 

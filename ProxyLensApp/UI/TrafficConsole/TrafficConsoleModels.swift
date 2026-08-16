@@ -201,6 +201,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
     let certificateTrust: CertificateTrustState?
     let allFlowCount: Int
     let applications: [TrafficApplicationSummary]
+    let pinnedDomains: [TrafficDomainSummary]
     let domains: [TrafficDomainSummary]
     let selectedSource: TrafficSourceSelection
     let displayFilter: TrafficDisplayFilter
@@ -214,6 +215,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
         certificateTrust: nil,
         allFlowCount: 0,
         applications: [],
+        pinnedDomains: [],
         domains: [],
         selectedSource: .allTraffic,
         displayFilter: .all,
@@ -232,6 +234,7 @@ struct TrafficConsoleStore {
     private var applicationSummaries: [TrafficApplicationSummary] = []
     private var domainCounts: [String: Int] = [:]
     private var domainSummaries: [TrafficDomainSummary] = []
+    private(set) var pinnedDomainHosts: Set<String> = []
     private var visibleRows: [TrafficFlowRow] = []
     private var visibleFlowIDs: Set<FlowID> = []
     private(set) var selectedSource: TrafficSourceSelection = .allTraffic
@@ -335,6 +338,18 @@ struct TrafficConsoleStore {
         clearSelectionIfHidden()
     }
 
+    mutating func setPinnedDomain(_ host: String, isPinned: Bool) {
+        let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedHost.isEmpty else {
+            return
+        }
+        if isPinned {
+            pinnedDomainHosts.insert(normalizedHost)
+        } else {
+            pinnedDomainHosts.remove(normalizedHost)
+        }
+    }
+
     mutating func setDisplayFilter(_ filter: TrafficDisplayFilter) {
         guard displayFilter != filter else {
             return
@@ -383,6 +398,12 @@ struct TrafficConsoleStore {
             certificateTrust: certificateTrust,
             allFlowCount: flowsByID.count,
             applications: applicationSummaries,
+            pinnedDomains:
+                pinnedDomainHosts
+                .map {
+                    TrafficDomainSummary(host: $0, flowCount: domainCounts[$0] ?? 0)
+                }
+                .sorted { $0.host.localizedStandardCompare($1.host) == .orderedAscending },
             domains: domainSummaries,
             selectedSource: selectedSource,
             displayFilter: displayFilter,
