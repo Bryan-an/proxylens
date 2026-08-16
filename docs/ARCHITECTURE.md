@@ -422,6 +422,10 @@ Use AppKit for the traffic workspace:
 - `NSTextView` for raw request/response editing and replay.
 - Native responder-chain commands and keyboard shortcuts.
 
+Source List visibility is owned by the AppKit split-view controller. Pinned domain identifiers are
+local UI preferences stored in `UserDefaults`; the traffic view model projects them into every
+snapshot so a pin remains visible with a zero-flow count after the current session is cleared.
+
 The main traffic window should be managed by `MainWindowController`. SwiftUI views can be hosted inside auxiliary windows or panels without making the traffic table depend on SwiftUI rendering behavior.
 
 UI view models should be thin:

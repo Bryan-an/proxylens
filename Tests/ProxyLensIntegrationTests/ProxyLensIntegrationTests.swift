@@ -46,6 +46,58 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.visibleRows.map(\.id), [second.id])
     }
 
+    func testConsoleStoreKeepsPinnedDomainsVisibleAcrossSessionChanges() throws {
+        let api = try Self.makeFlow(index: 1, host: "api.example.com", statusCode: 200)
+        let cdn = try Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 200)
+        var store = TrafficConsoleStore()
+        store.apply([.finished(api), .finished(cdn)])
+
+        store.setPinnedDomain("cdn.example.com", isPinned: true)
+        store.setPinnedDomain("api.example.com", isPinned: true)
+
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(
+            snapshot.pinnedDomains,
+            [
+                TrafficDomainSummary(host: "api.example.com", flowCount: 1),
+                TrafficDomainSummary(host: "cdn.example.com", flowCount: 1)
+            ]
+        )
+
+        store.replaceAll([])
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(
+            snapshot.pinnedDomains,
+            [
+                TrafficDomainSummary(host: "api.example.com", flowCount: 0),
+                TrafficDomainSummary(host: "cdn.example.com", flowCount: 0)
+            ]
+        )
+
+        store.setPinnedDomain("api.example.com", isPinned: false)
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(
+            snapshot.pinnedDomains,
+            [TrafficDomainSummary(host: "cdn.example.com", flowCount: 0)]
+        )
+    }
+
+    func testPinnedDomainsStorePersistsNormalizedSortedDomains() throws {
+        let suiteName = "ProxyLensIntegrationTests.PinnedDomains.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = UserDefaultsTrafficPinnedDomainsStore(defaults: defaults)
+
+        store.save([" CDN.Example.com ", "api.example.com", ""])
+
+        XCTAssertEqual(
+            defaults.stringArray(forKey: UserDefaultsTrafficPinnedDomainsStore.defaultKey),
+            ["api.example.com", "cdn.example.com"]
+        )
+        let restored = UserDefaultsTrafficPinnedDomainsStore(defaults: defaults)
+        XCTAssertEqual(restored.domains, ["api.example.com", "cdn.example.com"])
+    }
+
     func testConsoleStoreReplaceAllResetsRowsAndKeepsFilters() throws {
         let first = try Self.makeFlow(index: 1, host: "api.example.com", statusCode: 200)
         let second = try Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 404)
@@ -1404,6 +1456,116 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(inspectorPane.frame.height, rememberedInspectorHeight, accuracy: 1)
     }
 
+    func testTrafficConsoleTogglesSourceListAndRendersPinnedDomains() async throws {
+        let pinnedDomainsStore = InMemoryTrafficPinnedDomainsStore(
+            domains: ["offline.example.com"]
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            pinnedDomainsStore: pinnedDomainsStore
+        )
+        await viewModel.prepare()
+        let flow = try Self.makeFlow(
+            index: 13,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        defer {
+            window.orderOut(nil)
+            window.contentViewController = nil
+        }
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        controller.view.layoutSubtreeIfNeeded()
+
+        let sourcePane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.sources" }
+            )
+        )
+        let sourceOutline = try XCTUnwrap(
+            Self.descendant(
+                of: NSOutlineView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.sources" }
+            )
+        )
+        let sourceToggle = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "sourceList.toggle" }
+            )
+        )
+        let sourceLabels = (0..<sourceOutline.numberOfRows).compactMap { row in
+            sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                .accessibilityLabel()
+        }
+        XCTAssertTrue(sourceLabels.contains("Pinned, 1 domain"))
+        XCTAssertTrue(sourceLabels.contains("api.example.com, 1 flow"))
+        XCTAssertTrue(sourceLabels.contains("offline.example.com, 0 flows"))
+        let apiRow = try XCTUnwrap(
+            (0..<sourceOutline.numberOfRows).first { row in
+                sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                    .accessibilityLabel() == "api.example.com, 1 flow"
+            }
+        )
+        sourceOutline.selectRowIndexes(IndexSet(integer: apiRow), byExtendingSelection: false)
+        let sourceMenu = try XCTUnwrap(sourceOutline.menu)
+        let menuDelegate = try XCTUnwrap(sourceMenu.delegate as? SourceListViewController)
+        menuDelegate.menuNeedsUpdate(sourceMenu)
+        let pinItem = try XCTUnwrap(sourceMenu.items.first)
+        XCTAssertEqual(pinItem.title, "Pin Domain")
+        XCTAssertEqual(pinItem.representedObject as? String, "api.example.com")
+        let pinAction = try XCTUnwrap(pinItem.action)
+        XCTAssertTrue(NSApp.sendAction(pinAction, to: pinItem.target, from: pinItem))
+        XCTAssertEqual(
+            viewModel.snapshot.pinnedDomains.map(\.host),
+            [
+                "api.example.com", "offline.example.com"
+            ])
+        XCTAssertEqual(
+            pinnedDomainsStore.domains,
+            ["api.example.com", "offline.example.com"]
+        )
+        let updatedSourceLabels = (0..<sourceOutline.numberOfRows).compactMap { row in
+            sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                .accessibilityLabel()
+        }
+        XCTAssertTrue(updatedSourceLabels.contains("Pinned, 2 domains"))
+        XCTAssertFalse(sourcePane.visibleRect.isEmpty)
+        XCTAssertEqual(sourceToggle.accessibilityLabel(), "Hide Source List")
+
+        sourceToggle.performClick(nil)
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertTrue(sourcePane.visibleRect.isEmpty)
+        XCTAssertEqual(sourceToggle.accessibilityLabel(), "Show Source List")
+
+        sourceToggle.performClick(nil)
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertFalse(sourcePane.visibleRect.isEmpty)
+        XCTAssertEqual(sourceToggle.accessibilityLabel(), "Hide Source List")
+    }
+
     func testTrafficConsoleRendersSplitMessageInspector() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
@@ -1971,6 +2133,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             certificateTrust: nil,
             allFlowCount: 1,
             applications: [],
+            pinnedDomains: [],
             domains: [],
             selectedSource: .allTraffic,
             displayFilter: .all,
@@ -2065,6 +2228,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             certificateTrust: nil,
             allFlowCount: 1,
             applications: [],
+            pinnedDomains: [],
             domains: [],
             selectedSource: .allTraffic,
             displayFilter: .all,

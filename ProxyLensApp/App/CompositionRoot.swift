@@ -83,7 +83,8 @@ final class CompositionRoot {
             exportService: exportService,
             requestReplayer: replayService,
             sessionService: sessionService,
-            certificateTrust: certificateTrustService
+            certificateTrust: certificateTrustService,
+            pinnedDomainsStore: UserDefaultsTrafficPinnedDomainsStore()
         )
     }
 

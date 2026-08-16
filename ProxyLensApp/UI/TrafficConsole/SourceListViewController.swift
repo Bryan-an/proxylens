@@ -2,11 +2,12 @@ import AppKit
 
 @MainActor
 final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
-    NSOutlineViewDelegate
+    NSOutlineViewDelegate, NSMenuDelegate
 {
     private let viewModel: TrafficConsoleViewModel
     private let outlineView = NSOutlineView()
     private var roots: [SourceOutlineNode] = []
+    private var pinnedDomainHosts: Set<String> = []
     private var isRendering = false
 
     init(viewModel: TrafficConsoleViewModel) {
@@ -31,6 +32,9 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         outlineView.dataSource = self
         outlineView.delegate = self
         outlineView.setAccessibilityIdentifier("traffic.sources")
+        let menu = NSMenu(title: "Source List")
+        menu.delegate = self
+        outlineView.menu = menu
 
         let scrollView = NSScrollView()
         scrollView.documentView = outlineView
@@ -43,6 +47,7 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
     func render(_ snapshot: TrafficConsoleSnapshot) {
         isRendering = true
         defer { isRendering = false }
+        pinnedDomainHosts = Set(snapshot.pinnedDomains.map(\.host))
 
         let allTraffic = SourceOutlineNode(
             id: "all-traffic",
@@ -82,12 +87,38 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
                     title: $0.host,
                     count: $0.flowCount,
                     symbolName: "network",
-                    selection: .domain($0.host)
+                    selection: .domain($0.host),
+                    domainHost: $0.host
                 )
             }
         )
-        roots = [allTraffic, applications, domains]
+        let pinned = SourceOutlineNode(
+            id: "pinned-domains",
+            title: "Pinned",
+            count: snapshot.pinnedDomains.count,
+            countSingular: "domain",
+            symbolName: "pin.fill",
+            selection: nil,
+            children: snapshot.pinnedDomains.map {
+                SourceOutlineNode(
+                    id: "pinned-domain:\($0.host)",
+                    title: $0.host,
+                    count: $0.flowCount,
+                    symbolName: "pin.fill",
+                    selection: .domain($0.host),
+                    domainHost: $0.host
+                )
+            }
+        )
+        roots = [allTraffic]
+        if !pinned.children.isEmpty {
+            roots.append(pinned)
+        }
+        roots.append(contentsOf: [applications, domains])
         outlineView.reloadData()
+        if !pinned.children.isEmpty {
+            outlineView.expandItem(pinned)
+        }
         outlineView.expandItem(applications)
         outlineView.expandItem(domains)
 
@@ -160,6 +191,38 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         }
         viewModel.selectSource(selection)
     }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
+        guard row >= 0,
+            let node = outlineView.item(atRow: row) as? SourceOutlineNode,
+            let host = node.domainHost
+        else {
+            return
+        }
+
+        let isPinned = pinnedDomainHosts.contains(host)
+        let item = NSMenuItem(
+            title: isPinned ? "Unpin Domain" : "Pin Domain",
+            action: #selector(togglePinnedDomain(_:)),
+            keyEquivalent: ""
+        )
+        item.image = NSImage(
+            systemSymbolName: isPinned ? "pin.slash" : "pin",
+            accessibilityDescription: nil
+        )
+        item.target = self
+        item.representedObject = host
+        menu.addItem(item)
+    }
+
+    @objc private func togglePinnedDomain(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        viewModel.setPinnedDomain(host, isPinned: !pinnedDomainHosts.contains(host))
+    }
 }
 
 @MainActor
@@ -171,6 +234,7 @@ private final class SourceOutlineNode: NSObject {
     let symbolName: String
     let bundlePath: String?
     let selection: TrafficSourceSelection?
+    let domainHost: String?
     let children: [SourceOutlineNode]
 
     init(
@@ -181,6 +245,7 @@ private final class SourceOutlineNode: NSObject {
         symbolName: String,
         bundlePath: String? = nil,
         selection: TrafficSourceSelection?,
+        domainHost: String? = nil,
         children: [SourceOutlineNode] = []
     ) {
         self.id = id
@@ -190,6 +255,7 @@ private final class SourceOutlineNode: NSObject {
         self.symbolName = symbolName
         self.bundlePath = bundlePath
         self.selection = selection
+        self.domainHost = domainHost
         self.children = children
     }
 }
