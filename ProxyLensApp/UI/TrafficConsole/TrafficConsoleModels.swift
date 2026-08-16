@@ -108,18 +108,77 @@ enum TrafficBodyPresentation: Equatable, Sendable {
 struct TrafficMessageInspection: Equatable, Sendable {
     let title: String
     let headers: String
+    let query: String?
     let body: TrafficBodyPresentation
     let json: TrafficBodyPresentation
     let bodyContentType: String?
+
+    init(
+        title: String,
+        headers: String,
+        query: String? = nil,
+        body: TrafficBodyPresentation,
+        json: TrafficBodyPresentation,
+        bodyContentType: String?
+    ) {
+        self.title = title
+        self.headers = headers
+        self.query = query
+        self.body = body
+        self.json = json
+        self.bodyContentType = bodyContentType
+    }
+}
+
+struct TrafficFlowSummaryInspection: Equatable, Sendable {
+    let method: String
+    let url: String
+    let statusCode: Int?
+    let statusReason: String?
+    let state: FlowState
+    let duration: TimeInterval?
+    let byteCount: Int64
+    let usesTLS: Bool
+
+    init(flow: Flow) {
+        let row = TrafficFlowRow(flow: flow)
+        method = row.method
+        url = row.fullURL
+        statusCode = row.statusCode
+        statusReason = flow.response?.reasonPhrase
+        state = row.state
+        duration = row.duration
+        byteCount = row.byteCount
+        usesTLS = row.usesTLS
+    }
 }
 
 struct TrafficFlowInspection: Equatable, Sendable {
     let flowID: FlowID?
     let title: String
+    let summary: TrafficFlowSummaryInspection?
     let request: TrafficMessageInspection?
     let response: TrafficMessageInspection?
     let rules: String
     let breakpoint: TrafficBreakpointInspection?
+
+    init(
+        flowID: FlowID?,
+        title: String,
+        summary: TrafficFlowSummaryInspection? = nil,
+        request: TrafficMessageInspection?,
+        response: TrafficMessageInspection?,
+        rules: String,
+        breakpoint: TrafficBreakpointInspection?
+    ) {
+        self.flowID = flowID
+        self.title = title
+        self.summary = summary
+        self.request = request
+        self.response = response
+        self.rules = rules
+        self.breakpoint = breakpoint
+    }
 
     static let empty = TrafficFlowInspection(
         flowID: nil,
