@@ -30,6 +30,9 @@ public enum HTTPMessageText: Sendable {
             throw ProxyLensError.invalidHTTPMessage("Request line must be METHOD target version")
         }
 
+        guard isToken(parts[0]) else {
+            throw ProxyLensError.invalidHTTPMessage("Invalid request method: \(parts[0])")
+        }
         let method = HTTPMethod(rawValue: parts[0])
         let target = parts[1]
         let version = try parseVersion(parts[2...].joined(separator: " "))
@@ -196,5 +199,19 @@ public enum HTTPMessageText: Sendable {
             result += "?\(query)"
         }
         return result
+    }
+
+    private static func isToken(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                let value = scalar.value
+                if (65...90).contains(value) || (97...122).contains(value)
+                    || (48...57).contains(value)
+                {
+                    return true
+                }
+                return [33, 35, 36, 37, 38, 39, 42, 43, 45, 46, 94, 95, 96, 124, 126]
+                    .contains(value)
+            }
     }
 }

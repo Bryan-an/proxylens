@@ -1,7 +1,124 @@
 import Foundation
 import zlib
 
-/// Compresses and inflates gzip/zlib/raw-deflate payloads for derived inspection.
+/// Applies the supported HTTP content codings while keeping decompression bounded.
+public enum HTTPContentCoding: Sendable {
+    public enum CodingError: Swift.Error, Equatable, LocalizedError, Sendable {
+        case unsupported(String)
+        case decodingFailed(String)
+        case encodingFailed(String)
+        case exceedsLimit
+
+        public var errorDescription: String? {
+            switch self {
+            case .unsupported(let encoding):
+                "Unsupported content encoding: \(encoding)"
+            case .decodingFailed(let encoding):
+                "Could not decompress \(encoding) body"
+            case .encodingFailed(let encoding):
+                "Could not compress \(encoding) body"
+            case .exceedsLimit:
+                "Decoded body exceeds the output limit"
+            }
+        }
+    }
+
+    public static func decode(
+        _ data: Data,
+        contentEncoding: String?,
+        maximumOutputByteCount: Int
+    ) throws -> Data {
+        guard let encoding = encodingToken(contentEncoding) else {
+            guard data.count <= maximumOutputByteCount else {
+                throw CodingError.exceedsLimit
+            }
+            return data
+        }
+
+        do {
+            switch encoding {
+            case "gzip", "x-gzip":
+                return try ZlibContentEncoding.decompress(
+                    data,
+                    format: .gzip,
+                    maximumOutputByteCount: maximumOutputByteCount
+                )
+            case "deflate":
+                return try inflateDeflate(data, maximumOutputByteCount: maximumOutputByteCount)
+            default:
+                throw CodingError.unsupported(encoding)
+            }
+        } catch ZlibContentEncoding.Error.exceedsLimit {
+            throw CodingError.exceedsLimit
+        } catch let error as CodingError {
+            throw error
+        } catch {
+            throw CodingError.decodingFailed(encoding)
+        }
+    }
+
+    public static func encode(_ data: Data, contentEncoding: String?) throws -> Data {
+        guard let encoding = encodingToken(contentEncoding) else {
+            return data
+        }
+
+        do {
+            switch encoding {
+            case "gzip", "x-gzip":
+                return try ZlibContentEncoding.compress(data, format: .gzip)
+            case "deflate":
+                return try ZlibContentEncoding.compress(data, format: .zlib)
+            default:
+                throw CodingError.unsupported(encoding)
+            }
+        } catch let error as CodingError {
+            throw error
+        } catch {
+            throw CodingError.encodingFailed(encoding)
+        }
+    }
+
+    private static func inflateDeflate(
+        _ data: Data,
+        maximumOutputByteCount: Int
+    ) throws -> Data {
+        do {
+            return try ZlibContentEncoding.decompress(
+                data,
+                format: .zlib,
+                maximumOutputByteCount: maximumOutputByteCount
+            )
+        } catch ZlibContentEncoding.Error.exceedsLimit {
+            throw CodingError.exceedsLimit
+        } catch {
+            return try ZlibContentEncoding.decompress(
+                data,
+                format: .rawDeflate,
+                maximumOutputByteCount: maximumOutputByteCount
+            )
+        }
+    }
+
+    private static func encodingToken(_ contentEncoding: String?) -> String? {
+        guard let contentEncoding else {
+            return nil
+        }
+        let tokens = contentEncoding.split(separator: ",", omittingEmptySubsequences: false)
+            .compactMap { raw -> String? in
+                let token = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if token.isEmpty || token == "identity" {
+                    return nil
+                }
+                return token
+            }
+        guard !tokens.isEmpty else {
+            return nil
+        }
+        return tokens.count == 1 ? tokens[0] : tokens.joined(separator: ", ")
+    }
+}
+
+/// Compresses and inflates gzip/zlib/raw-deflate payloads for bounded content coding.
 enum ZlibContentEncoding {
     enum Format {
         case gzip

@@ -28,10 +28,17 @@ protocol TrafficBodyReading: Sendable {
 extension FlowBodyReader: TrafficBodyReading {}
 
 protocol TrafficRequestReplaying: Sendable {
-    func repeatRequest(_ flow: Flow) async throws -> Flow
+    func repeatRequest(_ request: HTTPRequest, sessionID: SessionID) async throws -> Flow
 }
 
 extension ReplayService: TrafficRequestReplaying {}
+
+struct TrafficRequestEditDraft: Equatable, Sendable {
+    let headersText: String
+    let bodyText: String
+    let canEditBody: Bool
+    let bodyMessage: String?
+}
 
 protocol TrafficSessionLoading: Sendable {
     func loadWorkspace() async throws -> [Flow]
@@ -58,6 +65,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let bodyReader: any TrafficBodyReading
     private let captureConfiguration: CaptureConfiguration
     private let eventBatchDelay: Duration
+    private let maximumEditableRequestBodyBytes: Int64
     private let ruleEngine: RuleEngine?
     private let breakpointCoordinator: BreakpointCoordinator?
     private let exportService: ExportService?
@@ -84,6 +92,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         bodyReader: any TrafficBodyReading,
         captureConfiguration: CaptureConfiguration,
         eventBatchDelay: Duration = .milliseconds(40),
+        maximumEditableRequestBodyBytes: Int64 = 1_024 * 1_024,
         ruleEngine: RuleEngine? = nil,
         breakpointCoordinator: BreakpointCoordinator? = nil,
         exportService: ExportService? = nil,
@@ -96,6 +105,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.bodyReader = bodyReader
         self.captureConfiguration = captureConfiguration
         self.eventBatchDelay = eventBatchDelay
+        self.maximumEditableRequestBodyBytes = max(0, maximumEditableRequestBodyBytes)
         self.ruleEngine = ruleEngine
         self.breakpointCoordinator = breakpointCoordinator
         self.exportService = exportService
@@ -257,7 +267,139 @@ final class TrafficConsoleViewModel: ObservableObject {
             throw ProxyLensError.unsupportedOperation("The flow is no longer available")
         }
 
-        let replayedFlow = try await requestReplayer.repeatRequest(flow)
+        let replayedFlow = try await requestReplayer.repeatRequest(
+            flow.request,
+            sessionID: flow.sessionID
+        )
+        applyReplayedFlow(replayedFlow)
+        return replayedFlow.id
+    }
+
+    func requestEditDraft(flowID: FlowID) async throws -> TrafficRequestEditDraft {
+        guard let flow = store.flow(id: flowID) else {
+            throw ProxyLensError.unsupportedOperation("The flow is no longer available")
+        }
+        let headersText = HTTPMessageText.requestHeaders(flow.request)
+        guard let body = flow.request.body else {
+            return TrafficRequestEditDraft(
+                headersText: headersText,
+                bodyText: "",
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        }
+        let bodyLimitMessage = requestBodyEditingLimitMessage
+        guard body.byteCount <= maximumEditableRequestBodyBytes else {
+            return TrafficRequestEditDraft(
+                headersText: headersText,
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: bodyLimitMessage
+            )
+        }
+
+        let data = try await bodyReader.read(body)
+        guard Int64(data.count) <= maximumEditableRequestBodyBytes else {
+            return TrafficRequestEditDraft(
+                headersText: headersText,
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: bodyLimitMessage
+            )
+        }
+
+        let contentEncoding =
+            body.contentEncoding ?? flow.request.headers.firstValue(for: "Content-Encoding")
+        let decodedData: Data
+        do {
+            decodedData = try HTTPContentCoding.decode(
+                data,
+                contentEncoding: contentEncoding,
+                maximumOutputByteCount: Int(clamping: maximumEditableRequestBodyBytes)
+            )
+        } catch HTTPContentCoding.CodingError.exceedsLimit {
+            return TrafficRequestEditDraft(
+                headersText: headersText,
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: bodyLimitMessage
+            )
+        } catch {
+            return TrafficRequestEditDraft(
+                headersText: headersText,
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: error.localizedDescription
+            )
+        }
+        guard let bodyText = String(data: decodedData, encoding: .utf8) else {
+            return TrafficRequestEditDraft(
+                headersText: headersText,
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: "Binary request bodies are preserved but cannot be edited"
+            )
+        }
+        return TrafficRequestEditDraft(
+            headersText: headersText,
+            bodyText: bodyText,
+            canEditBody: true,
+            bodyMessage: nil
+        )
+    }
+
+    @discardableResult
+    func editAndRepeat(
+        flowID: FlowID,
+        headersText: String,
+        bodyText: String?
+    ) async throws -> FlowID {
+        guard let requestReplayer else {
+            throw ProxyLensError.unsupportedOperation("Edit & Repeat is not available")
+        }
+        guard let flow = store.flow(id: flowID) else {
+            throw ProxyLensError.unsupportedOperation("The flow is no longer available")
+        }
+        let request: HTTPRequest
+        if let bodyText {
+            let decodedBody = Data(bodyText.utf8)
+            guard Int64(decodedBody.count) <= maximumEditableRequestBodyBytes else {
+                throw ProxyLensError.unsupportedOperation(requestBodyEditingLimitMessage)
+            }
+            let headersOnlyRequest = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: nil,
+                original: flow.request
+            )
+            let encodedBody = try HTTPContentCoding.encode(
+                decodedBody,
+                contentEncoding: headersOnlyRequest.headers.firstValue(for: "Content-Encoding")
+            )
+            request = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: encodedBody,
+                original: flow.request
+            )
+        } else {
+            request = try HTTPMessageText.parseRequest(
+                headersText: headersText,
+                body: nil,
+                original: flow.request
+            )
+        }
+        let replayedFlow = try await requestReplayer.repeatRequest(
+            request,
+            sessionID: flow.sessionID
+        )
+        applyReplayedFlow(replayedFlow)
+        return replayedFlow.id
+    }
+
+    private var requestBodyEditingLimitMessage: String {
+        "Body editing is limited to \(ByteCountFormatter.string(fromByteCount: maximumEditableRequestBodyBytes, countStyle: .file))"
+    }
+
+    private func applyReplayedFlow(_ replayedFlow: Flow) {
         store.apply([.finished(replayedFlow)])
         store.selectFlow(replayedFlow.id)
         if store.selectedFlowID == nil {
@@ -265,7 +407,6 @@ final class TrafficConsoleViewModel: ObservableObject {
             store.selectFlow(replayedFlow.id)
         }
         refreshInspection()
-        return replayedFlow.id
     }
 
     func clearSession() async throws {

@@ -80,57 +80,24 @@ public enum JSONBodyView: Sendable {
         _ data: Data,
         contentEncoding: String?
     ) -> UnwrappedBody {
-        guard let encoding = encodingToken(contentEncoding) else {
-            return .decoded(data)
-        }
-
-        let format: ZlibContentEncoding.Format
-        switch encoding {
-        case "gzip", "x-gzip":
-            format = .gzip
-        case "deflate":
-            return inflateDeflate(data)
-        default:
-            return .failed(.unsupportedEncoding(encoding))
-        }
-
         do {
-            let decoded = try ZlibContentEncoding.decompress(
+            let decoded = try HTTPContentCoding.decode(
                 data,
-                format: format,
+                contentEncoding: contentEncoding,
                 maximumOutputByteCount: maximumDecodedByteCount
             )
             return .decoded(decoded)
-        } catch ZlibContentEncoding.Error.exceedsLimit {
-            return .failed(.exceedsLimit)
-        } catch {
-            return .failed(.decompressionFailed(encoding))
-        }
-    }
-
-    private static func inflateDeflate(_ data: Data) -> UnwrappedBody {
-        do {
-            let decoded = try ZlibContentEncoding.decompress(
-                data,
-                format: .zlib,
-                maximumOutputByteCount: maximumDecodedByteCount
-            )
-            return .decoded(decoded)
-        } catch ZlibContentEncoding.Error.exceedsLimit {
-            return .failed(.exceedsLimit)
-        } catch {
-            do {
-                let decoded = try ZlibContentEncoding.decompress(
-                    data,
-                    format: .rawDeflate,
-                    maximumOutputByteCount: maximumDecodedByteCount
-                )
-                return .decoded(decoded)
-            } catch ZlibContentEncoding.Error.exceedsLimit {
+        } catch let error as HTTPContentCoding.CodingError {
+            switch error {
+            case .unsupported(let encoding):
+                return .failed(.unsupportedEncoding(encoding))
+            case .decodingFailed(let encoding), .encodingFailed(let encoding):
+                return .failed(.decompressionFailed(encoding))
+            case .exceedsLimit:
                 return .failed(.exceedsLimit)
-            } catch {
-                return .failed(.decompressionFailed("deflate"))
             }
+        } catch {
+            return .failed(.decompressionFailed("unknown"))
         }
     }
 
@@ -197,27 +164,6 @@ public enum JSONBodyView: Sendable {
             return .unavailable(reason: invalidJSONReason("The body is empty."))
         }
         return .unavailable(reason: notJSONReason)
-    }
-
-    private static func encodingToken(_ contentEncoding: String?) -> String? {
-        guard let contentEncoding else {
-            return nil
-        }
-        let tokens = contentEncoding.split(separator: ",", omittingEmptySubsequences: false)
-            .compactMap { raw -> String? in
-                let token = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                if token.isEmpty || token == "identity" {
-                    return nil
-                }
-                return token
-            }
-        guard !tokens.isEmpty else {
-            return nil
-        }
-        if tokens.count > 1 {
-            return tokens.joined(separator: ", ")
-        }
-        return tokens[0]
     }
 
     private static func isJSONMediaType(_ contentType: String?) -> Bool {

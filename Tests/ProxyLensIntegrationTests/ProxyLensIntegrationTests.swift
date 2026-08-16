@@ -499,6 +499,134 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(menu.items.first?.title, "Repeat Request")
         XCTAssertEqual(menu.items.first?.action, NSSelectorFromString("repeatRequest:"))
         XCTAssertEqual(menu.items.first?.representedObject as? FlowID, flow.id)
+        XCTAssertEqual(menu.items[1].title, "Edit & Repeat…")
+        XCTAssertEqual(menu.items[1].action, NSSelectorFromString("editAndRepeat:"))
+        XCTAssertEqual(menu.items[1].representedObject as? FlowID, flow.id)
+    }
+
+    func testRequestEditorExposesAccessiblePlainTextFieldsAndOnlyReturnsChangedBody() throws {
+        let controller = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: "GET / HTTP/1.1\nHost: api.example.com",
+                bodyText: "before",
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        )
+        _ = controller.view
+
+        XCTAssertEqual(controller.headersText, "GET / HTTP/1.1\nHost: api.example.com")
+        XCTAssertEqual(controller.bodyText, "before")
+        XCTAssertNil(controller.changedBodyText)
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.headers" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.body" }
+            )
+        )
+
+        controller.bodyText = "after"
+
+        XCTAssertEqual(controller.changedBodyText, "after")
+
+        let binaryController = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: "POST / HTTP/1.1\nHost: api.example.com",
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: "Binary request bodies are preserved but cannot be edited"
+            )
+        )
+        _ = binaryController.view
+        let binaryBodyEditor = Self.descendant(
+            of: NSTextView.self,
+            in: binaryController.view,
+            matching: { $0.accessibilityIdentifier() == "requestEditor.body" }
+        )
+        XCTAssertFalse(try XCTUnwrap(binaryBodyEditor).isEditable)
+        binaryController.bodyText = "replacement"
+        XCTAssertNil(binaryController.changedBodyText)
+    }
+
+    func testRequestEditorPrettyPrintsAndHighlightsJSONWithoutTreatingFormattingAsAnEdit()
+        async throws
+    {
+        let controller = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText:
+                    "POST /events HTTP/1.1\nHost: api.example.com\nContent-Type: application/json",
+                bodyText: #"{"name":"ProxyLens","enabled":true}"#,
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        )
+
+        _ = controller.view
+
+        let expected = """
+            {
+              "enabled" : true,
+              "name" : "ProxyLens"
+            }
+            """
+        XCTAssertEqual(controller.bodyText, expected)
+        XCTAssertNil(controller.changedBodyText)
+
+        let headersEditor = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.headers" }
+            )
+        )
+        let bodyEditor = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.body" }
+            )
+        )
+
+        XCTAssertEqual(
+            headersEditor.textStorage?.attribute(
+                .foregroundColor,
+                at: (headersEditor.string as NSString).range(of: "Content-Type").location,
+                effectiveRange: nil
+            ) as? NSColor,
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            bodyEditor.textStorage?.attribute(
+                .foregroundColor,
+                at: (bodyEditor.string as NSString).range(of: #""name""#).location,
+                effectiveRange: nil
+            ) as? NSColor,
+            InspectorSyntaxPalette.key
+        )
+
+        bodyEditor.string = #"{"count":42}"#
+        controller.textDidChange(
+            Notification(name: NSText.didChangeNotification, object: bodyEditor)
+        )
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(
+            bodyEditor.textStorage?.attribute(
+                .foregroundColor,
+                at: (bodyEditor.string as NSString).range(of: "42").location,
+                effectiveRange: nil
+            ) as? NSColor,
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(controller.changedBodyText, #"{"count":42}"#)
     }
 
     func testViewModelBatchesLargeFlowListsAndLoadsAuthoritativeBodies() async throws {
@@ -867,8 +995,224 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(viewModel.snapshot.displayFilter, .all)
         XCTAssertEqual(viewModel.snapshot.selectedSource, .allTraffic)
         XCTAssertEqual(viewModel.snapshot.inspection.flowID, replayed.id)
-        let receivedFlowIDs = await replayer.receivedFlowIDs()
-        XCTAssertEqual(receivedFlowIDs, [original.id])
+        let received = await replayer.receivedRequests()
+        XCTAssertEqual(received.map(\.request), [original.request])
+        XCTAssertEqual(received.map(\.sessionID), [original.sessionID])
+    }
+
+    func testViewModelBuildsARequestDraftAndRepeatsTheEditedRequest() async throws {
+        let original = try Self.makeFlow(
+            index: 43,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("before".utf8),
+            method: .post
+        )
+        let replayed = try Self.makeFlow(
+            index: 44,
+            host: "staging.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+        let replayedID = try await viewModel.editAndRepeat(
+            flowID: original.id,
+            headersText: """
+                PUT /v2/users/42 HTTP/1.1
+                Host: staging.example.com
+                Content-Type: text/plain
+                X-Debug: enabled
+                """,
+            bodyText: "after"
+        )
+
+        XCTAssertEqual(draft.headersText, HTTPMessageText.requestHeaders(original.request))
+        XCTAssertEqual(draft.bodyText, "before")
+        XCTAssertTrue(draft.canEditBody)
+        XCTAssertNil(draft.bodyMessage)
+        XCTAssertEqual(replayedID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, replayed.id)
+        let received = await replayer.receivedRequests()
+        let editedRequest = try XCTUnwrap(received.first?.request)
+        XCTAssertEqual(editedRequest.method, .put)
+        XCTAssertEqual(editedRequest.url.absoluteString, "https://staging.example.com/v2/users/42")
+        XCTAssertEqual(editedRequest.headers.firstValue(for: "X-Debug"), "enabled")
+        XCTAssertEqual(editedRequest.body?.inlineData, Data("after".utf8))
+        XCTAssertEqual(received.first?.sessionID, original.sessionID)
+    }
+
+    func testViewModelEditsAndReencodesAGzipJSONRequestBody() async throws {
+        let compressedBody = try XCTUnwrap(
+            Data(base64Encoded: "H4sIAAAAAAAC/6tWKkvMKU1VslJKSk3LL0pVqgUAy2iO6hIAAAA=")
+        )
+        let original = try Self.makeFlow(
+            index: 47,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: compressedBody,
+            method: .post,
+            requestContentType: "application/json",
+            requestContentEncoding: "gzip"
+        )
+        let replayed = try Self.makeFlow(
+            index: 48,
+            host: "api.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+        let replayedID = try await viewModel.editAndRepeat(
+            flowID: original.id,
+            headersText: draft.headersText,
+            bodyText: #"{"value":"after"}"#
+        )
+
+        XCTAssertTrue(draft.canEditBody)
+        XCTAssertEqual(draft.bodyText, #"{"value":"before"}"#)
+        XCTAssertNil(draft.bodyMessage)
+        XCTAssertEqual(replayedID, replayed.id)
+        let received = await replayer.receivedRequests()
+        let editedRequest = try XCTUnwrap(received.first?.request)
+        let editedBody = try XCTUnwrap(editedRequest.body?.inlineData)
+        XCTAssertEqual(editedRequest.headers.firstValue(for: "Content-Encoding"), "gzip")
+        XCTAssertEqual(
+            editedRequest.headers.firstValue(for: "Content-Length"),
+            "\(editedBody.count)"
+        )
+        guard
+            case .prettyPrinted(let editedJSON) = JSONBodyView.render(
+                data: editedBody,
+                contentType: editedRequest.headers.firstValue(for: "Content-Type"),
+                contentEncoding: editedRequest.headers.firstValue(for: "Content-Encoding")
+            )
+        else {
+            return XCTFail("Expected the edited body to remain valid gzip JSON")
+        }
+        XCTAssertTrue(editedJSON.contains(#""value" : "after""#))
+    }
+
+    func testViewModelDoesNotLoadAnOversizedBodyIntoTheRequestEditor() async throws {
+        let original = try Self.makeFlow(
+            index: 45,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("ninebytes".utf8)
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            maximumEditableRequestBodyBytes: 8
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+
+        XCTAssertEqual(draft.bodyText, "")
+        XCTAssertFalse(draft.canEditBody)
+        XCTAssertEqual(draft.bodyMessage, "Body editing is limited to 8 bytes")
+    }
+
+    func testViewModelRejectsAnEditedBodyThatExceedsTheEditorLimit() async throws {
+        let original = try Self.makeFlow(
+            index: 49,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("before".utf8)
+        )
+        let replayed = try Self.makeFlow(
+            index: 50,
+            host: "api.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            maximumEditableRequestBodyBytes: 8,
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        do {
+            try await viewModel.editAndRepeat(
+                flowID: original.id,
+                headersText: HTTPMessageText.requestHeaders(original.request),
+                bodyText: "ninebytes"
+            )
+            XCTFail("Expected the oversized edit to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Unsupported operation: Body editing is limited to 8 bytes"
+            )
+        }
+        let received = await replayer.receivedRequests()
+        XCTAssertTrue(received.isEmpty)
+    }
+
+    func testViewModelPreservesABinaryBodyOutsideTheTextRequestEditor() async throws {
+        let original = try Self.makeFlow(
+            index: 46,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data([0x00, 0xFF, 0x01])
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+
+        XCTAssertEqual(draft.bodyText, "")
+        XCTAssertFalse(draft.canEditBody)
+        XCTAssertEqual(
+            draft.bodyMessage,
+            "Binary request bodies are preserved but cannot be edited"
+        )
     }
 
     func testTrafficConsoleHidesWindowTitleAndInspectorWithoutSelection() async throws {
@@ -1642,13 +1986,22 @@ final class ProxyLensIntegrationTests: XCTestCase {
         method: HTTPMethod? = nil,
         responseContentType: String = "application/octet-stream",
         source: FlowSource = .desktopProxy,
-        requestHeaderValue: String? = nil
+        requestHeaderValue: String? = nil,
+        requestContentType: String = "text/plain",
+        requestContentEncoding: String? = nil
     ) throws -> Flow {
         var requestHeaders = HTTPHeaders()
         try requestHeaders.append(name: "Host", value: host)
         try requestHeaders.append(name: "Accept", value: "application/json")
         if let requestHeaderValue {
             try requestHeaders.append(name: "X-Debug-Label", value: requestHeaderValue)
+        }
+        if let requestBody {
+            try requestHeaders.append(name: "Content-Type", value: requestContentType)
+            try requestHeaders.append(name: "Content-Length", value: "\(requestBody.count)")
+            if let requestContentEncoding {
+                try requestHeaders.append(name: "Content-Encoding", value: requestContentEncoding)
+            }
         }
         var request = HTTPRequest(
             method: method ?? (index.isMultiple(of: 2) ? .get : .post),
@@ -1659,7 +2012,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
             request.attachBody(
                 BodyReference(
                     inline: requestBody,
-                    metadata: BodyMetadata(contentType: "text/plain")
+                    metadata: BodyMetadata(
+                        contentType: requestContentType,
+                        contentEncoding: requestContentEncoding
+                    )
                 )
             )
         }
@@ -1871,19 +2227,19 @@ private actor InlineBodyStore: BodyStore {
 
 private actor RecordingRequestReplayer: TrafficRequestReplaying {
     private let result: Flow
-    private var flowIDs: [FlowID] = []
+    private var requests: [(request: HTTPRequest, sessionID: SessionID)] = []
 
     init(result: Flow) {
         self.result = result
     }
 
-    func repeatRequest(_ flow: Flow) -> Flow {
-        flowIDs.append(flow.id)
+    func repeatRequest(_ request: HTTPRequest, sessionID: SessionID) -> Flow {
+        requests.append((request, sessionID))
         return result
     }
 
-    func receivedFlowIDs() -> [FlowID] {
-        flowIDs
+    func receivedRequests() -> [(request: HTTPRequest, sessionID: SessionID)] {
+        requests
     }
 }
 

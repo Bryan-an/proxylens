@@ -11,10 +11,12 @@ public struct ReplayService: Sendable {
 
     @discardableResult
     public func repeatRequest(_ flow: Flow) async throws -> Flow {
-        let replayedFlow = try await client.replay(
-            flow.request,
-            sessionID: flow.sessionID
-        )
+        try await repeatRequest(flow.request, sessionID: flow.sessionID)
+    }
+
+    @discardableResult
+    public func repeatRequest(_ request: HTTPRequest, sessionID: SessionID) async throws -> Flow {
+        let replayedFlow = try await client.replay(request, sessionID: sessionID)
         try await flowStore.save(replayedFlow)
         return replayedFlow
     }

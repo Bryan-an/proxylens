@@ -845,6 +845,26 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertEqual(parsedResponse.body?.inlineData, Data("created".utf8))
     }
 
+    func testHTTPMessageTextRejectsAnInvalidEditedRequestMethod() throws {
+        let original = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+
+        XCTAssertThrowsError(
+            try HTTPMessageText.parseRequest(
+                headersText: "G\u{0001}ET /users HTTP/1.1\nHost: api.example.com",
+                body: nil,
+                original: original
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .invalidHTTPMessage("Invalid request method: G\u{0001}ET")
+            )
+        }
+    }
+
     func testMappedLocalHTTPResponseUsesFileBodyAndHeaders() throws {
         let body = BodyReference(
             inline: Data(#"{"ok":true}"#.utf8),
@@ -1399,5 +1419,29 @@ final class ProxyLensCoreTests: XCTestCase {
             contentEncoding: "gzip"
         )
         XCTAssertEqual(exploded, .unavailable(reason: JSONBodyView.exceedsDisplayLimitReason))
+    }
+
+    func testHTTPContentCodingRoundTripsGzipAndBoundsDecodedOutput() throws {
+        let body = Data(#"{"value":"editable"}"#.utf8)
+        let encoded = try HTTPContentCoding.encode(body, contentEncoding: "gzip")
+
+        XCTAssertNotEqual(encoded, body)
+        XCTAssertEqual(
+            try HTTPContentCoding.decode(
+                encoded,
+                contentEncoding: "gzip",
+                maximumOutputByteCount: body.count
+            ),
+            body
+        )
+        XCTAssertThrowsError(
+            try HTTPContentCoding.decode(
+                encoded,
+                contentEncoding: "gzip",
+                maximumOutputByteCount: body.count - 1
+            )
+        ) { error in
+            XCTAssertEqual(error as? HTTPContentCoding.CodingError, .exceedsLimit)
+        }
     }
 }

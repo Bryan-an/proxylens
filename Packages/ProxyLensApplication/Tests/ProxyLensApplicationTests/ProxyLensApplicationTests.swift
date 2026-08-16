@@ -40,6 +40,41 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(persisted, replayed)
     }
 
+    func testReplayServicePersistsAReplayCreatedFromAnEditedRequest() async throws {
+        let sessionID = SessionID()
+        var editedHeaders = HTTPHeaders()
+        try editedHeaders.append(name: "Content-Type", value: "application/json")
+        try editedHeaders.append(name: "X-Debug", value: "enabled")
+        let editedRequest = HTTPRequest(
+            method: .patch,
+            url: URL(string: "https://api.example.com/users/42")!,
+            headers: editedHeaders,
+            body: BodyReference(inline: Data(#"{"name":"Grace"}"#.utf8))
+        )
+        var replayed = Flow(
+            sessionID: sessionID,
+            source: .replay,
+            request: editedRequest
+        )
+        try replayed.transition(to: .receivingRequest)
+        try replayed.transition(to: .receivingResponse)
+        replayed.attachResponse(try HTTPResponse(statusCode: 200))
+        try replayed.transition(to: .completed)
+
+        let client = RecordingRequestReplayClient(result: replayed)
+        let store = RecordingSessionStore(sessionID: sessionID, recorder: CallRecorder())
+        let service = ReplayService(client: client, flowStore: store)
+
+        let result = try await service.repeatRequest(editedRequest, sessionID: sessionID)
+
+        XCTAssertEqual(result, replayed)
+        let received = await client.receivedRequests()
+        XCTAssertEqual(received.map(\.request), [editedRequest])
+        XCTAssertEqual(received.map(\.sessionID), [sessionID])
+        let persisted = await store.load(flowID: replayed.id)
+        XCTAssertEqual(persisted, replayed)
+    }
+
     func testRuleEnginePublishesHostRulesToTheSharedSnapshot() async {
         let snapshot = MutableRuleSnapshot()
         let engine = RuleEngine(snapshot: snapshot)
