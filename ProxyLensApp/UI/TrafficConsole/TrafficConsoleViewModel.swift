@@ -765,10 +765,12 @@ final class TrafficConsoleViewModel: ObservableObject {
         inspection = TrafficFlowInspection(
             flowID: inspection.flowID,
             title: inspection.title,
+            summary: inspection.summary,
             request: inspection.request.map {
                 TrafficMessageInspection(
                     title: $0.title,
                     headers: $0.headers,
+                    query: $0.query,
                     body: request.body,
                     json: request.json,
                     bodyContentType: $0.bodyContentType
@@ -778,6 +780,7 @@ final class TrafficConsoleViewModel: ObservableObject {
                 TrafficMessageInspection(
                     title: $0.title,
                     headers: $0.headers,
+                    query: $0.query,
                     body: response.body,
                     json: response.json,
                     bodyContentType: $0.bodyContentType
@@ -808,9 +811,11 @@ final class TrafficConsoleViewModel: ObservableObject {
         TrafficFlowInspection(
             flowID: flow.id,
             title: "\(flow.request.method.rawValue) \(flow.request.url.absoluteString)",
+            summary: TrafficFlowSummaryInspection(flow: flow),
             request: TrafficMessageInspection(
                 title: "Request",
                 headers: requestHeadersText(flow.request),
+                query: queryText(flow.request.url),
                 body: initialBody(flow.request.body, emptyMessage: "This request has no body."),
                 json: initialJSON(flow.request.body),
                 bodyContentType: flow.request.body?.contentType
@@ -837,6 +842,24 @@ final class TrafficConsoleViewModel: ObservableObject {
 
     private static func responseHeadersText(_ response: HTTPResponse) -> String {
         HTTPMessageText.responseHeaders(response)
+    }
+
+    private static func queryText(_ url: URL) -> String {
+        guard
+            let items = URLComponents(
+                url: url,
+                resolvingAgainstBaseURL: false
+            )?.queryItems, !items.isEmpty
+        else {
+            return "No query parameters."
+        }
+
+        return items.map { item in
+            guard let value = item.value else {
+                return item.name
+            }
+            return "\(item.name)=\(value)"
+        }.joined(separator: "\n")
     }
 
     private static func bodyIsEditable(_ body: TrafficBodyPresentation) -> Bool {

@@ -1623,9 +1623,42 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
+        let summaryMethod = Self.descendant(
+            of: NSTextField.self,
+            in: controller.view,
+            matching: { $0.accessibilityIdentifier() == "inspector.summary.method" }
+        )
+        let summaryStatus = Self.descendant(
+            of: NSTextField.self,
+            in: controller.view,
+            matching: { $0.accessibilityIdentifier() == "inspector.summary.status" }
+        )
+        let summaryURL = Self.descendant(
+            of: NSTextField.self,
+            in: controller.view,
+            matching: { $0.accessibilityIdentifier() == "inspector.summary.url" }
+        )
         XCTAssertLessThan(modeSelector.frame.width, inspectorPaneFrame.width / 2)
         XCTAssertLessThan(requestSectionSelector.frame.width, requestPaneFrame.width)
         XCTAssertLessThan(responseSectionSelector.frame.width, responsePaneFrame.width)
+        XCTAssertEqual(
+            (0..<requestSectionSelector.segmentCount).map {
+                requestSectionSelector.label(forSegment: $0)
+            },
+            ["Headers", "Query", "Body", "JSON", "Raw"]
+        )
+        XCTAssertEqual(
+            (0..<responseSectionSelector.segmentCount).map {
+                responseSectionSelector.label(forSegment: $0)
+            },
+            ["Headers", "Body", "JSON", "Raw"]
+        )
+        XCTAssertEqual(summaryMethod?.stringValue, "POST")
+        XCTAssertEqual(summaryStatus?.stringValue, "404 Result")
+        XCTAssertEqual(
+            summaryURL?.stringValue,
+            "https://api.example.com/v1/items/3?source=test"
+        )
         for identifier in [
             "traffic.filter.method",
             "traffic.filter.status",
@@ -1661,6 +1694,45 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(flowTable.numberOfRows, flows.count)
         XCTAssertTrue(requestInspector.string.contains("POST /v1/items/3?source=test HTTP/1.1"))
         XCTAssertTrue(responseInspector.string.contains("HTTP/1.1 404 Result"))
+
+        requestSectionSelector.selectedSegment = 1
+        XCTAssertTrue(
+            requestSectionSelector.sendAction(
+                requestSectionSelector.action,
+                to: requestSectionSelector.target
+            )
+        )
+        XCTAssertEqual(requestInspector.string, "source=test")
+
+        if requestSectionSelector.segmentCount > 4 {
+            requestSectionSelector.selectedSegment = 4
+            XCTAssertTrue(
+                requestSectionSelector.sendAction(
+                    requestSectionSelector.action,
+                    to: requestSectionSelector.target
+                )
+            )
+            XCTAssertTrue(
+                requestInspector.string.contains("POST /v1/items/3?source=test HTTP/1.1")
+            )
+            XCTAssertTrue(requestInspector.string.contains(#"{"query":"proxylens"}"#))
+        } else {
+            XCTFail("Request inspector is missing its Raw tab")
+        }
+
+        if responseSectionSelector.segmentCount > 3 {
+            responseSectionSelector.selectedSegment = 3
+            XCTAssertTrue(
+                responseSectionSelector.sendAction(
+                    responseSectionSelector.action,
+                    to: responseSectionSelector.target
+                )
+            )
+            XCTAssertTrue(responseInspector.string.contains("HTTP/1.1 404 Result"))
+            XCTAssertTrue(responseInspector.string.contains(#"{"error":"not found"}"#))
+        } else {
+            XCTFail("Response inspector is missing its Raw tab")
+        }
 
         searchField.stringValue = "api.example.com"
         XCTAssertTrue(searchField.sendAction(searchField.action, to: searchField.target))
@@ -1857,7 +1929,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertEqual(sectionSelector.segmentCount, 3)
+        XCTAssertEqual(sectionSelector.segmentCount, 4)
         XCTAssertEqual(sectionSelector.label(forSegment: 2), "JSON")
 
         sectionSelector.selectedSegment = 1
@@ -1947,7 +2019,12 @@ final class ProxyLensIntegrationTests: XCTestCase {
                     }
                 )
             )
-            sectionSelector.selectedSegment = 1
+            let bodySegment = try XCTUnwrap(
+                (0..<sectionSelector.segmentCount).first {
+                    sectionSelector.label(forSegment: $0) == "Body"
+                }
+            )
+            sectionSelector.selectedSegment = bodySegment
             sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
 
             let inspector = try XCTUnwrap(
@@ -2031,11 +2108,11 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
 
-        sectionSelector.selectedSegment = 2
+        sectionSelector.selectedSegment = 3
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertTrue(inspector.string.contains(pretty))
 
-        sectionSelector.selectedSegment = 1
+        sectionSelector.selectedSegment = 2
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertEqual(inspector.string, compact)
         XCTAssertFalse(inspector.string.contains(pretty))
