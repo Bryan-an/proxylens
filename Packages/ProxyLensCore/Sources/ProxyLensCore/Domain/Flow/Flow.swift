@@ -60,6 +60,7 @@ public struct FlowSource: Codable, Equatable, Hashable, Sendable {
     }
 
     public static let desktopProxy = FlowSource(kind: .desktopProxy, label: "Desktop proxy")
+    public static let replay = FlowSource(kind: .replay, label: "Replay")
 }
 
 public enum ConnectionProtocol: String, Codable, Equatable, Hashable, Sendable {

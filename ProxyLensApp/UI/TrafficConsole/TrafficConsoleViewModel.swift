@@ -27,6 +27,12 @@ protocol TrafficBodyReading: Sendable {
 
 extension FlowBodyReader: TrafficBodyReading {}
 
+protocol TrafficRequestReplaying: Sendable {
+    func repeatRequest(_ flow: Flow) async throws -> Flow
+}
+
+extension ReplayService: TrafficRequestReplaying {}
+
 protocol TrafficSessionLoading: Sendable {
     func loadWorkspace() async throws -> [Flow]
     func clearWorkspace() async throws
@@ -55,6 +61,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let ruleEngine: RuleEngine?
     private let breakpointCoordinator: BreakpointCoordinator?
     private let exportService: ExportService?
+    private let requestReplayer: (any TrafficRequestReplaying)?
     private let sessionService: (any TrafficSessionLoading)?
     private let certificateTrust: (any TrafficCertificateTrusting)?
 
@@ -80,6 +87,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         ruleEngine: RuleEngine? = nil,
         breakpointCoordinator: BreakpointCoordinator? = nil,
         exportService: ExportService? = nil,
+        requestReplayer: (any TrafficRequestReplaying)? = nil,
         sessionService: (any TrafficSessionLoading)? = nil,
         certificateTrust: (any TrafficCertificateTrusting)? = nil
     ) {
@@ -91,6 +99,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.ruleEngine = ruleEngine
         self.breakpointCoordinator = breakpointCoordinator
         self.exportService = exportService
+        self.requestReplayer = requestReplayer
         self.sessionService = sessionService
         self.certificateTrust = certificateTrust
     }
@@ -237,6 +246,26 @@ final class TrafficConsoleViewModel: ObservableObject {
             throw ProxyLensError.unsupportedOperation("The flow is no longer available")
         }
         return try await exportService.har(for: flow)
+    }
+
+    @discardableResult
+    func repeatRequest(flowID: FlowID) async throws -> FlowID {
+        guard let requestReplayer else {
+            throw ProxyLensError.unsupportedOperation("Repeat Request is not available")
+        }
+        guard let flow = store.flow(id: flowID) else {
+            throw ProxyLensError.unsupportedOperation("The flow is no longer available")
+        }
+
+        let replayedFlow = try await requestReplayer.repeatRequest(flow)
+        store.apply([.finished(replayedFlow)])
+        store.selectFlow(replayedFlow.id)
+        if store.selectedFlowID == nil {
+            store.clearFilters()
+            store.selectFlow(replayedFlow.id)
+        }
+        refreshInspection()
+        return replayedFlow.id
     }
 
     func clearSession() async throws {

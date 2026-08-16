@@ -240,6 +240,14 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         let path = Self.mappingPath(for: rows[rowIndex])
         let flowID = rows[rowIndex].id
         menu.addItem(
+            exportMenuItem(
+                title: "Repeat Request",
+                flowID: flowID,
+                action: #selector(repeatRequest)
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
             exportMenuItem(title: "Copy as cURL", flowID: flowID, action: #selector(copyCURL))
         )
         menu.addItem(
@@ -303,6 +311,20 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         item.target = self
         item.representedObject = host
         return item
+    }
+
+    @objc private func repeatRequest(_ sender: NSMenuItem) {
+        guard let flowID = sender.representedObject as? FlowID else {
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                try await viewModel.repeatRequest(flowID: flowID)
+            } catch {
+                await presentError(error)
+            }
+        }
     }
 
     @objc private func copyCURL(_ sender: NSMenuItem) {

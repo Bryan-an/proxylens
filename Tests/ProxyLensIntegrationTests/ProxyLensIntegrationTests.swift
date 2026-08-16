@@ -473,6 +473,34 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(tableView.numberOfRows, 1)
     }
 
+    func testFlowTableContextMenuOffersRepeatRequestFirst() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+        let flow = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        var store = TrafficConsoleStore()
+        store.apply([.finished(flow)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+
+        controller.menuNeedsUpdate(menu)
+
+        XCTAssertEqual(menu.items.first?.title, "Repeat Request")
+        XCTAssertEqual(menu.items.first?.action, NSSelectorFromString("repeatRequest:"))
+        XCTAssertEqual(menu.items.first?.representedObject as? FlowID, flow.id)
+    }
+
     func testViewModelBatchesLargeFlowListsAndLoadsAuthoritativeBodies() async throws {
         let captureController = RecordingCaptureController()
         let viewModel = TrafficConsoleViewModel(
@@ -803,6 +831,44 @@ final class ProxyLensIntegrationTests: XCTestCase {
         try await waitUntil {
             viewModel.snapshot.visibleRows.map(\.id) == [flow.id]
         }
+    }
+
+    func testViewModelRepeatsAFlowAndSelectsTheVisibleReplayResult() async throws {
+        let original = try Self.makeFlow(
+            index: 41,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        let replayed = try Self.makeFlow(
+            index: 42,
+            host: "api.example.com",
+            statusCode: 202,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+        viewModel.setOriginFilter(.desktopProxy)
+
+        let replayedID = try await viewModel.repeatRequest(flowID: original.id)
+
+        XCTAssertEqual(replayedID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 2)
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.displayFilter, .all)
+        XCTAssertEqual(viewModel.snapshot.selectedSource, .allTraffic)
+        XCTAssertEqual(viewModel.snapshot.inspection.flowID, replayed.id)
+        let receivedFlowIDs = await replayer.receivedFlowIDs()
+        XCTAssertEqual(receivedFlowIDs, [original.id])
     }
 
     func testTrafficConsoleHidesWindowTitleAndInspectorWithoutSelection() async throws {
@@ -1689,6 +1755,11 @@ private final class RecordingTableView: NSTableView {
     private(set) var removedRowIndexes: [IndexSet] = []
     private(set) var movedRows: [(from: Int, to: Int)] = []
     private(set) var dataSourceRowCountsDuringRemovals: [Int] = []
+    var clickedRowOverride: Int?
+
+    override var clickedRow: Int {
+        clickedRowOverride ?? super.clickedRow
+    }
 
     override func reloadData() {
         fullReloadCount += 1
@@ -1796,6 +1867,24 @@ private actor InlineBodyStore: BodyStore {
     }
 
     func remove(_: BodyReference) {}
+}
+
+private actor RecordingRequestReplayer: TrafficRequestReplaying {
+    private let result: Flow
+    private var flowIDs: [FlowID] = []
+
+    init(result: Flow) {
+        self.result = result
+    }
+
+    func repeatRequest(_ flow: Flow) -> Flow {
+        flowIDs.append(flow.id)
+        return result
+    }
+
+    func receivedFlowIDs() -> [FlowID] {
+        flowIDs
+    }
 }
 
 private actor RecordingSessionService: TrafficSessionLoading {

@@ -72,7 +72,8 @@ The core may use Foundation value types where useful, but it must not import App
 - Apply the active rule set.
 - Persist flow events.
 - Manage sessions and saved filters.
-- Replay and export requests.
+- Replay captured requests and persist the resulting flows.
+- Export requests and responses.
 - Coordinate the proxy engine, storage, certificate provider, and system proxy controller.
 
 The application layer depends on core protocols. It does not construct concrete NIO channels, SQLite connections, or AppKit views.
@@ -177,6 +178,7 @@ ProxyLens/
 │   │   │   │       └── RuleTrace.swift
 │   │   │   ├── Ports/
 │   │   │   │   ├── ProxyEngine.swift
+│   │   │   │   ├── RequestReplayClient.swift
 │   │   │   │   ├── FlowStore.swift
 │   │   │   │   ├── BodyStore.swift
 │   │   │   │   ├── CertificateProvider.swift
@@ -213,6 +215,8 @@ ProxyLens/
 │   │   │   │   └── ConnectTunnelHandler.swift
 │   │   │   ├── Upstream/
 │   │   │   │   └── UpstreamConnection.swift
+│   │   │   ├── Replay/
+│   │   │   │   └── NIORequestReplayClient.swift
 │   │   │   ├── TLS/
 │   │   │   │   └── TLSChannelConfiguration.swift
 │   │   │   └── WebSocket/
@@ -433,6 +437,14 @@ AppKit views
 ```
 
 The view model may maintain a display projection for sorting and grouping. It hydrates that projection from `SessionService` on launch and retains the body store for inspection and export.
+
+Repeat Request is an explicit control-plane action. `ReplayService` sends the captured request
+through the core `RequestReplayClient` port, persists the returned flow in the original session,
+and exposes it to the traffic console as a new `.replay` source. The SwiftNIO adapter connects
+directly to the original HTTP or HTTPS upstream, verifies TLS, strips hop-by-hop headers,
+recomputes `Host` and `Content-Length`, does not follow redirects, rejects truncated or oversized
+request bodies, bounds captured response bytes, and fails idle responses after 30 seconds. Active rules
+are not re-evaluated for unchanged replays; Edit & Repeat remains a separate workflow.
 
 ## Persistence architecture
 

@@ -55,6 +55,14 @@ final class CompositionRoot {
         )
         let bodyReader = FlowBodyReader(bodyStore: bodyStore)
         let exportService = ExportService(bodyStore: bodyStore)
+        let requestReplayClient = NIORequestReplayClient(
+            bodyStore: bodyStore,
+            maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes
+        )
+        let replayService = ReplayService(
+            client: requestReplayClient,
+            flowStore: sessionStore
+        )
         let sessionService = SessionService(sessionStore: sessionStore)
         let certificateTrustService = CertificateTrustService(trustStore: certificateTrustStore)
 
@@ -73,6 +81,7 @@ final class CompositionRoot {
             ruleEngine: ruleEngine,
             breakpointCoordinator: breakpointCoordinator,
             exportService: exportService,
+            requestReplayer: replayService,
             sessionService: sessionService,
             certificateTrust: certificateTrustService
         )

@@ -5,6 +5,41 @@ import XCTest
 @testable import ProxyLensApplication
 
 final class ProxyLensApplicationTests: XCTestCase {
+    func testReplayServiceRepeatsTheOriginalRequestAndPersistsTheNewFlow() async throws {
+        let original = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/users",
+            requestHeaders: [("Content-Type", "application/json")],
+            requestBody: Data(#"{"name":"Ada"}"#.utf8),
+            statusCode: 201
+        )
+        var replayed = Flow(
+            sessionID: original.sessionID,
+            source: FlowSource(kind: .replay, label: "Replay"),
+            request: original.request
+        )
+        try replayed.transition(to: .receivingRequest)
+        try replayed.transition(to: .receivingResponse)
+        replayed.attachResponse(
+            try HTTPResponse(statusCode: 202, reasonPhrase: "Accepted")
+        )
+        try replayed.transition(to: .completed)
+
+        let client = RecordingRequestReplayClient(result: replayed)
+        let recorder = CallRecorder()
+        let store = RecordingSessionStore(sessionID: SessionID(), recorder: recorder)
+        let service = ReplayService(client: client, flowStore: store)
+
+        let result = try await service.repeatRequest(original)
+
+        XCTAssertEqual(result, replayed)
+        let received = await client.receivedRequests()
+        XCTAssertEqual(received.map(\.request), [original.request])
+        XCTAssertEqual(received.map(\.sessionID), [original.sessionID])
+        let persisted = await store.load(flowID: replayed.id)
+        XCTAssertEqual(persisted, replayed)
+    }
+
     func testRuleEnginePublishesHostRulesToTheSharedSnapshot() async {
         let snapshot = MutableRuleSnapshot()
         let engine = RuleEngine(snapshot: snapshot)
@@ -930,6 +965,24 @@ private actor RecordingBodyWriter: BodyWriter {
     }
 
     func cancel() {}
+}
+
+private actor RecordingRequestReplayClient: RequestReplayClient {
+    private let result: Flow
+    private var requests: [(request: HTTPRequest, sessionID: SessionID)] = []
+
+    init(result: Flow) {
+        self.result = result
+    }
+
+    func replay(_ request: HTTPRequest, sessionID: SessionID) throws -> Flow {
+        requests.append((request, sessionID))
+        return result
+    }
+
+    func receivedRequests() -> [(request: HTTPRequest, sessionID: SessionID)] {
+        requests
+    }
 }
 
 private actor AsyncGate {

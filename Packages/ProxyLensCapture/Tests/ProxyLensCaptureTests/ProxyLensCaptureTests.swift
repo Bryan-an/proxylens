@@ -14,6 +14,195 @@ import XCTest
 @testable import ProxyLensCapture
 
 final class ProxyLensCaptureTests: XCTestCase {
+    func testRequestReplayClientRepeatsHTTPPostAndCapturesTheResponse() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "replayed")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensReplayTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies"),
+                inlineBodyThreshold: 4,
+                maximumCapturedBodyBytes: 1_024
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let requestBytes = Data(#"{"name":"Ada"}"#.utf8)
+        let originalBody = try await bodyStore.put(
+            requestBytes,
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        var headers = ProxyLensCore.HTTPHeaders()
+        try headers.append(name: "Host", value: "stale.example.com")
+        try headers.append(name: "Content-Type", value: "application/json")
+        try headers.append(name: "Content-Length", value: "999")
+        try headers.append(name: "Proxy-Connection", value: "keep-alive")
+        let sessionID = SessionID()
+        let client = NIORequestReplayClient(
+            bodyStore: bodyStore,
+            maximumCapturedBodyBytes: 1_024
+        )
+
+        do {
+            let flow = try await client.replay(
+                HTTPRequest(
+                    method: .post,
+                    url: URL(
+                        string: "http://127.0.0.1:\(upstream.endpoint.port)/echo?source=replay"
+                    )!,
+                    headers: headers,
+                    body: originalBody
+                ),
+                sessionID: sessionID
+            )
+
+            XCTAssertEqual(flow.sessionID, sessionID)
+            XCTAssertEqual(flow.source, .replay)
+            XCTAssertEqual(flow.state, .completed)
+            XCTAssertEqual(flow.response?.statusCode, 200)
+            XCTAssertEqual(flow.connection?.protocolKind, .http)
+            XCTAssertFalse(flow.connection?.tlsIntercepted ?? true)
+            XCTAssertEqual(upstream.requestURI, "/echo?source=replay")
+            XCTAssertEqual(
+                upstream.requestHeader("Host"),
+                "127.0.0.1:\(upstream.endpoint.port)"
+            )
+            XCTAssertEqual(upstream.requestHeader("Content-Length"), "\(requestBytes.count)")
+            XCTAssertNil(upstream.requestHeader("Proxy-Connection"))
+
+            let replayBody = try XCTUnwrap(flow.request.body)
+            XCTAssertNotEqual(replayBody.id, originalBody.id)
+            let persistedReplayBody = try await bodyStore.read(replayBody)
+            XCTAssertEqual(persistedReplayBody, requestBytes)
+            let responseBody = try XCTUnwrap(flow.response?.body)
+            let persistedResponseBody = try await bodyStore.read(responseBody)
+            XCTAssertEqual(
+                persistedResponseBody,
+                Data("replayed:{\"name\":\"Ada\"}".utf8)
+            )
+
+            let oversizedBody = Data(repeating: 0x61, count: 1_025)
+            do {
+                _ = try await client.replay(
+                    HTTPRequest(
+                        method: .post,
+                        url: URL(
+                            string: "http://127.0.0.1:\(upstream.endpoint.port)/too-large"
+                        )!,
+                        body: BodyReference(inline: oversizedBody)
+                    ),
+                    sessionID: sessionID
+                )
+                XCTFail("Expected an oversized replay body to be rejected")
+            } catch let error as RequestReplayError {
+                XCTAssertEqual(
+                    error,
+                    .requestBodyTooLarge(byteCount: 1_025, maximumByteCount: 1_024)
+                )
+            }
+            XCTAssertEqual(upstream.requestCount, 1)
+        } catch {
+            await upstream.stop()
+            throw error
+        }
+
+        await upstream.stop()
+    }
+
+    func testRequestReplayClientRepeatsHTTPSWithVerifiedTLS() async throws {
+        let certificateProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.replay-tests.\(UUID().uuidString)"
+            )
+        )
+        let rootCertificate = try await certificateProvider.rootCertificate()
+        let upstreamIdentity = try await certificateProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "secure replay",
+            identity: upstreamIdentity
+        )
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensSecureReplayTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let client = NIORequestReplayClient(
+            bodyStore: bodyStore,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [rootCertificate]
+            )
+        )
+
+        do {
+            let flow = try await client.replay(
+                HTTPRequest(
+                    method: .get,
+                    url: URL(
+                        string: "https://localhost:\(upstream.endpoint.port)/secure"
+                    )!
+                ),
+                sessionID: SessionID()
+            )
+
+            XCTAssertEqual(flow.state, .completed)
+            XCTAssertEqual(flow.source, .replay)
+            XCTAssertEqual(flow.connection?.protocolKind, .https)
+            XCTAssertFalse(flow.connection?.tlsIntercepted ?? true)
+            XCTAssertEqual(flow.response?.statusCode, 200)
+            let responseBody = try XCTUnwrap(flow.response?.body)
+            let persistedResponseBody = try await bodyStore.read(responseBody)
+            XCTAssertEqual(persistedResponseBody, Data("secure replay".utf8))
+        } catch {
+            await upstream.stop()
+            try? await certificateProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await upstream.stop()
+        try await certificateProvider.removeCertificateAuthority()
+    }
+
+    func testRequestReplayClientRecordsTimeoutAsAFailedFlow() async throws {
+        let upstream = try await TestHTTPServer.startHanging()
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensReplayTimeoutTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let client = NIORequestReplayClient(
+            bodyStore: FileBodyStore(database: database),
+            responseTimeout: .milliseconds(50)
+        )
+
+        do {
+            let flow = try await client.replay(
+                HTTPRequest(
+                    method: .get,
+                    url: URL(string: "http://127.0.0.1:\(upstream.endpoint.port)/hang")!
+                ),
+                sessionID: SessionID()
+            )
+
+            XCTAssertEqual(flow.state, .failed(.timeout))
+            XCTAssertEqual(flow.source, .replay)
+        } catch {
+            await upstream.stop()
+            throw error
+        }
+
+        await upstream.stop()
+    }
+
     func testProxyTargetSupportsAbsoluteAndOriginFormRequests() throws {
         var headers = NIOHTTP1.HTTPHeaders()
         headers.add(name: "Host", value: "127.0.0.1:8080")
