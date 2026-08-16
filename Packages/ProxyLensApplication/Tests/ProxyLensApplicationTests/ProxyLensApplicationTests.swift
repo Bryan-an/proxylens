@@ -5,6 +5,76 @@ import XCTest
 @testable import ProxyLensApplication
 
 final class ProxyLensApplicationTests: XCTestCase {
+    func testReplayServiceRepeatsTheOriginalRequestAndPersistsTheNewFlow() async throws {
+        let original = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/users",
+            requestHeaders: [("Content-Type", "application/json")],
+            requestBody: Data(#"{"name":"Ada"}"#.utf8),
+            statusCode: 201
+        )
+        var replayed = Flow(
+            sessionID: original.sessionID,
+            source: FlowSource(kind: .replay, label: "Replay"),
+            request: original.request
+        )
+        try replayed.transition(to: .receivingRequest)
+        try replayed.transition(to: .receivingResponse)
+        replayed.attachResponse(
+            try HTTPResponse(statusCode: 202, reasonPhrase: "Accepted")
+        )
+        try replayed.transition(to: .completed)
+
+        let client = RecordingRequestReplayClient(result: replayed)
+        let recorder = CallRecorder()
+        let store = RecordingSessionStore(sessionID: SessionID(), recorder: recorder)
+        let service = ReplayService(client: client, flowStore: store)
+
+        let result = try await service.repeatRequest(original)
+
+        XCTAssertEqual(result, replayed)
+        let received = await client.receivedRequests()
+        XCTAssertEqual(received.map(\.request), [original.request])
+        XCTAssertEqual(received.map(\.sessionID), [original.sessionID])
+        let persisted = await store.load(flowID: replayed.id)
+        XCTAssertEqual(persisted, replayed)
+    }
+
+    func testReplayServicePersistsAReplayCreatedFromAnEditedRequest() async throws {
+        let sessionID = SessionID()
+        var editedHeaders = HTTPHeaders()
+        try editedHeaders.append(name: "Content-Type", value: "application/json")
+        try editedHeaders.append(name: "X-Debug", value: "enabled")
+        let editedRequest = HTTPRequest(
+            method: .patch,
+            url: URL(string: "https://api.example.com/users/42")!,
+            headers: editedHeaders,
+            body: BodyReference(inline: Data(#"{"name":"Grace"}"#.utf8))
+        )
+        var replayed = Flow(
+            sessionID: sessionID,
+            source: .replay,
+            request: editedRequest
+        )
+        try replayed.transition(to: .receivingRequest)
+        try replayed.transition(to: .receivingResponse)
+        replayed.attachResponse(try HTTPResponse(statusCode: 200))
+        try replayed.transition(to: .completed)
+
+        let client = RecordingRequestReplayClient(result: replayed)
+        let store = RecordingSessionStore(sessionID: sessionID, recorder: CallRecorder())
+        let service = ReplayService(client: client, flowStore: store)
+
+        let result = try await service.repeatRequest(editedRequest, sessionID: sessionID)
+
+        XCTAssertEqual(result, replayed)
+        let received = await client.receivedRequests()
+        XCTAssertEqual(received.map(\.request), [editedRequest])
+        XCTAssertEqual(received.map(\.sessionID), [sessionID])
+        let persisted = await store.load(flowID: replayed.id)
+        XCTAssertEqual(persisted, replayed)
+    }
+
     func testRuleEnginePublishesHostRulesToTheSharedSnapshot() async {
         let snapshot = MutableRuleSnapshot()
         let engine = RuleEngine(snapshot: snapshot)
@@ -461,6 +531,41 @@ final class ProxyLensApplicationTests: XCTestCase {
         let remainingSessions = await sessionStore.listSessions()
         XCTAssertTrue(remainingFlows.isEmpty)
         XCTAssertTrue(remainingSessions.isEmpty)
+    }
+
+    func testSessionServiceReusesTheNewestSessionAndCreatesOneForAnEmptyWorkspace()
+        async throws
+    {
+        let recorder = CallRecorder()
+        let createdSessionID = SessionID()
+        let sessionStore = RecordingSessionStore(
+            sessionID: createdSessionID,
+            recorder: recorder
+        )
+        let olderSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let newerSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        await sessionStore.seed(session: olderSession, flows: [])
+        await sessionStore.seed(session: newerSession, flows: [])
+        let service = SessionService(sessionStore: sessionStore)
+
+        let reusedSessionID = try await service.sessionIDForNewFlow()
+
+        XCTAssertEqual(reusedSessionID, newerSession.id)
+
+        try await service.clearWorkspace()
+        let newSessionID = try await service.sessionIDForNewFlow()
+
+        XCTAssertEqual(newSessionID, createdSessionID)
+        let createdSession = await sessionStore.loadSession(sessionID: createdSessionID)
+        XCTAssertEqual(createdSession?.state, .stopped)
+        let calls = await recorder.snapshot()
+        XCTAssertEqual(Array(calls.suffix(2)), ["session.create", "session.stop"])
     }
 
     func testCertificateTrustServiceDelegatesInstallRemoveExportAndState() async throws {
@@ -930,6 +1035,24 @@ private actor RecordingBodyWriter: BodyWriter {
     }
 
     func cancel() {}
+}
+
+private actor RecordingRequestReplayClient: RequestReplayClient {
+    private let result: Flow
+    private var requests: [(request: HTTPRequest, sessionID: SessionID)] = []
+
+    init(result: Flow) {
+        self.result = result
+    }
+
+    func replay(_ request: HTTPRequest, sessionID: SessionID) throws -> Flow {
+        requests.append((request, sessionID))
+        return result
+    }
+
+    func receivedRequests() -> [(request: HTTPRequest, sessionID: SessionID)] {
+        requests
+    }
 }
 
 private actor AsyncGate {

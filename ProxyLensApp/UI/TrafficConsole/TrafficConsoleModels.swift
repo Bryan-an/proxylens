@@ -4,7 +4,15 @@ import ProxyLensCore
 
 enum TrafficSourceSelection: Equatable, Hashable, Sendable {
     case allTraffic
+    case application(String)
     case domain(String)
+}
+
+struct TrafficApplicationSummary: Equatable, Identifiable, Sendable {
+    let id: String
+    let name: String
+    let bundlePath: String?
+    let flowCount: Int
 }
 
 struct TrafficDomainSummary: Equatable, Identifiable, Sendable {
@@ -102,6 +110,7 @@ struct TrafficMessageInspection: Equatable, Sendable {
     let headers: String
     let body: TrafficBodyPresentation
     let json: TrafficBodyPresentation
+    let bodyContentType: String?
 }
 
 struct TrafficFlowInspection: Equatable, Sendable {
@@ -132,6 +141,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
     let workspaceWarning: String?
     let certificateTrust: CertificateTrustState?
     let allFlowCount: Int
+    let applications: [TrafficApplicationSummary]
     let domains: [TrafficDomainSummary]
     let selectedSource: TrafficSourceSelection
     let displayFilter: TrafficDisplayFilter
@@ -144,6 +154,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
         workspaceWarning: nil,
         certificateTrust: nil,
         allFlowCount: 0,
+        applications: [],
         domains: [],
         selectedSource: .allTraffic,
         displayFilter: .all,
@@ -158,6 +169,8 @@ struct TrafficConsoleStore {
     private var orderedFlowIDs: [FlowID] = []
     private var orderIndexByID: [FlowID: Int] = [:]
     private var searchableTextByID: [FlowID: String] = [:]
+    private var applicationProjections: [String: ApplicationProjection] = [:]
+    private var applicationSummaries: [TrafficApplicationSummary] = []
     private var domainCounts: [String: Int] = [:]
     private var domainSummaries: [TrafficDomainSummary] = []
     private var visibleRows: [TrafficFlowRow] = []
@@ -177,6 +190,7 @@ struct TrafficConsoleStore {
     }
 
     mutating func apply(_ events: [FlowEvent]) {
+        var applicationProjectionChanged = false
         var domainProjectionChanged = false
         var needsSort = false
 
@@ -190,6 +204,9 @@ struct TrafficConsoleStore {
 
             flowsByID[flow.id] = flow
             searchableTextByID[flow.id] = TrafficDisplayFilter.searchableText(for: flow)
+            applicationProjectionChanged =
+                updateApplicationProjections(previousFlow: previousFlow, currentFlow: flow)
+                || applicationProjectionChanged
             domainProjectionChanged =
                 updateDomainCounts(previousFlow: previousFlow, currentFlow: flow)
                 || domainProjectionChanged
@@ -223,6 +240,9 @@ struct TrafficConsoleStore {
             }
         }
 
+        if applicationProjectionChanged {
+            rebuildApplicationSummaries()
+        }
         if domainProjectionChanged {
             rebuildDomainSummaries()
         }
@@ -237,6 +257,8 @@ struct TrafficConsoleStore {
         orderedFlowIDs = []
         orderIndexByID = [:]
         searchableTextByID = [:]
+        applicationProjections = [:]
+        applicationSummaries = []
         domainCounts = [:]
         domainSummaries = []
         visibleRows = []
@@ -301,6 +323,7 @@ struct TrafficConsoleStore {
             workspaceWarning: workspaceWarning,
             certificateTrust: certificateTrust,
             allFlowCount: flowsByID.count,
+            applications: applicationSummaries,
             domains: domainSummaries,
             selectedSource: selectedSource,
             displayFilter: displayFilter,
@@ -311,10 +334,17 @@ struct TrafficConsoleStore {
     }
 
     private func matchesCurrentProjection(_ flow: Flow) -> Bool {
-        if case .domain(let host) = selectedSource,
-            TrafficFlowRow.host(for: flow) != host
-        {
-            return false
+        switch selectedSource {
+        case .allTraffic:
+            break
+        case .application(let applicationID):
+            guard Self.applicationProjection(for: flow)?.id == applicationID else {
+                return false
+            }
+        case .domain(let host):
+            guard TrafficFlowRow.host(for: flow) == host else {
+                return false
+            }
         }
         return displayFilter.matches(
             flow,
@@ -355,6 +385,85 @@ struct TrafficConsoleStore {
         decrementDomainCount(previousHost)
         domainCounts[currentHost, default: 0] += 1
         return true
+    }
+
+    private mutating func updateApplicationProjections(
+        previousFlow: Flow?,
+        currentFlow: Flow
+    ) -> Bool {
+        let current = Self.applicationProjection(for: currentFlow)
+        guard let previousFlow else {
+            guard let current else {
+                return false
+            }
+            incrementApplicationProjection(current)
+            return true
+        }
+
+        let previous = Self.applicationProjection(for: previousFlow)
+        guard previous != current else {
+            return false
+        }
+        if let previous {
+            decrementApplicationProjection(previous.id)
+        }
+        if let current {
+            incrementApplicationProjection(current)
+        }
+        return true
+    }
+
+    private mutating func incrementApplicationProjection(_ projection: ApplicationProjection) {
+        var updated = applicationProjections[projection.id] ?? projection
+        updated.flowCount += 1
+        applicationProjections[projection.id] = updated
+    }
+
+    private mutating func decrementApplicationProjection(_ id: String) {
+        guard var projection = applicationProjections[id] else {
+            return
+        }
+        if projection.flowCount == 1 {
+            applicationProjections.removeValue(forKey: id)
+        } else {
+            projection.flowCount -= 1
+            applicationProjections[id] = projection
+        }
+    }
+
+    private mutating func rebuildApplicationSummaries() {
+        applicationSummaries = applicationProjections.values
+            .map {
+                TrafficApplicationSummary(
+                    id: $0.id,
+                    name: $0.name,
+                    bundlePath: $0.bundlePath,
+                    flowCount: $0.flowCount
+                )
+            }
+            .sorted {
+                if $0.id == ApplicationProjection.unknownID {
+                    return false
+                }
+                if $1.id == ApplicationProjection.unknownID {
+                    return true
+                }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+    }
+
+    private static func applicationProjection(for flow: Flow) -> ApplicationProjection? {
+        guard flow.source.kind == .desktopProxy else {
+            return nil
+        }
+        guard let application = flow.source.application else {
+            return .unknown
+        }
+        return ApplicationProjection(
+            id: application.groupingIdentifier,
+            name: application.name,
+            bundlePath: application.bundlePath
+        )
     }
 
     private mutating func decrementDomainCount(_ host: String) {
@@ -454,6 +563,20 @@ struct TrafficConsoleStore {
         }
         return .orderedSame
     }
+}
+
+private struct ApplicationProjection: Equatable {
+    static let unknownID = "application:unknown"
+    static let unknown = ApplicationProjection(
+        id: unknownID,
+        name: "Unknown App",
+        bundlePath: nil
+    )
+
+    let id: String
+    let name: String
+    let bundlePath: String?
+    var flowCount = 0
 }
 
 extension FlowEvent {

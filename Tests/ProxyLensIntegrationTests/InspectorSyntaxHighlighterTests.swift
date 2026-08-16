@@ -11,14 +11,25 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
 
         XCTAssertEqual(highlighted.string, json)
         XCTAssertEqual(
-            foregroundColor(at: json.range(of: #""name""#)!, in: highlighted), .systemBlue)
+            foregroundColor(at: json.range(of: #""name""#)!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
         XCTAssertEqual(
             foregroundColor(at: json.range(of: #""ProxyLens""#)!, in: highlighted),
-            .systemRed
+            InspectorSyntaxPalette.string
         )
-        XCTAssertEqual(foregroundColor(at: json.range(of: "42")!, in: highlighted), .systemPurple)
-        XCTAssertEqual(foregroundColor(at: json.range(of: "true")!, in: highlighted), .systemOrange)
-        XCTAssertEqual(foregroundColor(at: json.range(of: "null")!, in: highlighted), .systemOrange)
+        XCTAssertEqual(
+            foregroundColor(at: json.range(of: "42")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: json.range(of: "true")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: json.range(of: "null")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
     }
 
     func testHighlightsHTTPHeaderNamesAndValues() {
@@ -28,11 +39,109 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
         XCTAssertEqual(highlighted.string, headers)
         XCTAssertEqual(
             foregroundColor(at: headers.range(of: "Content-Type")!, in: highlighted),
-            .systemBlue
+            InspectorSyntaxPalette.key
         )
         XCTAssertEqual(
             foregroundColor(at: headers.range(of: "application/json")!, in: highlighted),
             .secondaryLabelColor
+        )
+    }
+
+    func testHighlightsXMLTokensWithoutChangingContent() {
+        let xml = #"<!-- note --><root id="42"><child enabled='true'>&amp;</child></root>"#
+        let highlighted = InspectorSyntaxHighlighter.highlight(xml, as: .xml)
+
+        XCTAssertEqual(highlighted.string, xml)
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: "root")!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: "id")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: #""42""#)!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: "<!-- note -->")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: "&amp;")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+    }
+
+    func testDoesNotHighlightXMLAttributeLikeTextOutsideTags() {
+        let xml = #"<root>message id="42"</root>"#
+        let highlighted = InspectorSyntaxHighlighter.highlight(xml, as: .xml)
+
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: "id")!, in: highlighted),
+            .textColor
+        )
+        XCTAssertEqual(
+            foregroundColor(at: xml.range(of: #""42""#)!, in: highlighted),
+            .textColor
+        )
+    }
+
+    func testHighlightsURLEncodedFormKeysAndValuesWithoutChangingContent() {
+        let form = "name=ProxyLens+App&enabled=true&empty="
+        let highlighted = InspectorSyntaxHighlighter.highlight(form, as: .urlEncodedForm)
+
+        XCTAssertEqual(highlighted.string, form)
+        XCTAssertEqual(
+            foregroundColor(at: form.range(of: "name")!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            foregroundColor(at: form.range(of: "ProxyLens+App")!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+        XCTAssertEqual(
+            foregroundColor(at: form.range(of: "enabled")!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            foregroundColor(at: form.range(of: "true")!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+        XCTAssertEqual(
+            foregroundColor(at: form.range(of: "empty")!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
+    }
+
+    func testSelectsBodyLanguageFromContentType() {
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(forContentType: "application/xml; charset=utf-8"),
+            .xml
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(forContentType: "text/xml"),
+            .xml
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(forContentType: "application/problem+xml"),
+            .xml
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(
+                forContentType: "application/x-www-form-urlencoded; charset=utf-8"
+            ),
+            .urlEncodedForm
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(
+                forContentType: "multipart/form-data; boundary=test"),
+            .plainText
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(forContentType: "text/plain"),
+            .plainText
         )
     }
 
@@ -58,8 +167,15 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
         )
         XCTAssertEqual(
             foregroundColor(at: text.range(of: #""count""#)!, in: highlighted),
-            .systemBlue
+            InspectorSyntaxPalette.key
         )
+    }
+
+    func testUsesMutedColorsInsteadOfTheSaturatedSystemPalette() {
+        XCTAssertNotEqual(InspectorSyntaxPalette.key, .systemBlue)
+        XCTAssertNotEqual(InspectorSyntaxPalette.string, .systemRed)
+        XCTAssertNotEqual(InspectorSyntaxPalette.number, .systemPurple)
+        XCTAssertNotEqual(InspectorSyntaxPalette.literal, .systemOrange)
     }
 
     private func foregroundColor(

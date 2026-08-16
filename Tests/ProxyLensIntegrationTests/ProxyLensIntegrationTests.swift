@@ -63,6 +63,56 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.displayFilter.searchText, "api")
     }
 
+    func testConsoleStoreGroupsAndFiltersDesktopApplicationsWithUnknownFallback() throws {
+        let safari = FlowSource(
+            kind: .desktopProxy,
+            label: "Safari",
+            application: FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari",
+                bundlePath: "/System/Applications/Safari.app",
+                executablePath: "/System/Applications/Safari.app/Contents/MacOS/Safari",
+                processIdentifier: 101
+            )
+        )
+        let curl = FlowSource(
+            kind: .desktopProxy,
+            label: "curl",
+            application: FlowApplication(
+                name: "curl",
+                executablePath: "/usr/bin/curl",
+                processIdentifier: 202
+            )
+        )
+        let imported = FlowSource(kind: .importedSession, label: "Saved capture")
+        let flows = try [
+            Self.makeFlow(index: 1, host: "one.example.com", statusCode: 200, source: safari),
+            Self.makeFlow(index: 2, host: "two.example.com", statusCode: 200, source: safari),
+            Self.makeFlow(index: 3, host: "three.example.com", statusCode: 200, source: curl),
+            Self.makeFlow(index: 4, host: "four.example.com", statusCode: 200),
+            Self.makeFlow(index: 5, host: "five.example.com", statusCode: 200, source: imported)
+        ]
+        var store = TrafficConsoleStore()
+
+        store.apply(flows.map(FlowEvent.finished))
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+
+        XCTAssertEqual(snapshot.applications.map(\.name), ["curl", "Safari", "Unknown App"])
+        XCTAssertEqual(snapshot.applications.map(\.flowCount), [1, 2, 1])
+
+        let safariID = try XCTUnwrap(snapshot.applications.first { $0.name == "Safari" }?.id)
+        store.selectSource(.application(safariID))
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [flows[0].id, flows[1].id])
+
+        let unknownID = try XCTUnwrap(
+            snapshot.applications.first { $0.name == "Unknown App" }?.id
+        )
+        store.selectSource(.application(unknownID))
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [flows[3].id])
+    }
+
     func testDisplayFilterComposesSearchFacetsAndDomainSelection() throws {
         let matching = try Self.makeFlow(
             index: 1,
@@ -423,6 +473,162 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(tableView.numberOfRows, 1)
     }
 
+    func testFlowTableContextMenuOffersRepeatRequestFirst() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+        let flow = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        var store = TrafficConsoleStore()
+        store.apply([.finished(flow)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+
+        controller.menuNeedsUpdate(menu)
+
+        XCTAssertEqual(menu.items.first?.title, "Repeat Request")
+        XCTAssertEqual(menu.items.first?.action, NSSelectorFromString("repeatRequest:"))
+        XCTAssertEqual(menu.items.first?.representedObject as? FlowID, flow.id)
+        XCTAssertEqual(menu.items[1].title, "Edit & Repeat…")
+        XCTAssertEqual(menu.items[1].action, NSSelectorFromString("editAndRepeat:"))
+        XCTAssertEqual(menu.items[1].representedObject as? FlowID, flow.id)
+    }
+
+    func testRequestEditorExposesAccessiblePlainTextFieldsAndOnlyReturnsChangedBody() throws {
+        let controller = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: "GET / HTTP/1.1\nHost: api.example.com",
+                bodyText: "before",
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        )
+        _ = controller.view
+
+        XCTAssertEqual(controller.headersText, "GET / HTTP/1.1\nHost: api.example.com")
+        XCTAssertEqual(controller.bodyText, "before")
+        XCTAssertNil(controller.changedBodyText)
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.headers" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.body" }
+            )
+        )
+
+        controller.bodyText = "after"
+
+        XCTAssertEqual(controller.changedBodyText, "after")
+
+        let binaryController = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: "POST / HTTP/1.1\nHost: api.example.com",
+                bodyText: "",
+                canEditBody: false,
+                bodyMessage: "Binary request bodies are preserved but cannot be edited"
+            )
+        )
+        _ = binaryController.view
+        let binaryBodyEditor = Self.descendant(
+            of: NSTextView.self,
+            in: binaryController.view,
+            matching: { $0.accessibilityIdentifier() == "requestEditor.body" }
+        )
+        XCTAssertFalse(try XCTUnwrap(binaryBodyEditor).isEditable)
+        binaryController.bodyText = "replacement"
+        XCTAssertNil(binaryController.changedBodyText)
+    }
+
+    func testRequestEditorPrettyPrintsAndHighlightsJSONWithoutTreatingFormattingAsAnEdit()
+        async throws
+    {
+        let controller = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText:
+                    "POST /events HTTP/1.1\nHost: api.example.com\nContent-Type: application/json",
+                bodyText: #"{"name":"ProxyLens","enabled":true}"#,
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        )
+
+        _ = controller.view
+
+        let expected = """
+            {
+              "enabled" : true,
+              "name" : "ProxyLens"
+            }
+            """
+        XCTAssertEqual(controller.bodyText, expected)
+        XCTAssertNil(controller.changedBodyText)
+
+        let headersEditor = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.headers" }
+            )
+        )
+        let bodyEditor = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.body" }
+            )
+        )
+
+        XCTAssertEqual(
+            headersEditor.textStorage?.attribute(
+                .foregroundColor,
+                at: (headersEditor.string as NSString).range(of: "Content-Type").location,
+                effectiveRange: nil
+            ) as? NSColor,
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            bodyEditor.textStorage?.attribute(
+                .foregroundColor,
+                at: (bodyEditor.string as NSString).range(of: #""name""#).location,
+                effectiveRange: nil
+            ) as? NSColor,
+            InspectorSyntaxPalette.key
+        )
+
+        bodyEditor.string = #"{"count":42}"#
+        controller.textDidChange(
+            Notification(name: NSText.didChangeNotification, object: bodyEditor)
+        )
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(
+            bodyEditor.textStorage?.attribute(
+                .foregroundColor,
+                at: (bodyEditor.string as NSString).range(of: "42").location,
+                effectiveRange: nil
+            ) as? NSColor,
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(controller.changedBodyText, #"{"count":42}"#)
+    }
+
     func testViewModelBatchesLargeFlowListsAndLoadsAuthoritativeBodies() async throws {
         let captureController = RecordingCaptureController()
         let viewModel = TrafficConsoleViewModel(
@@ -755,6 +961,449 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
     }
 
+    func testViewModelComposesARequestIntoTheCurrentWorkspace() async throws {
+        let sessionID = SessionID()
+        let replayed = try Self.makeFlow(
+            index: 40,
+            host: "api.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let sessionService = RecordingSessionService(composeSessionID: sessionID)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer,
+            sessionService: sessionService
+        )
+        await viewModel.prepare()
+
+        let replayedID = try await viewModel.composeRequest(
+            headersText: """
+                POST https://api.example.com/v1/events HTTP/1.1
+                Content-Type: application/json
+                """,
+            bodyText: #"{"name":"ProxyLens"}"#
+        )
+
+        XCTAssertEqual(replayedID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, replayed.id)
+        let received = await replayer.receivedRequests()
+        let request = try XCTUnwrap(received.first?.request)
+        XCTAssertEqual(request.method, .post)
+        XCTAssertEqual(request.url.absoluteString, "https://api.example.com/v1/events")
+        XCTAssertEqual(request.body?.inlineData, Data(#"{"name":"ProxyLens"}"#.utf8))
+        XCTAssertEqual(
+            request.headers.firstValue(for: "Content-Length"),
+            "20"
+        )
+        XCTAssertEqual(received.first?.sessionID, sessionID)
+        let composeSessionRequestCount = await sessionService.composeSessionRequestCount()
+        XCTAssertEqual(composeSessionRequestCount, 1)
+
+        do {
+            try await viewModel.composeRequest(
+                headersText: "GET /relative HTTP/1.1\nHost: api.example.com",
+                bodyText: nil
+            )
+            XCTFail("Expected a relative composed target to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Invalid HTTP message: A composed request must use an absolute HTTP or HTTPS URL"
+            )
+        }
+        let requestsAfterInvalidInput = await replayer.receivedRequests()
+        let sessionsAfterInvalidInput = await sessionService.composeSessionRequestCount()
+        XCTAssertEqual(requestsAfterInvalidInput.count, 1)
+        XCTAssertEqual(sessionsAfterInvalidInput, 1)
+    }
+
+    func testViewModelRepeatsAFlowAndSelectsTheVisibleReplayResult() async throws {
+        let original = try Self.makeFlow(
+            index: 41,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        let replayed = try Self.makeFlow(
+            index: 42,
+            host: "api.example.com",
+            statusCode: 202,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+        viewModel.setOriginFilter(.desktopProxy)
+
+        let replayedID = try await viewModel.repeatRequest(flowID: original.id)
+
+        XCTAssertEqual(replayedID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 2)
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.displayFilter, .all)
+        XCTAssertEqual(viewModel.snapshot.selectedSource, .allTraffic)
+        XCTAssertEqual(viewModel.snapshot.inspection.flowID, replayed.id)
+        let received = await replayer.receivedRequests()
+        XCTAssertEqual(received.map(\.request), [original.request])
+        XCTAssertEqual(received.map(\.sessionID), [original.sessionID])
+    }
+
+    func testViewModelBuildsARequestDraftAndRepeatsTheEditedRequest() async throws {
+        let original = try Self.makeFlow(
+            index: 43,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("before".utf8),
+            method: .post
+        )
+        let replayed = try Self.makeFlow(
+            index: 44,
+            host: "staging.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+        let replayedID = try await viewModel.editAndRepeat(
+            flowID: original.id,
+            headersText: """
+                PUT /v2/users/42 HTTP/1.1
+                Host: staging.example.com
+                Content-Type: text/plain
+                X-Debug: enabled
+                """,
+            bodyText: "after"
+        )
+
+        XCTAssertEqual(draft.headersText, HTTPMessageText.requestHeaders(original.request))
+        XCTAssertEqual(draft.bodyText, "before")
+        XCTAssertTrue(draft.canEditBody)
+        XCTAssertNil(draft.bodyMessage)
+        XCTAssertEqual(replayedID, replayed.id)
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, replayed.id)
+        let received = await replayer.receivedRequests()
+        let editedRequest = try XCTUnwrap(received.first?.request)
+        XCTAssertEqual(editedRequest.method, .put)
+        XCTAssertEqual(editedRequest.url.absoluteString, "https://staging.example.com/v2/users/42")
+        XCTAssertEqual(editedRequest.headers.firstValue(for: "X-Debug"), "enabled")
+        XCTAssertEqual(editedRequest.body?.inlineData, Data("after".utf8))
+        XCTAssertEqual(received.first?.sessionID, original.sessionID)
+    }
+
+    func testViewModelEditsAndReencodesAGzipJSONRequestBody() async throws {
+        let compressedBody = try XCTUnwrap(
+            Data(base64Encoded: "H4sIAAAAAAAC/6tWKkvMKU1VslJKSk3LL0pVqgUAy2iO6hIAAAA=")
+        )
+        let original = try Self.makeFlow(
+            index: 47,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: compressedBody,
+            method: .post,
+            requestContentType: "application/json",
+            requestContentEncoding: "gzip"
+        )
+        let replayed = try Self.makeFlow(
+            index: 48,
+            host: "api.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+        let replayedID = try await viewModel.editAndRepeat(
+            flowID: original.id,
+            headersText: draft.headersText,
+            bodyText: #"{"value":"after"}"#
+        )
+
+        XCTAssertTrue(draft.canEditBody)
+        XCTAssertEqual(draft.bodyText, #"{"value":"before"}"#)
+        XCTAssertNil(draft.bodyMessage)
+        XCTAssertEqual(replayedID, replayed.id)
+        let received = await replayer.receivedRequests()
+        let editedRequest = try XCTUnwrap(received.first?.request)
+        let editedBody = try XCTUnwrap(editedRequest.body?.inlineData)
+        XCTAssertEqual(editedRequest.headers.firstValue(for: "Content-Encoding"), "gzip")
+        XCTAssertEqual(
+            editedRequest.headers.firstValue(for: "Content-Length"),
+            "\(editedBody.count)"
+        )
+        guard
+            case .prettyPrinted(let editedJSON) = JSONBodyView.render(
+                data: editedBody,
+                contentType: editedRequest.headers.firstValue(for: "Content-Type"),
+                contentEncoding: editedRequest.headers.firstValue(for: "Content-Encoding")
+            )
+        else {
+            return XCTFail("Expected the edited body to remain valid gzip JSON")
+        }
+        XCTAssertTrue(editedJSON.contains(#""value" : "after""#))
+    }
+
+    func testViewModelDoesNotLoadAnOversizedBodyIntoTheRequestEditor() async throws {
+        let original = try Self.makeFlow(
+            index: 45,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("ninebytes".utf8)
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            maximumEditableRequestBodyBytes: 8
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+
+        XCTAssertEqual(draft.bodyText, "")
+        XCTAssertFalse(draft.canEditBody)
+        XCTAssertEqual(draft.bodyMessage, "Body editing is limited to 8 bytes")
+    }
+
+    func testViewModelRejectsAnEditedBodyThatExceedsTheEditorLimit() async throws {
+        let original = try Self.makeFlow(
+            index: 49,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data("before".utf8)
+        )
+        let replayed = try Self.makeFlow(
+            index: 50,
+            host: "api.example.com",
+            statusCode: 201,
+            source: .replay
+        )
+        let replayer = RecordingRequestReplayer(result: replayed)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            maximumEditableRequestBodyBytes: 8,
+            requestReplayer: replayer
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        do {
+            try await viewModel.editAndRepeat(
+                flowID: original.id,
+                headersText: HTTPMessageText.requestHeaders(original.request),
+                bodyText: "ninebytes"
+            )
+            XCTFail("Expected the oversized edit to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Unsupported operation: Body editing is limited to 8 bytes"
+            )
+        }
+        let received = await replayer.receivedRequests()
+        XCTAssertTrue(received.isEmpty)
+    }
+
+    func testViewModelPreservesABinaryBodyOutsideTheTextRequestEditor() async throws {
+        let original = try Self.makeFlow(
+            index: 46,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data([0x00, 0xFF, 0x01])
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(original))
+        viewModel.flushPendingEvents()
+
+        let draft = try await viewModel.requestEditDraft(flowID: original.id)
+
+        XCTAssertEqual(draft.bodyText, "")
+        XCTAssertFalse(draft.canEditBody)
+        XCTAssertEqual(
+            draft.bodyMessage,
+            "Binary request bodies are preserved but cannot be edited"
+        )
+    }
+
+    func testTrafficConsoleHidesWindowTitleAndInspectorWithoutSelection() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 12,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        XCTAssertNil(viewModel.snapshot.selectedFlowID)
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "ProxyLens"
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        defer {
+            window.orderOut(nil)
+            window.contentViewController = nil
+        }
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+
+        let detailSplit = try XCTUnwrap(
+            Self.descendant(
+                of: NSSplitView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.split.detail" }
+            )
+        )
+        let flowPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.flows" }
+            )
+        )
+        let inspectorPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.inspector" }
+            )
+        )
+        XCTAssertEqual(flowPane.frame.height, detailSplit.bounds.height, accuracy: 1)
+        XCTAssertTrue(inspectorPane.visibleRect.isEmpty)
+
+        let titlebarRoot = try XCTUnwrap(window.contentView?.superview)
+        let title = Self.descendant(
+            of: NSTextField.self,
+            in: titlebarRoot,
+            matching: { $0.accessibilityIdentifier() == "window.title.centered" }
+        )
+        XCTAssertNil(title)
+        XCTAssertEqual(window.titleVisibility, .hidden)
+        XCTAssertNil(window.toolbar)
+
+        let composeButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "request.compose" }
+            )
+        )
+        XCTAssertEqual(composeButton.title, "Compose Request…")
+        XCTAssertEqual(composeButton.action, NSSelectorFromString("composeRequest:"))
+        XCTAssertEqual(composeButton.keyEquivalent, "n")
+        XCTAssertEqual(composeButton.keyEquivalentModifierMask, [.command])
+
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowID == flow.id
+                && !inspectorPane.visibleRect.isEmpty
+                && inspectorPane.frame.height >= 240
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            flowPane.frame.height / detailSplit.bounds.height,
+            0.36,
+            accuracy: 0.05
+        )
+
+        let requestedInspectorHeight: CGFloat = 280
+        detailSplit.setPosition(
+            detailSplit.bounds.height
+                - detailSplit.dividerThickness
+                - requestedInspectorHeight,
+            ofDividerAt: 0
+        )
+        controller.view.layoutSubtreeIfNeeded()
+        let rememberedInspectorHeight = inspectorPane.frame.height
+        XCTAssertEqual(rememberedInspectorHeight, requestedInspectorHeight, accuracy: 1)
+
+        viewModel.selectFlow(nil)
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowID == nil
+                && inspectorPane.visibleRect.isEmpty
+                && abs(flowPane.frame.height - detailSplit.bounds.height) <= 1
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(flowPane.frame.height, detailSplit.bounds.height, accuracy: 1)
+        XCTAssertTrue(inspectorPane.visibleRect.isEmpty)
+
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowID == flow.id
+                && !inspectorPane.visibleRect.isEmpty
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(inspectorPane.frame.height, rememberedInspectorHeight, accuracy: 1)
+    }
+
     func testTrafficConsoleRendersSplitMessageInspector() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
@@ -765,8 +1414,23 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         await viewModel.prepare()
 
+        let safariSource = FlowSource(
+            kind: .desktopProxy,
+            label: "Safari",
+            application: FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari",
+                bundlePath: "/System/Applications/Safari.app",
+                processIdentifier: 501
+            )
+        )
         let flows = try [
-            Self.makeFlow(index: 1, host: "api.example.com", statusCode: 201),
+            Self.makeFlow(
+                index: 1,
+                host: "api.example.com",
+                statusCode: 201,
+                source: safariSource
+            ),
             Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 304),
             Self.makeFlow(
                 index: 3,
@@ -885,6 +1549,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
 
         let sourcePaneFrame = sourcePane.convert(sourcePane.bounds, to: controller.view)
         let workspaceFrame = detailSplit.convert(detailSplit.bounds, to: controller.view)
+        XCTAssertGreaterThanOrEqual(sourcePaneFrame.width, 250)
         XCTAssertGreaterThanOrEqual(sourcePaneFrame.minY, workspaceFrame.minY)
         XCTAssertLessThanOrEqual(sourcePaneFrame.maxY, workspaceFrame.maxY)
         XCTAssertGreaterThan(sourcePaneFrame.height, workspaceFrame.height * 0.9)
@@ -975,7 +1640,24 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 )
             )
         }
-        XCTAssertEqual(sourceOutline.numberOfRows, 5)
+        XCTAssertEqual(sourceOutline.numberOfRows, 8)
+        let sourceLabels = (0..<sourceOutline.numberOfRows).compactMap { row in
+            sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                .accessibilityLabel()
+        }
+        XCTAssertEqual(
+            sourceLabels,
+            [
+                "All Traffic, 4 flows",
+                "Apps, 2 applications",
+                "Safari, 1 flow",
+                "Unknown App, 3 flows",
+                "Domains, 3 domains",
+                "api.example.com, 2 flows",
+                "auth.example.net, 1 flow",
+                "cdn.example.com, 1 flow"
+            ]
+        )
         XCTAssertEqual(flowTable.numberOfRows, flows.count)
         XCTAssertTrue(requestInspector.string.contains("POST /v1/items/3?source=test HTTP/1.1"))
         XCTAssertTrue(responseInspector.string.contains("HTTP/1.1 404 Result"))
@@ -1204,7 +1886,96 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 at: NSRange(keyRange, in: inspector.string).location,
                 effectiveRange: nil
             ) as? NSColor
-        XCTAssertEqual(keyColor, .systemBlue)
+        XCTAssertEqual(keyColor, InspectorSyntaxPalette.key)
+    }
+
+    func testInspectorHighlightsBodyFromDeclaredContentTypeWithoutColoringMetadata() throws {
+        let requestXML = #"<root id="42"/>"#
+        let responseForm = "name=ProxyLens&enabled=true"
+        let flowID = FlowID()
+        let snapshot = TrafficConsoleSnapshot(
+            capture: .stopped,
+            workspaceWarning: nil,
+            certificateTrust: nil,
+            allFlowCount: 1,
+            applications: [],
+            domains: [],
+            selectedSource: .allTraffic,
+            displayFilter: .all,
+            visibleRows: [],
+            selectedFlowID: flowID,
+            inspection: TrafficFlowInspection(
+                flowID: flowID,
+                title: "POST https://api.example.com/v1",
+                request: TrafficMessageInspection(
+                    title: "Request",
+                    headers: "POST /v1 HTTP/1.1\nHost: api.example.com",
+                    body: .content(metadata: "15 B • application/xml", value: requestXML),
+                    json: .none("This body is not JSON."),
+                    bodyContentType: "application/xml"
+                ),
+                response: TrafficMessageInspection(
+                    title: "Response",
+                    headers: "HTTP/1.1 200 OK",
+                    body: .content(
+                        metadata: "27 B • application/x-www-form-urlencoded",
+                        value: responseForm
+                    ),
+                    json: .none("This body is not JSON."),
+                    bodyContentType: "application/x-www-form-urlencoded"
+                ),
+                rules: "No rules applied to this flow.",
+                breakpoint: nil
+            )
+        )
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(snapshot)
+
+        for (prefix, token, expectedColor) in [
+            ("request", "root", InspectorSyntaxPalette.key),
+            ("response", "name", InspectorSyntaxPalette.key),
+            ("response", "ProxyLens", InspectorSyntaxPalette.string)
+        ] {
+            let sectionSelector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSSegmentedControl.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "inspector.\(prefix).section"
+                    }
+                )
+            )
+            sectionSelector.selectedSegment = 1
+            sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+            let inspector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSTextView.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "inspector.\(prefix).content"
+                    }
+                )
+            )
+            let tokenRange = try XCTUnwrap(inspector.string.range(of: token))
+            let tokenColor =
+                inspector.textStorage?.attribute(
+                    .foregroundColor,
+                    at: NSRange(tokenRange, in: inspector.string).location,
+                    effectiveRange: nil
+                ) as? NSColor
+            XCTAssertEqual(tokenColor, expectedColor)
+            XCTAssertEqual(
+                inspector.textStorage?.attribute(
+                    .foregroundColor,
+                    at: 0,
+                    effectiveRange: nil
+                ) as? NSColor,
+                .textColor
+            )
+        }
     }
 
     func testInspectorDoesNotCopyJSONTabIntoBodyEditsDuringBreakpoint() throws {
@@ -1216,6 +1987,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             workspaceWarning: nil,
             certificateTrust: nil,
             allFlowCount: 1,
+            applications: [],
             domains: [],
             selectedSource: .allTraffic,
             displayFilter: .all,
@@ -1228,7 +2000,8 @@ final class ProxyLensIntegrationTests: XCTestCase {
                     title: "Request",
                     headers: "POST /v1 HTTP/1.1\nHost: api.example.com",
                     body: .content(metadata: "11 B", value: compact),
-                    json: .content(metadata: "11 B", value: pretty)
+                    json: .content(metadata: "11 B", value: pretty),
+                    bodyContentType: "application/json"
                 ),
                 response: nil,
                 rules: "No rules applied to this flow.",
@@ -1287,13 +2060,22 @@ final class ProxyLensIntegrationTests: XCTestCase {
         method: HTTPMethod? = nil,
         responseContentType: String = "application/octet-stream",
         source: FlowSource = .desktopProxy,
-        requestHeaderValue: String? = nil
+        requestHeaderValue: String? = nil,
+        requestContentType: String = "text/plain",
+        requestContentEncoding: String? = nil
     ) throws -> Flow {
         var requestHeaders = HTTPHeaders()
         try requestHeaders.append(name: "Host", value: host)
         try requestHeaders.append(name: "Accept", value: "application/json")
         if let requestHeaderValue {
             try requestHeaders.append(name: "X-Debug-Label", value: requestHeaderValue)
+        }
+        if let requestBody {
+            try requestHeaders.append(name: "Content-Type", value: requestContentType)
+            try requestHeaders.append(name: "Content-Length", value: "\(requestBody.count)")
+            if let requestContentEncoding {
+                try requestHeaders.append(name: "Content-Encoding", value: requestContentEncoding)
+            }
         }
         var request = HTTPRequest(
             method: method ?? (index.isMultiple(of: 2) ? .get : .post),
@@ -1304,7 +2086,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
             request.attachBody(
                 BodyReference(
                     inline: requestBody,
-                    metadata: BodyMetadata(contentType: "text/plain")
+                    metadata: BodyMetadata(
+                        contentType: requestContentType,
+                        contentEncoding: requestContentEncoding
+                    )
                 )
             )
         }
@@ -1400,6 +2185,11 @@ private final class RecordingTableView: NSTableView {
     private(set) var removedRowIndexes: [IndexSet] = []
     private(set) var movedRows: [(from: Int, to: Int)] = []
     private(set) var dataSourceRowCountsDuringRemovals: [Int] = []
+    var clickedRowOverride: Int?
+
+    override var clickedRow: Int {
+        clickedRowOverride ?? super.clickedRow
+    }
 
     override func reloadData() {
         fullReloadCount += 1
@@ -1509,14 +2299,39 @@ private actor InlineBodyStore: BodyStore {
     func remove(_: BodyReference) {}
 }
 
+private actor RecordingRequestReplayer: TrafficRequestReplaying {
+    private let result: Flow
+    private var requests: [(request: HTTPRequest, sessionID: SessionID)] = []
+
+    init(result: Flow) {
+        self.result = result
+    }
+
+    func repeatRequest(_ request: HTTPRequest, sessionID: SessionID) -> Flow {
+        requests.append((request, sessionID))
+        return result
+    }
+
+    func receivedRequests() -> [(request: HTTPRequest, sessionID: SessionID)] {
+        requests
+    }
+}
+
 private actor RecordingSessionService: TrafficSessionLoading {
     private var flows: [Flow]
     private var didClear = false
     private let loadError: (any Error)?
+    private let composeSessionID: SessionID
+    private var composeSessionRequests = 0
 
-    init(flows: [Flow] = [], loadError: (any Error)? = nil) {
+    init(
+        flows: [Flow] = [],
+        loadError: (any Error)? = nil,
+        composeSessionID: SessionID = SessionID()
+    ) {
         self.flows = flows
         self.loadError = loadError
+        self.composeSessionID = composeSessionID
     }
 
     func loadWorkspace() throws -> [Flow] {
@@ -1531,8 +2346,17 @@ private actor RecordingSessionService: TrafficSessionLoading {
         didClear = true
     }
 
+    func sessionIDForNewFlow() -> SessionID {
+        composeSessionRequests += 1
+        return composeSessionID
+    }
+
     func cleared() -> Bool {
         didClear
+    }
+
+    func composeSessionRequestCount() -> Int {
+        composeSessionRequests
     }
 }
 

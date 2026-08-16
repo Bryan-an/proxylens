@@ -240,6 +240,21 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         let path = Self.mappingPath(for: rows[rowIndex])
         let flowID = rows[rowIndex].id
         menu.addItem(
+            exportMenuItem(
+                title: "Repeat Request",
+                flowID: flowID,
+                action: #selector(repeatRequest)
+            )
+        )
+        menu.addItem(
+            exportMenuItem(
+                title: "Edit & Repeat…",
+                flowID: flowID,
+                action: #selector(editAndRepeat)
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
             exportMenuItem(title: "Copy as cURL", flowID: flowID, action: #selector(copyCURL))
         )
         menu.addItem(
@@ -303,6 +318,67 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         item.target = self
         item.representedObject = host
         return item
+    }
+
+    @objc private func repeatRequest(_ sender: NSMenuItem) {
+        guard let flowID = sender.representedObject as? FlowID else {
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                try await viewModel.repeatRequest(flowID: flowID)
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    @objc private func editAndRepeat(_ sender: NSMenuItem) {
+        guard let flowID = sender.representedObject as? FlowID else {
+            return
+        }
+
+        Task { @MainActor in
+            await presentRequestEditor(flowID: flowID)
+        }
+    }
+
+    private func presentRequestEditor(flowID: FlowID) async {
+        do {
+            let draft = try await viewModel.requestEditDraft(flowID: flowID)
+            let editor = RequestEditorViewController(draft: draft)
+            addChild(editor)
+            defer { editor.removeFromParent() }
+
+            let alert = NSAlert()
+            alert.messageText = "Edit & Repeat"
+            alert.informativeText =
+                "Edit the request line, headers, or text body before sending a new request."
+            alert.addButton(withTitle: "Send Request")
+            let cancelButton = alert.addButton(withTitle: "Cancel")
+            cancelButton.keyEquivalent = "\u{1b}"
+            alert.accessoryView = editor.view
+            alert.window.initialFirstResponder = editor.initialFirstResponder
+
+            let response: NSApplication.ModalResponse
+            if let window = view.window {
+                response = await alert.beginSheetModal(for: window)
+            } else {
+                response = alert.runModal()
+            }
+            guard response == .alertFirstButtonReturn else {
+                return
+            }
+
+            try await viewModel.editAndRepeat(
+                flowID: flowID,
+                headersText: editor.headersText,
+                bodyText: editor.changedBodyText
+            )
+        } catch {
+            await presentError(error)
+        }
     }
 
     @objc private func copyCURL(_ sender: NSMenuItem) {

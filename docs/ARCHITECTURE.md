@@ -72,7 +72,8 @@ The core may use Foundation value types where useful, but it must not import App
 - Apply the active rule set.
 - Persist flow events.
 - Manage sessions and saved filters.
-- Replay and export requests.
+- Replay captured requests and persist the resulting flows.
+- Export requests and responses.
 - Coordinate the proxy engine, storage, certificate provider, and system proxy controller.
 
 The application layer depends on core protocols. It does not construct concrete NIO channels, SQLite connections, or AppKit views.
@@ -177,6 +178,7 @@ ProxyLens/
 │   │   │   │       └── RuleTrace.swift
 │   │   │   ├── Ports/
 │   │   │   │   ├── ProxyEngine.swift
+│   │   │   │   ├── RequestReplayClient.swift
 │   │   │   │   ├── FlowStore.swift
 │   │   │   │   ├── BodyStore.swift
 │   │   │   │   ├── CertificateProvider.swift
@@ -213,6 +215,8 @@ ProxyLens/
 │   │   │   │   └── ConnectTunnelHandler.swift
 │   │   │   ├── Upstream/
 │   │   │   │   └── UpstreamConnection.swift
+│   │   │   ├── Replay/
+│   │   │   │   └── NIORequestReplayClient.swift
 │   │   │   ├── TLS/
 │   │   │   │   └── TLSChannelConfiguration.swift
 │   │   │   └── WebSocket/
@@ -434,6 +438,22 @@ AppKit views
 
 The view model may maintain a display projection for sorting and grouping. It hydrates that projection from `SessionService` on launch and retains the body store for inspection and export.
 
+Compose Request, Repeat Request, and Edit & Repeat are explicit control-plane actions.
+`ReplayService` sends the composed, captured, or edited request through the core
+`RequestReplayClient` port, persists the returned flow in the current workspace session, and
+exposes it to the traffic console as a new `.replay` source. A composed request requires an
+absolute HTTP or HTTPS URL because it has no captured request from which to infer an upstream.
+When the workspace is empty, `SessionService` creates a stopped local session to own the new flow.
+The editor accepts a request line, headers, and UTF-8 body text. Captured gzip, x-gzip, and
+deflate text bodies are decoded for editing and re-encoded before replay; unsupported captured
+encodings remain unchanged. A composed body may use identity, gzip, x-gzip, or deflate encoding.
+Both stored and decoded body loading are capped at 1 MiB, and edits are checked against the same
+limit before sending. Binary and larger bodies remain unchanged. The SwiftNIO adapter connects
+directly to the selected HTTP or HTTPS upstream, verifies TLS, strips hop-by-hop headers,
+recomputes `Host` and `Content-Length`, does not follow redirects, rejects truncated or oversized
+request bodies, bounds captured response bytes, and fails idle responses after 30 seconds. Active
+rules are not re-evaluated for replays.
+
 ## Persistence architecture
 
 `ProxyLensPersistence` should expose application-level operations, not raw SQL to the rest of the app.
@@ -476,11 +496,18 @@ P0 rules currently implemented in the shared pipeline:
 
 Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.
 
-P0 JSON inspection currently implemented:
+P0 application source attribution currently implemented:
+
+- When the listener accepts a local proxy connection, `MacOSFlowSourceResolver` inspects the TCP socket owner with `libproc` and resolves the process to application metadata with AppKit and the process APIs. The scan runs on a dedicated serial utility queue before the HTTP pipeline is installed, so it does not block a SwiftNIO event-loop thread.
+- The immutable `FlowSource` stores the display name, bundle identifier, outermost application-bundle path, executable path, process identifier, and client endpoint. Helper processes inside an application bundle group under the outermost host application.
+- The source sidebar groups desktop-proxy flows under **Apps**, uses installed application icons when a bundle path is available, and supports selecting an application as a traffic filter. Attribution failures degrade to **Unknown App** without interrupting capture. Imported and replayed flows are not presented as locally attributed applications.
+- This is best-effort attribution for explicit local proxy connections. It does not require a privileged helper or `NetworkExtension`, and short-lived sockets or processes hidden by operating-system permissions may remain unknown.
+
+P0 body inspection currently implemented:
 
 - `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
-- gzip, x-gzip, and deflate are unwrapped only for this derived view, and decoded output is bounded to 1 MB. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
-- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens and HTTP header names/values while leaving captured and edited text unchanged. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, XML/form/Protobuf, and JSONPath remain out of scope.
+- `HTTPContentCoding` unwraps gzip, x-gzip, and deflate with a bounded decoded size for the derived JSON view and Edit & Repeat. Edited compressed text is re-encoded before replay. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
+- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens, HTTP header names/values, XML in the raw Body tab, and URL-encoded form keys/values. The Compose Request and Edit & Repeat windows reuse the same palette, initially pretty-print valid JSON, and refresh body highlighting when either headers or body text changes. Opening and sending an untouched formatted captured body still replays the authoritative captured bytes. Raw Body highlighting uses the declared content type; `application/xml`, `text/xml`, and `+xml` types are treated as XML, and `application/x-www-form-urlencoded` is treated as form data. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, decoded XML/form tabs, multipart parsing, Protobuf, and JSONPath remain out of scope.
 
 P0 export currently implemented:
 
@@ -521,6 +548,7 @@ All macOS-specific security behavior belongs in `ProxyLensPlatform`:
 - Keychain storage of private keys and certificates.
 - Certificate trust guidance or installation via `CertificateTrustStore` / `SystemCertificateTrustStore`.
 - System HTTP/HTTPS proxy configuration and restoration.
+- Local TCP socket ownership and application metadata attribution.
 - OSLog categories and redaction.
 - Future login-item or helper-process registration.
 

@@ -138,6 +138,32 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertTrue(flow.state.isTerminal)
     }
 
+    func testFlowApplicationUsesStableGroupingIdentifiers() {
+        XCTAssertEqual(
+            FlowApplication(
+                name: "Safari",
+                bundleIdentifier: "COM.APPLE.SAFARI",
+                bundlePath: "/Applications/Other.app",
+                executablePath: "/bin/other"
+            ).groupingIdentifier,
+            "bundle:com.apple.safari"
+        )
+        XCTAssertEqual(
+            FlowApplication(name: "curl", executablePath: "/usr/bin/curl").groupingIdentifier,
+            "executable:/usr/bin/curl"
+        )
+    }
+
+    func testFlowSourceDecodesSnapshotsWrittenBeforeApplicationAttribution() throws {
+        let source = try JSONDecoder().decode(
+            FlowSource.self,
+            from: Data(#"{"kind":"desktopProxy","label":"Desktop proxy"}"#.utf8)
+        )
+
+        XCTAssertEqual(source, .desktopProxy)
+        XCTAssertNil(source.application)
+    }
+
     func testFlowTimingCalculatesPhaseDurations() {
         let start = Date(timeIntervalSince1970: 2_000)
         var timing = FlowTiming(startedAt: start)
@@ -819,6 +845,68 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertEqual(parsedResponse.body?.inlineData, Data("created".utf8))
     }
 
+    func testHTTPMessageTextParsesAComposedAbsoluteRequestWithoutAnOriginal() throws {
+        let request = try HTTPMessageText.parseRequest(
+            headersText: """
+                POST https://api.example.com/v1/events?source=compose HTTP/1.1
+                Content-Type: application/json
+                """,
+            body: Data(#"{"ok":true}"#.utf8)
+        )
+
+        XCTAssertEqual(request.method, .post)
+        XCTAssertEqual(
+            request.url.absoluteString,
+            "https://api.example.com/v1/events?source=compose"
+        )
+        XCTAssertEqual(
+            request.rawTarget,
+            "https://api.example.com/v1/events?source=compose"
+        )
+        XCTAssertEqual(request.headers.firstValue(for: "Content-Length"), "11")
+        XCTAssertEqual(request.body?.inlineData, Data(#"{"ok":true}"#.utf8))
+
+        XCTAssertThrowsError(
+            try HTTPMessageText.parseRequest(
+                headersText: "GET /v1/events HTTP/1.1\nHost: api.example.com",
+                body: nil
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .invalidHTTPMessage(
+                    "A composed request must use an absolute HTTP or HTTPS URL"
+                )
+            )
+        }
+        XCTAssertThrowsError(
+            try HTTPMessageText.parseRequest(
+                headersText: "GET https:/missing-host HTTP/1.1",
+                body: nil
+            )
+        )
+    }
+
+    func testHTTPMessageTextRejectsAnInvalidEditedRequestMethod() throws {
+        let original = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+
+        XCTAssertThrowsError(
+            try HTTPMessageText.parseRequest(
+                headersText: "G\u{0001}ET /users HTTP/1.1\nHost: api.example.com",
+                body: nil,
+                original: original
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .invalidHTTPMessage("Invalid request method: G\u{0001}ET")
+            )
+        }
+    }
+
     func testMappedLocalHTTPResponseUsesFileBodyAndHeaders() throws {
         let body = BodyReference(
             inline: Data(#"{"ok":true}"#.utf8),
@@ -1373,5 +1461,29 @@ final class ProxyLensCoreTests: XCTestCase {
             contentEncoding: "gzip"
         )
         XCTAssertEqual(exploded, .unavailable(reason: JSONBodyView.exceedsDisplayLimitReason))
+    }
+
+    func testHTTPContentCodingRoundTripsGzipAndBoundsDecodedOutput() throws {
+        let body = Data(#"{"value":"editable"}"#.utf8)
+        let encoded = try HTTPContentCoding.encode(body, contentEncoding: "gzip")
+
+        XCTAssertNotEqual(encoded, body)
+        XCTAssertEqual(
+            try HTTPContentCoding.decode(
+                encoded,
+                contentEncoding: "gzip",
+                maximumOutputByteCount: body.count
+            ),
+            body
+        )
+        XCTAssertThrowsError(
+            try HTTPContentCoding.decode(
+                encoded,
+                contentEncoding: "gzip",
+                maximumOutputByteCount: body.count - 1
+            )
+        ) { error in
+            XCTAssertEqual(error as? HTTPContentCoding.CodingError, .exceedsLimit)
+        }
     }
 }

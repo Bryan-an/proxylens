@@ -23,6 +23,25 @@ public enum HTTPMessageText: Sendable {
         body: Data?,
         original: HTTPRequest
     ) throws -> HTTPRequest {
+        try parseRequestImpl(headersText: headersText, body: body, original: original)
+    }
+
+    /// Parses a standalone request created outside an existing captured flow.
+    ///
+    /// The request target must be an absolute HTTP or HTTPS URL because there is no original
+    /// request from which to infer a scheme and authority.
+    public static func parseRequest(
+        headersText: String,
+        body: Data?
+    ) throws -> HTTPRequest {
+        try parseRequestImpl(headersText: headersText, body: body, original: nil)
+    }
+
+    private static func parseRequestImpl(
+        headersText: String,
+        body: Data?,
+        original: HTTPRequest?
+    ) throws -> HTTPRequest {
         let (firstLine, headers) = try parseMessage(headersText)
         let parts = firstLine.split(whereSeparator: { $0 == " " || $0 == "\t" })
             .map(String.init)
@@ -30,11 +49,14 @@ public enum HTTPMessageText: Sendable {
             throw ProxyLensError.invalidHTTPMessage("Request line must be METHOD target version")
         }
 
+        guard isToken(parts[0]) else {
+            throw ProxyLensError.invalidHTTPMessage("Invalid request method: \(parts[0])")
+        }
         let method = HTTPMethod(rawValue: parts[0])
         let target = parts[1]
         let version = try parseVersion(parts[2...].joined(separator: " "))
         let url = try requestURL(target: target, headers: headers, original: original)
-        let bodyReference = try resolvedBody(body, original: original.body, headers: headers)
+        let bodyReference = try resolvedBody(body, original: original?.body, headers: headers)
         let synchronizedHeaders = try synchronizedBodyHeaders(
             headers,
             byteCount: bodyReference?.byteCount,
@@ -130,13 +152,24 @@ public enum HTTPMessageText: Sendable {
     private static func requestURL(
         target: String,
         headers: HTTPHeaders,
-        original: HTTPRequest
+        original: HTTPRequest?
     ) throws -> URL {
         if let absolute = URL(string: target), let scheme = absolute.scheme,
             scheme.caseInsensitiveCompare("http") == .orderedSame
                 || scheme.caseInsensitiveCompare("https") == .orderedSame
         {
+            if original == nil, absolute.host?.isEmpty != false {
+                throw ProxyLensError.invalidHTTPMessage(
+                    "A composed request must use an absolute HTTP or HTTPS URL"
+                )
+            }
             return absolute
+        }
+
+        guard let original else {
+            throw ProxyLensError.invalidHTTPMessage(
+                "A composed request must use an absolute HTTP or HTTPS URL"
+            )
         }
 
         guard target == "*" || target.hasPrefix("/") else {
@@ -196,5 +229,19 @@ public enum HTTPMessageText: Sendable {
             result += "?\(query)"
         }
         return result
+    }
+
+    private static func isToken(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                let value = scalar.value
+                if (65...90).contains(value) || (97...122).contains(value)
+                    || (48...57).contains(value)
+                {
+                    return true
+                }
+                return [33, 35, 36, 37, 38, 39, 42, 43, 45, 46, 94, 95, 96, 124, 126]
+                    .contains(value)
+            }
     }
 }

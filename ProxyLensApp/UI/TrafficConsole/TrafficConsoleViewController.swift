@@ -12,12 +12,23 @@ final class TrafficConsoleViewController: NSViewController {
     private let detailSplitViewController = NSSplitViewController()
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
+    private let composeButton = NSButton()
     private let certificateButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
+    private lazy var inspectorSplitViewItem: NSSplitViewItem = {
+        let item = NSSplitViewItem(viewController: inspectorController)
+        item.minimumThickness = 240
+        item.preferredThicknessFraction = 0.64
+        item.canCollapse = true
+        return item
+    }()
     private var snapshotCancellable: AnyCancellable?
+    private var didSetInitialSourcePosition = false
     private var didSetInitialDetailPosition = false
+    private var rememberedInspectorHeight: CGFloat?
+    private weak var configuredWindow: NSWindow?
 
     init(viewModel: TrafficConsoleViewModel) {
         self.viewModel = viewModel
@@ -65,6 +76,15 @@ final class TrafficConsoleViewController: NSViewController {
         clearSessionButton.action = #selector(clearSession)
         clearSessionButton.setAccessibilityIdentifier("session.clear")
 
+        composeButton.translatesAutoresizingMaskIntoConstraints = false
+        composeButton.title = "Compose Request…"
+        composeButton.bezelStyle = .rounded
+        composeButton.target = self
+        composeButton.action = #selector(composeRequest(_:))
+        composeButton.keyEquivalent = "n"
+        composeButton.keyEquivalentModifierMask = [.command]
+        composeButton.setAccessibilityIdentifier("request.compose")
+
         certificateButton.translatesAutoresizingMaskIntoConstraints = false
         certificateButton.title = "Trust HTTPS Certificate…"
         certificateButton.bezelStyle = .rounded
@@ -77,6 +97,7 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
+        header.addSubview(composeButton)
         header.addSubview(certificateButton)
         header.addSubview(clearSessionButton)
         header.addSubview(captureButton)
@@ -90,7 +111,10 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.leadingAnchor.constraint(equalTo: statusImage.trailingAnchor, constant: 5),
             statusField.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusField.trailingAnchor.constraint(
-                lessThanOrEqualTo: certificateButton.leadingAnchor, constant: -12),
+                lessThanOrEqualTo: composeButton.leadingAnchor, constant: -12),
+            composeButton.trailingAnchor.constraint(
+                equalTo: certificateButton.leadingAnchor, constant: -8),
+            composeButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             certificateButton.trailingAnchor.constraint(
                 equalTo: clearSessionButton.leadingAnchor, constant: -8),
             certificateButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -149,8 +173,36 @@ final class TrafficConsoleViewController: NSViewController {
     override func viewDidAppear() {
         super.viewDidAppear()
 
+        hideWindowTitle()
+        setInitialSourcePositionIfNeeded()
+        setInitialDetailPositionIfNeeded()
+    }
+
+    private func setInitialSourcePositionIfNeeded() {
+        let splitView = splitViewController.splitView
+        guard !didSetInitialSourcePosition,
+            view.window != nil,
+            splitViewController.splitViewItems.count == 2,
+            splitView.bounds.width > 0
+        else {
+            return
+        }
+
+        didSetInitialSourcePosition = true
+        let sourceItem = splitViewController.splitViewItems[0]
+        let preferredWidth = splitView.bounds.width * sourceItem.preferredThicknessFraction
+        let sourceWidth = min(
+            max(preferredWidth, sourceItem.minimumThickness),
+            sourceItem.maximumThickness
+        )
+        splitView.setPosition(sourceWidth, ofDividerAt: 0)
+    }
+
+    private func setInitialDetailPositionIfNeeded() {
         let detailSplitView = detailSplitViewController.splitView
         guard !didSetInitialDetailPosition,
+            view.window != nil,
+            !inspectorSplitViewItem.isCollapsed,
             detailSplitViewController.splitViewItems.count == 2,
             detailSplitView.bounds.height > 0
         else {
@@ -159,6 +211,52 @@ final class TrafficConsoleViewController: NSViewController {
 
         didSetInitialDetailPosition = true
         detailSplitView.setPosition(detailSplitView.bounds.height * 0.36, ofDividerAt: 0)
+    }
+
+    private func rememberInspectorHeight() {
+        let inspectorView = inspectorController.view
+        guard view.window != nil,
+            !inspectorView.visibleRect.isEmpty,
+            inspectorView.frame.height > 0
+        else {
+            return
+        }
+
+        rememberedInspectorHeight = inspectorView.frame.height
+    }
+
+    private func restoreInspectorHeightIfPossible() {
+        guard let rememberedInspectorHeight,
+            view.window != nil,
+            detailSplitViewController.splitViewItems.count == 2
+        else {
+            return
+        }
+
+        view.layoutSubtreeIfNeeded()
+        let detailSplitView = detailSplitViewController.splitView
+        let availableHeight = detailSplitView.bounds.height - detailSplitView.dividerThickness
+        let flowMinimumHeight = detailSplitViewController.splitViewItems[0].minimumThickness
+        let maximumInspectorHeight = max(0, availableHeight - flowMinimumHeight)
+        let minimumInspectorHeight = min(
+            inspectorSplitViewItem.minimumThickness,
+            maximumInspectorHeight
+        )
+        let inspectorHeight = min(
+            max(rememberedInspectorHeight, minimumInspectorHeight),
+            maximumInspectorHeight
+        )
+        detailSplitView.setPosition(availableHeight - inspectorHeight, ofDividerAt: 0)
+    }
+
+    private func hideWindowTitle() {
+        guard let window = view.window, configuredWindow !== window else {
+            return
+        }
+
+        window.titleVisibility = .hidden
+        window.toolbar = nil
+        configuredWindow = window
     }
 
     private func configureSplitView() {
@@ -175,13 +273,13 @@ final class TrafficConsoleViewController: NSViewController {
 
         let sources = NSSplitViewItem(sidebarWithViewController: sourceController)
         sources.minimumThickness = 170
-        sources.maximumThickness = 320
-        sources.preferredThicknessFraction = 0.18
+        sources.maximumThickness = 400
+        sources.preferredThicknessFraction = 0.22
         sources.canCollapse = true
 
         let workspace = NSSplitViewItem(viewController: detailSplitViewController)
         workspace.minimumThickness = 640
-        workspace.preferredThicknessFraction = 0.82
+        workspace.preferredThicknessFraction = 0.78
 
         let flows = NSSplitViewItem(viewController: flowController)
         flows.minimumThickness = 180
@@ -190,13 +288,8 @@ final class TrafficConsoleViewController: NSViewController {
             NSLayoutConstraint.Priority.defaultLow.rawValue + 1
         )
 
-        let inspector = NSSplitViewItem(viewController: inspectorController)
-        inspector.minimumThickness = 240
-        inspector.preferredThicknessFraction = 0.64
-        inspector.canCollapse = true
-
         detailSplitViewController.addSplitViewItem(flows)
-        detailSplitViewController.addSplitViewItem(inspector)
+        detailSplitViewController.addSplitViewItem(inspectorSplitViewItem)
         splitViewController.addSplitViewItem(sources)
         splitViewController.addSplitViewItem(workspace)
     }
@@ -205,6 +298,24 @@ final class TrafficConsoleViewController: NSViewController {
         sourceController.render(snapshot)
         flowController.render(snapshot)
         inspectorController.render(snapshot)
+
+        let shouldCollapseInspector = snapshot.selectedFlowID == nil
+        if inspectorSplitViewItem.isCollapsed != shouldCollapseInspector {
+            if shouldCollapseInspector {
+                rememberInspectorHeight()
+                inspectorSplitViewItem.isCollapsed = true
+            } else {
+                inspectorSplitViewItem.isCollapsed = false
+                restoreInspectorHeightIfPossible()
+            }
+        }
+        if !shouldCollapseInspector,
+            !didSetInitialDetailPosition,
+            view.window != nil
+        {
+            view.layoutSubtreeIfNeeded()
+            setInitialDetailPositionIfNeeded()
+        }
 
         let presentation = CaptureControlPresentation(snapshot.capture)
         statusImage.image = NSImage(
@@ -262,6 +373,62 @@ final class TrafficConsoleViewController: NSViewController {
 
     @objc private func toggleCapture() {
         viewModel.toggleCapture()
+    }
+
+    @objc private func composeRequest(_: NSButton) {
+        Task { @MainActor in
+            await presentRequestComposer()
+        }
+    }
+
+    private func presentRequestComposer() async {
+        let editor = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: """
+                    GET https://example.com/ HTTP/1.1
+                    Accept: application/json
+                    """,
+                bodyText: "",
+                canEditBody: true,
+                bodyMessage: nil
+            )
+        )
+        addChild(editor)
+        defer { editor.removeFromParent() }
+
+        let alert = NSAlert()
+        alert.messageText = "Compose Request"
+        alert.informativeText =
+            "Enter an absolute HTTP or HTTPS URL in the request line, then edit headers and body."
+        alert.addButton(withTitle: "Send Request")
+        let cancelButton = alert.addButton(withTitle: "Cancel")
+        cancelButton.keyEquivalent = "\u{1b}"
+        alert.accessoryView = editor.view
+        alert.window.initialFirstResponder = editor.initialFirstResponder
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        do {
+            try await viewModel.composeRequest(
+                headersText: editor.headersText,
+                bodyText: editor.bodyText.isEmpty ? nil : editor.bodyText
+            )
+        } catch {
+            let errorAlert = NSAlert(error: error)
+            if let window = view.window {
+                await errorAlert.beginSheetModal(for: window)
+            } else {
+                errorAlert.runModal()
+            }
+        }
     }
 
     @objc private func clearSession() {

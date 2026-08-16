@@ -16,6 +16,7 @@ public actor NIOProxyEngine: ProxyEngine {
     private let upstreamTLSConfiguration: UpstreamTLSConfiguration
     private let ruleSnapshot: (any RuleSnapshotSource)?
     private let breakpointGate: any BreakpointGate
+    private let flowSourceResolver: any FlowSourceResolver
 
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
     private var serverChannel: Channel?
@@ -30,7 +31,8 @@ public actor NIOProxyEngine: ProxyEngine {
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration(),
         ruleSnapshot: (any RuleSnapshotSource)? = nil,
-        breakpointGate: any BreakpointGate = ImmediateBreakpointGate()
+        breakpointGate: any BreakpointGate = ImmediateBreakpointGate(),
+        flowSourceResolver: any FlowSourceResolver = UnknownFlowSourceResolver()
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
         self.eventSink = eventSink
@@ -41,6 +43,7 @@ public actor NIOProxyEngine: ProxyEngine {
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
         self.ruleSnapshot = ruleSnapshot
         self.breakpointGate = breakpointGate
+        self.flowSourceResolver = flowSourceResolver
     }
 
     public func start(configuration: ProxyConfiguration, sessionID: SessionID) async throws {
@@ -84,27 +87,41 @@ public actor NIOProxyEngine: ProxyEngine {
                         certificateProvider,
                         upstreamTLSContext,
                         ruleSnapshot,
-                        breakpointGate
+                        breakpointGate,
+                        flowSourceResolver
                     ] channel in
-                    channel.eventLoop.makeCompletedFuture(
-                        Result {
-                            try HTTPServerPipeline.install(
-                                on: channel,
-                                handler: HTTPProxyHandler(
-                                    sessionID: sessionID,
-                                    eventSink: eventSink,
-                                    maxPendingRequestBytes: maxPendingRequestBytes,
-                                    bodyStore: bodyStore,
-                                    maximumCapturedBodyBytes: maximumCapturedBodyBytes,
-                                    interceptHTTPS: interceptHTTPS,
-                                    certificateProvider: certificateProvider,
-                                    upstreamTLSContext: upstreamTLSContext,
-                                    ruleSnapshot: ruleSnapshot,
-                                    breakpointGate: breakpointGate
-                                )
+                    let sourceFuture: EventLoopFuture<FlowSource>
+                    if let clientEndpoint = Self.endpoint(channel.remoteAddress),
+                        let proxyEndpoint = Self.endpoint(channel.localAddress)
+                    {
+                        sourceFuture = channel.eventLoop.makeFutureWithTask {
+                            await flowSourceResolver.resolveSource(
+                                clientEndpoint: clientEndpoint,
+                                proxyEndpoint: proxyEndpoint
                             )
                         }
-                    )
+                    } else {
+                        sourceFuture = channel.eventLoop.makeSucceededFuture(.desktopProxy)
+                    }
+                    return sourceFuture.flatMapThrowing { flowSource in
+                        try HTTPServerPipeline.install(
+                            on: channel,
+                            handler: HTTPProxyHandler(
+                                sessionID: sessionID,
+                                eventSink: eventSink,
+                                maxPendingRequestBytes: maxPendingRequestBytes,
+                                bodyStore: bodyStore,
+                                maximumCapturedBodyBytes: maximumCapturedBodyBytes,
+                                interceptHTTPS: interceptHTTPS,
+                                certificateProvider: certificateProvider,
+                                upstreamTLSContext: upstreamTLSContext,
+                                tunnelTarget: nil,
+                                ruleSnapshot: ruleSnapshot,
+                                breakpointGate: breakpointGate,
+                                flowSource: flowSource
+                            )
+                        )
+                    }
                 }
                 .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                 .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
@@ -169,5 +186,12 @@ public actor NIOProxyEngine: ProxyEngine {
                 continuation.resume()
             }
         }
+    }
+
+    private static func endpoint(_ address: SocketAddress?) -> NetworkEndpoint? {
+        guard let address, let port = address.port, let endpointPort = UInt16(exactly: port) else {
+            return nil
+        }
+        return NetworkEndpoint(host: address.ipAddress ?? "localhost", port: endpointPort)
     }
 }
