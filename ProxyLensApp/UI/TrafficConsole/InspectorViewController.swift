@@ -1,10 +1,22 @@
 import AppKit
 import ProxyLensCore
 
+private enum MessageInspectorSection: String {
+    case headers = "Headers"
+    case query = "Query"
+    case body = "Body"
+    case json = "JSON"
+    case raw = "Raw"
+}
+
 @MainActor
 final class InspectorViewController: NSViewController {
     private let viewModel: TrafficConsoleViewModel?
-    private let titleField = NSTextField(labelWithString: "No Flow Selected")
+    private let summaryMethodField = NSTextField(labelWithString: "")
+    private let summaryStatusField = NSTextField(labelWithString: "")
+    private let summaryLockImageView = NSImageView()
+    private let summaryURLField = NSTextField(labelWithString: "No Flow Selected")
+    private let summaryMetadataField = NSTextField(labelWithString: "")
     private let continueButton = NSButton(title: "Continue", target: nil, action: nil)
     private let abortButton = NSButton(title: "Abort", target: nil, action: nil)
     private let modeSelector = NSSegmentedControl(
@@ -15,11 +27,13 @@ final class InspectorViewController: NSViewController {
     )
     private let requestPane = MessageInspectorPaneViewController(
         title: "Request",
-        accessibilityPrefix: "inspector.request"
+        accessibilityPrefix: "inspector.request",
+        sections: [.headers, .query, .body, .json, .raw]
     )
     private let responsePane = MessageInspectorPaneViewController(
         title: "Response",
-        accessibilityPrefix: "inspector.response"
+        accessibilityPrefix: "inspector.response",
+        sections: [.headers, .body, .json, .raw]
     )
     private let contentSplitViewController = NSSplitViewController()
     private let rulesTextView = NSTextView()
@@ -41,7 +55,7 @@ final class InspectorViewController: NSViewController {
     }
 
     override func loadView() {
-        configureTitle()
+        configureSummary()
         configureBreakpointControls()
         configureModeSelector()
         configureMessagePanes()
@@ -53,51 +67,40 @@ final class InspectorViewController: NSViewController {
         breakpointStack.spacing = 8
         breakpointStack.alignment = .centerY
 
-        let selectorSpacer = NSView()
-        selectorSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        selectorSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let modeStack = NSStackView(views: [modeSelector, selectorSpacer])
-        modeStack.translatesAutoresizingMaskIntoConstraints = false
-        modeStack.orientation = .horizontal
-        modeStack.spacing = 8
-        modeStack.distribution = .fill
+        let summaryStack = NSStackView(views: [
+            summaryMethodField,
+            summaryStatusField,
+            summaryLockImageView,
+            summaryURLField,
+            summaryMetadataField,
+            modeSelector,
+            breakpointStack
+        ])
+        summaryStack.translatesAutoresizingMaskIntoConstraints = false
+        summaryStack.orientation = .horizontal
+        summaryStack.spacing = 7
+        summaryStack.distribution = .fill
+        summaryStack.alignment = .centerY
 
         let contentSplitView = contentSplitViewController.view
         contentSplitView.translatesAutoresizingMaskIntoConstraints = false
 
         let container = NSView()
         addChild(contentSplitViewController)
-        container.addSubview(titleField)
-        container.addSubview(breakpointStack)
-        container.addSubview(modeStack)
+        container.addSubview(summaryStack)
         container.addSubview(contentSplitView)
         container.addSubview(rulesScrollView)
         NSLayoutConstraint.activate([
-            titleField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            titleField.trailingAnchor.constraint(
-                equalTo: breakpointStack.leadingAnchor,
-                constant: -8
-            ),
-            titleField.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
-            breakpointStack.trailingAnchor.constraint(
-                equalTo: container.trailingAnchor,
-                constant: -10
-            ),
-            breakpointStack.centerYAnchor.constraint(equalTo: titleField.centerYAnchor),
-            modeStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            modeStack.trailingAnchor.constraint(
-                equalTo: container.trailingAnchor,
-                constant: -10
-            ),
-            modeStack.topAnchor.constraint(equalTo: titleField.bottomAnchor, constant: 8),
+            summaryStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            summaryStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            summaryStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 7),
             contentSplitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             contentSplitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            contentSplitView.topAnchor.constraint(equalTo: modeStack.bottomAnchor, constant: 8),
+            contentSplitView.topAnchor.constraint(equalTo: summaryStack.bottomAnchor, constant: 7),
             contentSplitView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             rulesScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             rulesScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            rulesScrollView.topAnchor.constraint(equalTo: modeStack.bottomAnchor, constant: 8),
+            rulesScrollView.topAnchor.constraint(equalTo: summaryStack.bottomAnchor, constant: 7),
             rulesScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         view = container
@@ -129,7 +132,7 @@ final class InspectorViewController: NSViewController {
             hasUserEdits = false
         }
 
-        titleField.stringValue = inspection.title
+        updateSummary()
         let isPaused = inspection.breakpoint != nil
         continueButton.isHidden = !isPaused
         abortButton.isHidden = !isPaused
@@ -151,12 +154,63 @@ final class InspectorViewController: NSViewController {
         updateMessagePane(responsePane, messageIndex: 1, message: inspection.response)
     }
 
-    private func configureTitle() {
-        titleField.translatesAutoresizingMaskIntoConstraints = false
-        titleField.font = .systemFont(ofSize: 13, weight: .semibold)
-        titleField.lineBreakMode = .byTruncatingMiddle
-        titleField.maximumNumberOfLines = 1
-        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    private func configureSummary() {
+        configureBadge(
+            summaryMethodField,
+            identifier: "inspector.summary.method",
+            minimumWidth: 46
+        )
+        configureBadge(
+            summaryStatusField,
+            identifier: "inspector.summary.status",
+            minimumWidth: 62
+        )
+
+        summaryLockImageView.translatesAutoresizingMaskIntoConstraints = false
+        summaryLockImageView.image = NSImage(
+            systemSymbolName: "lock.fill",
+            accessibilityDescription: "Secure connection"
+        )
+        summaryLockImageView.contentTintColor = .secondaryLabelColor
+        summaryLockImageView.imageScaling = .scaleProportionallyDown
+        summaryLockImageView.setContentHuggingPriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            summaryLockImageView.widthAnchor.constraint(equalToConstant: 13),
+            summaryLockImageView.heightAnchor.constraint(equalToConstant: 13)
+        ])
+
+        summaryURLField.translatesAutoresizingMaskIntoConstraints = false
+        summaryURLField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        summaryURLField.lineBreakMode = .byTruncatingMiddle
+        summaryURLField.maximumNumberOfLines = 1
+        summaryURLField.isSelectable = true
+        summaryURLField.setAccessibilityIdentifier("inspector.summary.url")
+        summaryURLField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        summaryURLField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        summaryMetadataField.translatesAutoresizingMaskIntoConstraints = false
+        summaryMetadataField.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        summaryMetadataField.textColor = .secondaryLabelColor
+        summaryMetadataField.lineBreakMode = .byTruncatingTail
+        summaryMetadataField.setAccessibilityIdentifier("inspector.summary.metadata")
+        summaryMetadataField.setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    private func configureBadge(
+        _ field: NSTextField,
+        identifier: String,
+        minimumWidth: CGFloat
+    ) {
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
+        field.alignment = .center
+        field.drawsBackground = true
+        field.wantsLayer = true
+        field.layer?.cornerRadius = 5
+        field.setAccessibilityIdentifier(identifier)
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        field.setContentCompressionResistancePriority(.required, for: .horizontal)
+        field.widthAnchor.constraint(greaterThanOrEqualToConstant: minimumWidth).isActive = true
     }
 
     private func configureBreakpointControls() {
@@ -176,10 +230,45 @@ final class InspectorViewController: NSViewController {
     private func configureModeSelector() {
         modeSelector.translatesAutoresizingMaskIntoConstraints = false
         modeSelector.selectedSegment = 0
+        modeSelector.segmentStyle = .separated
+        modeSelector.controlSize = .small
         modeSelector.target = self
         modeSelector.action = #selector(modeSelectionChanged)
         modeSelector.setAccessibilityIdentifier("inspector.mode")
         modeSelector.setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    private func updateSummary() {
+        guard let summary = inspection.summary else {
+            summaryMethodField.isHidden = true
+            summaryStatusField.isHidden = true
+            summaryLockImageView.isHidden = true
+            summaryMetadataField.isHidden = true
+            summaryURLField.stringValue = inspection.title
+            summaryURLField.toolTip = inspection.title
+            return
+        }
+
+        let methodColor = Self.methodColor(summary.method)
+        summaryMethodField.isHidden = false
+        summaryMethodField.stringValue = summary.method
+        summaryMethodField.textColor = methodColor
+        summaryMethodField.backgroundColor = methodColor.withAlphaComponent(0.14)
+
+        let statusColor = Self.statusColor(summary)
+        summaryStatusField.isHidden = false
+        summaryStatusField.stringValue = Self.statusText(summary)
+        summaryStatusField.textColor = statusColor
+        summaryStatusField.backgroundColor = statusColor.withAlphaComponent(0.14)
+
+        summaryLockImageView.isHidden = !summary.usesTLS
+        summaryURLField.stringValue = summary.url
+        summaryURLField.toolTip = summary.url
+        summaryMetadataField.isHidden = false
+        summaryMetadataField.stringValue = [
+            Self.formattedDuration(summary.duration),
+            Self.formattedByteCount(summary.byteCount)
+        ].joined(separator: "  •  ")
     }
 
     private func configureMessagePanes() {
@@ -295,32 +384,47 @@ final class InspectorViewController: NSViewController {
         let content: String
         var syntaxLanguage = InspectorSyntaxHighlighter.Language.plainText
         var highlightedRange: NSRange?
-        if pane.selectedSectionSegment == 0 {
+        switch pane.selectedSection {
+        case .headers:
             content = editedHeaders[messageIndex] ?? message.headers
             syntaxLanguage = .httpHeaders
-        } else if pane.selectedSectionSegment == 2 {
+        case .query:
+            content = message.query ?? "No query parameters."
+            syntaxLanguage = .urlEncodedForm
+        case .json:
             content = Self.bodyText(message.json, editable: false)
             highlightedRange = Self.bodyContentRange(message.json, editable: false)
             if highlightedRange != nil {
                 syntaxLanguage = .json
             }
-        } else if let editedBody = editedBodies[messageIndex] {
-            content = editedBody
-            syntaxLanguage = InspectorSyntaxHighlighter.language(
-                forContentType: message.bodyContentType
-            )
-        } else {
-            let isEditable = isEditingMessage(messageIndex)
-            content = Self.bodyText(
-                message.body,
-                editable: isEditable
-            )
-            highlightedRange = Self.bodyContentRange(message.body, editable: isEditable)
-            if highlightedRange != nil {
+        case .body:
+            if let editedBody = editedBodies[messageIndex] {
+                content = editedBody
                 syntaxLanguage = InspectorSyntaxHighlighter.language(
                     forContentType: message.bodyContentType
                 )
+            } else {
+                let isEditable = isEditingMessage(messageIndex)
+                content = Self.bodyText(
+                    message.body,
+                    editable: isEditable
+                )
+                highlightedRange = Self.bodyContentRange(message.body, editable: isEditable)
+                if highlightedRange != nil {
+                    syntaxLanguage = InspectorSyntaxHighlighter.language(
+                        forContentType: message.bodyContentType
+                    )
+                }
             }
+        case .raw:
+            let raw = Self.rawText(
+                message,
+                editedHeaders: editedHeaders[messageIndex],
+                editedBody: editedBodies[messageIndex]
+            )
+            content = raw.content
+            syntaxLanguage = .httpHeaders
+            highlightedRange = raw.headerRange
         }
 
         pane.display(
@@ -328,7 +432,7 @@ final class InspectorViewController: NSViewController {
             language: syntaxLanguage,
             highlightedRange: highlightedRange,
             isEditable: isEditingSection(
-                pane.selectedSectionSegment,
+                pane.selectedSection,
                 messageIndex: messageIndex
             ),
             isSelectorEnabled: true
@@ -337,11 +441,11 @@ final class InspectorViewController: NSViewController {
 
     private func updateEditingState() {
         requestPane.isContentEditable = isEditingSection(
-            requestPane.selectedSectionSegment,
+            requestPane.selectedSection,
             messageIndex: 0
         )
         responsePane.isContentEditable = isEditingSection(
-            responsePane.selectedSectionSegment,
+            responsePane.selectedSection,
             messageIndex: 1
         )
     }
@@ -358,14 +462,17 @@ final class InspectorViewController: NSViewController {
         }
     }
 
-    private func isEditingSection(_ sectionIndex: Int, messageIndex: Int) -> Bool {
+    private func isEditingSection(
+        _ section: MessageInspectorSection,
+        messageIndex: Int
+    ) -> Bool {
         guard isEditingMessage(messageIndex) else {
             return false
         }
-        if sectionIndex == 0 {
+        if section == .headers {
             return true
         }
-        if sectionIndex == 1 {
+        if section == .body {
             return inspection.breakpoint?.canEditBody == true
         }
         return false
@@ -378,9 +485,9 @@ final class InspectorViewController: NSViewController {
         guard isEditingMessage(messageIndex) else {
             return
         }
-        if pane.displayedSectionSegment == 0 {
+        if pane.displayedSection == .headers {
             editedHeaders[messageIndex] = pane.content
-        } else if pane.displayedSectionSegment == 1,
+        } else if pane.displayedSection == .body,
             inspection.breakpoint?.canEditBody == true
         {
             editedBodies[messageIndex] = pane.content
@@ -453,26 +560,117 @@ final class InspectorViewController: NSViewController {
             length: value.utf16.count
         )
     }
+
+    private static func rawText(
+        _ message: TrafficMessageInspection,
+        editedHeaders: String?,
+        editedBody: String?
+    ) -> (content: String, headerRange: NSRange) {
+        let headers = editedHeaders ?? message.headers
+        let body: String?
+        if let editedBody {
+            body = editedBody
+        } else {
+            switch message.body {
+            case .none:
+                body = nil
+            case .loading:
+                body = "Loading captured bytes…"
+            case .content(_, let value):
+                body = value
+            case .failed(_, let error):
+                body = "Unable to read captured bytes:\n\(error)"
+            }
+        }
+        let content = body.map { "\(headers)\n\n\($0)" } ?? headers
+        return (
+            content,
+            NSRange(location: 0, length: headers.utf16.count)
+        )
+    }
+
+    private static func methodColor(_ method: String) -> NSColor {
+        switch method {
+        case "GET": .systemBlue
+        case "POST": .systemGreen
+        case "PUT", "PATCH": .systemOrange
+        case "DELETE": .systemRed
+        default: .labelColor
+        }
+    }
+
+    private static func statusColor(_ summary: TrafficFlowSummaryInspection) -> NSColor {
+        if let statusCode = summary.statusCode {
+            switch statusCode {
+            case 200..<300: return .systemGreen
+            case 300..<400: return .systemBlue
+            case 400..<500: return .systemOrange
+            default: return .systemRed
+            }
+        }
+        switch summary.state {
+        case .failed, .cancelled: return .systemRed
+        case .paused: return .systemOrange
+        default: return .secondaryLabelColor
+        }
+    }
+
+    private static func statusText(_ summary: TrafficFlowSummaryInspection) -> String {
+        if let statusCode = summary.statusCode {
+            if let reason = summary.statusReason, !reason.isEmpty {
+                return "\(statusCode) \(reason)"
+            }
+            return String(statusCode)
+        }
+        switch summary.state {
+        case .failed: return "Failed"
+        case .cancelled: return "Cancelled"
+        case .paused: return "Paused"
+        case .completed: return "Done"
+        case .created, .receivingRequest, .connectingUpstream, .receivingResponse:
+            return "Pending"
+        }
+    }
+
+    private static func formattedDuration(_ duration: TimeInterval?) -> String {
+        guard let duration else {
+            return "—"
+        }
+        if duration < 1 {
+            return String(format: "%.0f ms", duration * 1_000)
+        }
+        return String(format: "%.2f s", duration)
+    }
+
+    private static func formattedByteCount(_ byteCount: Int64) -> String {
+        if byteCount < 1_000 {
+            return "\(byteCount) B"
+        }
+        if byteCount < 1_000_000 {
+            return String(format: "%.1f KB", Double(byteCount) / 1_000)
+        }
+        return String(format: "%.1f MB", Double(byteCount) / 1_000_000)
+    }
 }
 
 @MainActor
 private final class MessageInspectorPaneViewController: NSViewController, NSTextViewDelegate {
     let paneTitle: String
     let accessibilityPrefix: String
-    let sectionSelector = NSSegmentedControl(
-        labels: ["Headers", "Body", "JSON"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
+    let sections: [MessageInspectorSection]
+    let sectionSelector: NSSegmentedControl
     let textView = NSTextView()
     var onSelectionChange: ((MessageInspectorPaneViewController) -> Void)?
     var onTextChange: ((MessageInspectorPaneViewController) -> Void)?
-    private(set) var displayedSectionSegment = 0
+    private(set) var displayedSection: MessageInspectorSection
     private var isUpdatingContent = false
 
-    var selectedSectionSegment: Int {
-        sectionSelector.selectedSegment
+    var selectedSection: MessageInspectorSection {
+        let selectedSegment = sectionSelector.selectedSegment
+        guard sections.indices.contains(selectedSegment) else {
+            return sections[0]
+        }
+        return sections[selectedSegment]
     }
 
     var content: String {
@@ -484,9 +682,21 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         set { textView.isEditable = newValue }
     }
 
-    init(title: String, accessibilityPrefix: String) {
+    init(
+        title: String,
+        accessibilityPrefix: String,
+        sections: [MessageInspectorSection]
+    ) {
         self.paneTitle = title
         self.accessibilityPrefix = accessibilityPrefix
+        self.sections = sections
+        self.sectionSelector = NSSegmentedControl(
+            labels: sections.map(\.rawValue),
+            trackingMode: .selectOne,
+            target: nil,
+            action: nil
+        )
+        self.displayedSection = sections[0]
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -502,6 +712,8 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
 
         sectionSelector.translatesAutoresizingMaskIntoConstraints = false
         sectionSelector.selectedSegment = 0
+        sectionSelector.segmentStyle = .separated
+        sectionSelector.controlSize = .small
         sectionSelector.target = self
         sectionSelector.action = #selector(selectionChanged)
         sectionSelector.setAccessibilityIdentifier("\(accessibilityPrefix).section")
@@ -578,7 +790,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         )
         textView.isEditable = isEditable
         sectionSelector.isEnabled = isSelectorEnabled
-        displayedSectionSegment = sectionSelector.selectedSegment
+        displayedSection = selectedSection
         textView.scrollToBeginningOfDocument(nil)
         isUpdatingContent = false
     }
