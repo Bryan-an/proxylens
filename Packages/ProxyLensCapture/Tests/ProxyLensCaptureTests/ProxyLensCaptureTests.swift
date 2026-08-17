@@ -5,6 +5,7 @@ import NIOHTTP1
 import NIOPosix
 import NIOSSL
 import NIOTLS
+import NIOWebSocket
 import ProxyLensApplication
 import ProxyLensCore
 import ProxyLensPersistence
@@ -14,6 +15,215 @@ import XCTest
 @testable import ProxyLensCapture
 
 final class ProxyLensCaptureTests: XCTestCase {
+    func testWebSocketUpgradeRelaysAndPersistsBidirectionalFrames() async throws {
+        let upstream = try await TestWebSocketServer.start()
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensWebSocketIntegrationTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let sessionStore = GRDBSessionStore(database: database, bodyStore: bodyStore)
+        let flowEvents = RecordingFlowEventSink()
+        let frameEvents = RecordingWebSocketFrameSink()
+        let engine = NIOProxyEngine(
+            eventSink: PersistingFlowEventSink(
+                flowStore: sessionStore,
+                downstream: flowEvents
+            ),
+            webSocketFrameEventSink: PersistingWebSocketFrameEventSink(
+                frameStore: sessionStore,
+                downstream: frameEvents
+            ),
+            bodyStore: bodyStore
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await WebSocketTestClient.exchange(
+                url: "ws://127.0.0.1:\(upstream.endpoint.port)/echo",
+                through: proxyEndpoint,
+                message: "hello"
+            )
+
+            XCTAssertEqual(response, "echo:hello")
+            try await eventually("two persisted WebSocket frames") {
+                await frameEvents.frames().count >= 2
+            }
+            try await eventually("a finished WebSocket flow") {
+                await flowEvents.snapshot().contains { event in
+                    if case .finished = event {
+                        return true
+                    }
+                    return false
+                }
+            }
+            let events = await flowEvents.snapshot()
+            let finishedFlow = try XCTUnwrap(
+                events.compactMap { event -> Flow? in
+                    if case .finished(let flow) = event {
+                        return flow
+                    }
+                    return nil
+                }.first
+            )
+            let frames = try await sessionStore.listWebSocketFrames(for: finishedFlow.id)
+
+            XCTAssertEqual(finishedFlow.connection?.protocolKind, .webSocket)
+            XCTAssertEqual(finishedFlow.state, .completed)
+            XCTAssertEqual(frames.map(\.sequenceNumber), [1, 2])
+            XCTAssertEqual(frames.map(\.direction), [.clientToServer, .serverToClient])
+            XCTAssertEqual(frames.map(\.opcode), [.text, .text])
+            XCTAssertEqual(frames.map(\.wasMasked), [true, false])
+            var payloads: [Data] = []
+            for frame in frames {
+                payloads.append(try await bodyStore.read(frame.payload))
+            }
+            XCTAssertEqual(payloads, [Data("hello".utf8), Data("echo:hello".utf8)])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testWebSocketRelayUnmasksClientPayloadAndRemasksItForUpstream() throws {
+        var maskedPayload = ByteBufferAllocator().buffer(capacity: 5)
+        maskedPayload.writeString("hello")
+        let original = WebSocketFrame(
+            fin: true,
+            rsv1: true,
+            opcode: .text,
+            maskKey: [1, 2, 3, 4],
+            data: maskedPayload
+        )
+        var encoded = ByteBufferAllocator().buffer(capacity: 32)
+        let encoder = WebSocketFrameEncoder()
+        let encoderChannel = EmbeddedChannel(handler: encoder)
+        try encoderChannel.writeOutbound(original)
+        while var part = try encoderChannel.readOutbound(as: ByteBuffer.self) {
+            encoded.writeBuffer(&part)
+        }
+        _ = try encoderChannel.finish()
+        let decoderChannel = EmbeddedChannel(
+            handler: ByteToMessageHandler(WebSocketFrameDecoder(maxFrameSize: 1_024))
+        )
+        try decoderChannel.writeInbound(encoded)
+        let decoded = try XCTUnwrap(decoderChannel.readInbound(as: WebSocketFrame.self))
+
+        let forwarded = WebSocketFrameRelay.forwardedFrame(
+            decoded,
+            direction: .clientToServer
+        )
+
+        XCTAssertTrue(forwarded.fin)
+        XCTAssertTrue(forwarded.rsv1)
+        XCTAssertEqual(forwarded.opcode, .text)
+        XCTAssertNotNil(forwarded.maskKey)
+        XCTAssertEqual(String(decoding: forwarded.data.readableBytesView, as: UTF8.self), "hello")
+        _ = try decoderChannel.finish()
+    }
+
+    func testWebSocketFrameRecorderPersistsBoundedPayloadAndPublishesMetadata()
+        async throws
+    {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensWebSocketFrameTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies"),
+                inlineBodyThreshold: 2,
+                maximumCapturedBodyBytes: 4
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let sink = RecordingWebSocketFrameSink()
+        let recorder = WebSocketFrameRecorder(
+            bodyStore: bodyStore,
+            maximumCapturedFrameBytes: 4,
+            eventSink: sink
+        )
+        var data = ByteBufferAllocator().buffer(capacity: 5)
+        data.writeString("hello")
+        let frame = WebSocketFrame(fin: true, opcode: .text, data: data)
+        let flowID = FlowID()
+
+        try await recorder.record(
+            frame,
+            flowID: flowID,
+            sequenceNumber: 7,
+            direction: .serverToClient,
+            receivedAt: Date(timeIntervalSince1970: 50)
+        )
+
+        let frames = await sink.frames()
+        let captured = try XCTUnwrap(frames.first)
+        XCTAssertEqual(captured.flowID, flowID)
+        XCTAssertEqual(captured.sequenceNumber, 7)
+        XCTAssertEqual(captured.opcode, .text)
+        XCTAssertEqual(captured.direction, .serverToClient)
+        XCTAssertEqual(captured.payload.byteCount, 4)
+        XCTAssertTrue(captured.payload.isTruncated)
+        let persistedPayload = try await bodyStore.read(captured.payload)
+        XCTAssertEqual(persistedPayload, Data("hell".utf8))
+    }
+
+    func testStreamingBodyRecorderDiscoversGraphQLOperationForExternalBody() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensGraphQLCaptureTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies"),
+                inlineBodyThreshold: 4,
+                maximumCapturedBodyBytes: 1_024
+            )
+        )
+        let recorder = StreamingBodyRecorder(
+            bodyStore: FileBodyStore(database: database),
+            metadata: BodyMetadata(contentType: "application/json"),
+            maximumByteCount: 1_024,
+            discoversGraphQLOperation: true
+        )
+        let body = Data(
+            #"{"query":"query SearchCatalog { catalog { id } }"}"#.utf8
+        )
+
+        try await recorder.append(body.prefix(17))
+        try await recorder.append(body.dropFirst(17))
+        let finalizedReference = try await recorder.finalize()
+        let reference = try XCTUnwrap(finalizedReference)
+        let operation = await recorder.graphqlOperation(for: reference)
+
+        XCTAssertFalse(reference.isInline)
+        XCTAssertEqual(
+            operation,
+            GraphQLOperationMetadata(kind: .query, name: "SearchCatalog")
+        )
+    }
+
     func testRequestReplayClientRepeatsHTTPPostAndCapturesTheResponse() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "replayed")
         let storageRoot = FileManager.default.temporaryDirectory
@@ -707,6 +917,289 @@ final class ProxyLensCaptureTests: XCTestCase {
         await mapped.stop()
     }
 
+    func testHTTPRedirectRuleReturnsTemporaryRedirectWithoutCallingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "must not be called")
+        let eventSink = RecordingFlowEventSink()
+        let destination = URL(string: "https://login.example.com/continue?from=proxy")!
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Redirect login",
+                    priority: 14,
+                    phase: .requestHeaders,
+                    matcher: .allOf([
+                        .host(.exact("127.0.0.1")),
+                        .path(.exact("/login"))
+                    ]),
+                    action: .redirect(url: destination)
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/login?source=client",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 307)
+            XCTAssertEqual(response.header("Location"), destination.absoluteString)
+            XCTAssertEqual(response.body, Data())
+            XCTAssertEqual(upstream.requestCount, 0)
+
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(finished.response?.statusCode, 307)
+            XCTAssertEqual(finished.ruleTraces.map(\.ruleName), ["Redirect login"])
+            XCTAssertEqual(finished.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertNil(finished.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPThrottleRuleDelaysUpstreamConnectionWithoutBlockingCapture() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "delayed upstream")
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Throttle local fixture",
+                    priority: 17,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .throttle(ThrottleProfile(latency: 0.2))
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let startedAt = ContinuousClock.now
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/slow",
+                through: proxyEndpoint
+            )
+            let elapsed = startedAt.duration(to: .now)
+
+            XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(150))
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("delayed upstream".utf8))
+            XCTAssertEqual(upstream.requestCount, 1)
+
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(finished.ruleTraces.map(\.ruleName), ["Throttle local fixture"])
+            XCTAssertEqual(finished.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertNotNil(finished.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPThrottleRuleCanSimulateLostConnectionWithoutCallingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not arrive")
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Lost connection",
+                    priority: 17,
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .throttle(ThrottleProfile(packetLossPercentage: 100))
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            do {
+                _ = try await HTTPTestClient.get(
+                    url: "http://127.0.0.1:\(upstream.endpoint.port)/lost",
+                    through: proxyEndpoint
+                )
+                XCTFail("Expected the simulated lost connection to close without a response")
+            } catch {
+                // Expected: packet loss closes the client connection before an HTTP response.
+            }
+
+            XCTAssertEqual(upstream.requestCount, 0)
+            await eventSink.waitForFinished()
+            let failed = await eventSink.lastFlow {
+                $0.state == .failed(.simulatedNetworkFailure)
+            }
+            let finished = try XCTUnwrap(failed)
+            XCTAssertEqual(finished.ruleTraces.map(\.ruleName), ["Lost connection"])
+            XCTAssertEqual(finished.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertNil(finished.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPThrottleRuleShapesUploadBandwidth() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "uploaded")
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Slow upload",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .throttle(
+                        ThrottleProfile(uploadBytesPerSecond: 16_384)
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let body = Data(repeating: 0x61, count: 8_192)
+            let startedAt = ContinuousClock.now
+            let response = try await HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/upload",
+                body: body,
+                through: proxyEndpoint
+            )
+            let elapsed = startedAt.duration(to: .now)
+
+            XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(400))
+            XCTAssertEqual(response.body, Data("uploaded:".utf8) + body)
+            XCTAssertEqual(upstream.requestCount, 1)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPThrottleRuleShapesDownloadBandwidth() async throws {
+        let responseText = String(repeating: "d", count: 8_192)
+        let upstream = try await TestHTTPServer.start(responseBody: responseText)
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Slow download",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .throttle(
+                        ThrottleProfile(downloadBytesPerSecond: 16_384)
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let startedAt = ContinuousClock.now
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/download",
+                through: proxyEndpoint
+            )
+            let elapsed = startedAt.duration(to: .now)
+
+            XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(400))
+            XCTAssertEqual(response.body, Data(responseText.utf8))
+            XCTAssertEqual(upstream.requestCount, 1)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
     func testHTTPMapRemoteRuleReplacesPathAndAppliesNoCache() async throws {
         let original = try await TestHTTPServer.start(responseBody: "original upstream")
         let mapped = try await TestHTTPServer.start(responseBody: "mapped mock")
@@ -1016,6 +1509,600 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
     }
 
+    func testGraphQLOperationBreakpointDiscoversBodyBeforeConnectingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream response")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensGraphQLBreakpointTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint GraphQL mutation SaveProfile",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(
+                        name: .exact("SaveProfile"),
+                        kind: .mutation
+                    ),
+                    action: .breakpoint
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            bodyStore: FileBodyStore(database: database),
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let body = Data(
+                #"{"query":"mutation SaveProfile { saveProfile { id } }"}"#.utf8
+            )
+            let upstreamPort = upstream.endpoint.port
+            async let clientResponse = HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstreamPort)/graphql",
+                body: body,
+                through: proxyEndpoint,
+                extraHeaders: [("Content-Type", "application/json")]
+            )
+            await eventSink.waitForFlow { $0.state == .paused(.request) }
+            XCTAssertEqual(upstream.requestCount, 0)
+
+            let paused = await eventSink.lastFlow { $0.state == .paused(.request) }
+            let pausedFlow = try XCTUnwrap(paused)
+            XCTAssertEqual(
+                pausedFlow.request.graphqlOperation,
+                GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+            )
+            let pendingHit = await coordinator.hit(for: pausedFlow.id)
+            let hit = try XCTUnwrap(pendingHit)
+            await coordinator.resume(flowID: hit.flowID, decision: .continue(hit))
+
+            let response = try await clientResponse
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(upstream.requestCount, 1)
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                ["Breakpoint GraphQL mutation SaveProfile"]
+            )
+            XCTAssertEqual(finished.ruleTraces.map(\.phase), [.requestBody])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testGraphQLOperationBlockReturnsForbiddenBeforeConnectingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensGraphQLBlockTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let eventSink = RecordingFlowEventSink()
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block GraphQL mutation SaveProfile",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(
+                        name: .exact("SaveProfile"),
+                        kind: .mutation
+                    ),
+                    action: .block(reason: "Blocked GraphQL operation")
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            bodyStore: FileBodyStore(database: database),
+            ruleSnapshot: snapshot
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/graphql",
+                body: Data(
+                    #"{"query":"mutation SaveProfile { saveProfile { id } }"}"#.utf8
+                ),
+                through: proxyEndpoint,
+                extraHeaders: [("Content-Type", "application/json")]
+            )
+
+            XCTAssertEqual(response.statusCode, 403)
+            XCTAssertEqual(upstream.requestCount, 0)
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(
+                finished.request.graphqlOperation,
+                GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+            )
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                [
+                    "Block GraphQL mutation SaveProfile"
+                ])
+            XCTAssertEqual(finished.ruleTraces.map(\.phase), [.requestBody])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testGraphQLOperationMapLocalReturnsFixtureBeforeConnectingUpstream() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensGraphQLMapLocalTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let eventSink = RecordingFlowEventSink()
+        let mappedBody = Data(#"{"data":{"catalog":[]}}"#.utf8)
+        let spec = MapLocalSpec(
+            resourceID: "catalog.json",
+            statusCode: 201,
+            reasonPhrase: "Created",
+            body: BodyReference(
+                inline: mappedBody,
+                metadata: BodyMetadata(contentType: "application/json")
+            )
+        )
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local GraphQL query Catalog",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(name: .exact("Catalog"), kind: .query),
+                    action: .mapLocal(resourceID: spec.resourceID)
+                )
+            ]),
+            mappedLocals: [spec]
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            bodyStore: FileBodyStore(database: database),
+            ruleSnapshot: snapshot
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/graphql",
+                body: Data(#"{"query":"query Catalog { catalog { id } }"}"#.utf8),
+                through: proxyEndpoint,
+                extraHeaders: [("Content-Type", "application/json")]
+            )
+
+            XCTAssertEqual(response.statusCode, 201)
+            XCTAssertEqual(response.body, mappedBody)
+            XCTAssertEqual(response.header("Content-Type"), "application/json")
+            XCTAssertEqual(upstream.requestCount, 0)
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(
+                finished.request.graphqlOperation,
+                GraphQLOperationMetadata(kind: .query, name: "Catalog")
+            )
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                [
+                    "Map local GraphQL query Catalog"
+                ])
+            XCTAssertNil(finished.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testGraphQLOperationMapRemoteConnectsToMappedUpstream() async throws {
+        let original = try await TestHTTPServer.start(responseBody: "original upstream")
+        let mapped = try await TestHTTPServer.start(responseBody: "mapped upstream")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensGraphQLMapRemoteTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let eventSink = RecordingFlowEventSink()
+        let destination = URL(string: "http://127.0.0.1:\(mapped.endpoint.port)")!
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map remote GraphQL mutation SaveProfile",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(
+                        name: .exact("SaveProfile"),
+                        kind: .mutation
+                    ),
+                    action: .mapRemote(url: destination)
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            bodyStore: FileBodyStore(database: database),
+            ruleSnapshot: snapshot
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await original.stop()
+                await mapped.stop()
+                return
+            }
+
+            let requestBody = Data(
+                #"{"query":"mutation SaveProfile { saveProfile { id } }"}"#.utf8
+            )
+            let response = try await HTTPTestClient.post(
+                url: "http://127.0.0.1:\(original.endpoint.port)/graphql?source=client",
+                body: requestBody,
+                through: proxyEndpoint,
+                extraHeaders: [("Content-Type", "application/json")]
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(
+                response.body,
+                Data("mapped upstream:\(String(decoding: requestBody, as: UTF8.self))".utf8)
+            )
+            XCTAssertEqual(original.requestCount, 0)
+            XCTAssertEqual(mapped.requestCount, 1)
+            XCTAssertEqual(mapped.requestURI, "/graphql?source=client")
+            XCTAssertEqual(mapped.requestHeader("Host"), "127.0.0.1:\(mapped.endpoint.port)")
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(finished.request.url.port, Int(original.endpoint.port))
+            XCTAssertEqual(
+                finished.request.graphqlOperation,
+                GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+            )
+            XCTAssertEqual(finished.connection?.upstreamHost, "127.0.0.1")
+            XCTAssertEqual(finished.connection?.upstreamPort, mapped.endpoint.port)
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                ["Map remote GraphQL mutation SaveProfile"]
+            )
+            XCTAssertEqual(finished.ruleTraces.map(\.phase), [.requestBody])
+        } catch {
+            await engine.stop()
+            await original.stop()
+            await mapped.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await original.stop()
+        await mapped.stop()
+    }
+
+    func testGraphQLOperationBodyReplacementForwardsEditedBytesAndPreservesCapture()
+        async throws
+    {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensGraphQLReplaceBodyTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let eventSink = RecordingFlowEventSink()
+        let originalBody = Data(
+            #"{"query":"mutation SaveProfile { saveProfile { id } }"}"#.utf8
+        )
+        let replacementBody = Data(#"{"name":"Ada"}"#.utf8)
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Replace body GraphQL mutation SaveProfile",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(
+                        name: .exact("SaveProfile"),
+                        kind: .mutation
+                    ),
+                    action: .replaceBody(
+                        body: BodyReference(
+                            inline: replacementBody,
+                            metadata: BodyMetadata(contentType: "application/json")
+                        )
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            bodyStore: bodyStore,
+            ruleSnapshot: snapshot
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/graphql",
+                body: originalBody,
+                through: proxyEndpoint,
+                extraHeaders: [("Content-Type", "application/json")]
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(
+                response.body,
+                Data("upstream:\(String(decoding: replacementBody, as: UTF8.self))".utf8)
+            )
+            XCTAssertEqual(upstream.requestCount, 1)
+            XCTAssertEqual(upstream.requestHeader("Content-Length"), "\(replacementBody.count)")
+            XCTAssertEqual(upstream.requestHeader("Content-Type"), "application/json")
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            let capturedBody = try XCTUnwrap(finished.request.body)
+            let capturedBytes = try await bodyStore.read(capturedBody)
+            XCTAssertEqual(capturedBytes, originalBody)
+            XCTAssertEqual(
+                finished.request.graphqlOperation,
+                GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+            )
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                ["Replace body GraphQL mutation SaveProfile"]
+            )
+            XCTAssertEqual(finished.ruleTraces.map(\.phase), [.requestBody])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHostPathBodyReplacementForwardsWithoutGraphQLMetadata() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "upstream")
+        let eventSink = RecordingFlowEventSink()
+        let replacementBody = Data("replacement".utf8)
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Replace body local fixture",
+                    phase: .requestBody,
+                    matcher: .allOf([
+                        .host(.exact("127.0.0.1")),
+                        .path(.exact("/replace"))
+                    ]),
+                    action: .replaceBody(
+                        body: BodyReference(
+                            inline: replacementBody,
+                            metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+                        )
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, ruleSnapshot: snapshot)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.post(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/replace?source=client",
+                body: Data("original".utf8),
+                through: proxyEndpoint,
+                extraHeaders: [("Content-Type", "application/octet-stream")]
+            )
+
+            XCTAssertEqual(response.body, Data("upstream:replacement".utf8))
+            XCTAssertEqual(upstream.requestHeader("Content-Length"), "\(replacementBody.count)")
+            XCTAssertEqual(upstream.requestHeader("Content-Type"), "text/plain; charset=utf-8")
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertNil(finished.request.graphqlOperation)
+            XCTAssertEqual(finished.ruleTraces.map(\.ruleName), ["Replace body local fixture"])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHostPathResponseBodyReplacementPreservesUpstreamCapture() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "original upstream")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensResponseReplaceBodyTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let database = try DatabaseController(
+            configuration: DatabaseConfiguration(
+                databaseURL: storageRoot.appendingPathComponent("capture.sqlite"),
+                bodyDirectoryURL: storageRoot.appendingPathComponent("Bodies")
+            )
+        )
+        let bodyStore = FileBodyStore(database: database)
+        let eventSink = RecordingFlowEventSink()
+        let replacementBody = Data(#"{"mocked":true}"#.utf8)
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Replace response body local fixture",
+                    phase: .responseBody,
+                    matcher: .allOf([
+                        .host(.exact("127.0.0.1")),
+                        .path(.exact("/replace-response")),
+                        .status(200)
+                    ]),
+                    action: .replaceBody(
+                        body: BodyReference(
+                            inline: replacementBody,
+                            metadata: BodyMetadata(contentType: "application/json")
+                        )
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            bodyStore: bodyStore,
+            ruleSnapshot: snapshot
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstream.endpoint.port)/replace-response",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, replacementBody)
+            XCTAssertEqual(response.header("Content-Length"), "\(replacementBody.count)")
+            XCTAssertEqual(response.header("Content-Type"), "application/json")
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            let capturedBody = try XCTUnwrap(finished.response?.body)
+            let capturedBytes = try await bodyStore.read(capturedBody)
+            XCTAssertEqual(capturedBytes, Data("original upstream".utf8))
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                ["Replace response body local fixture"]
+            )
+            XCTAssertEqual(finished.ruleTraces.map(\.phase), [.responseBody])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
     func testHTTPRequestBreakpointAbortDoesNotCallUpstream() async throws {
         let upstream = try await TestHTTPServer.start(responseBody: "should not be reached")
         let eventSink = RecordingFlowEventSink()
@@ -1236,6 +2323,85 @@ final class ProxyLensCaptureTests: XCTestCase {
             let finishedFlow = try XCTUnwrap(finished)
             XCTAssertEqual(finishedFlow.response?.statusCode, 201)
             XCTAssertEqual(finishedFlow.ruleTraces.map(\.ruleName), ["Breakpoint response"])
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testHTTPResponseBodyReplacementSurvivesAnUneditedBreakpointContinue() async throws {
+        let upstream = try await TestHTTPServer.start(responseBody: "original upstream")
+        let eventSink = RecordingFlowEventSink()
+        let coordinator = BreakpointCoordinator()
+        let replacementBody = Data("replacement response".utf8)
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint response",
+                    phase: .responseHeaders,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .breakpoint
+                ),
+                Rule(
+                    name: "Replace response body",
+                    phase: .responseBody,
+                    matcher: .host(.exact("127.0.0.1")),
+                    action: .replaceBody(
+                        body: BodyReference(
+                            inline: replacementBody,
+                            metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+                        )
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            breakpointGate: coordinator
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let upstreamPort = upstream.endpoint.port
+            async let clientResponse = HTTPTestClient.get(
+                url: "http://127.0.0.1:\(upstreamPort)/response-replace-pause",
+                through: proxyEndpoint
+            )
+            await eventSink.waitForFlow { $0.state == .paused(.response) }
+            let paused = await eventSink.lastFlow { $0.state == .paused(.response) }
+            let pausedFlow = try XCTUnwrap(paused)
+            let pendingHit = await coordinator.hit(for: pausedFlow.id)
+            let hit = try XCTUnwrap(pendingHit)
+            await coordinator.resume(flowID: hit.flowID, decision: .continue(hit))
+
+            let response = try await clientResponse
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, replacementBody)
+            XCTAssertEqual(response.header("Content-Length"), "\(replacementBody.count)")
+            await eventSink.waitForFinished()
+            let completed = await eventSink.lastFlow { $0.state == .completed }
+            let finished = try XCTUnwrap(completed)
+            XCTAssertEqual(
+                finished.ruleTraces.map(\.ruleName),
+                ["Breakpoint response", "Replace response body"]
+            )
         } catch {
             await engine.stop()
             await upstream.stop()
@@ -1757,6 +2923,295 @@ private actor RecordingFlowEventSink: FlowEventSink {
     }
 }
 
+private actor RecordingWebSocketFrameSink: WebSocketFrameEventSink {
+    private var recordedFrames: [CapturedWebSocketFrame] = []
+
+    func publish(_ frame: CapturedWebSocketFrame) {
+        recordedFrames.append(frame)
+    }
+
+    func frames() -> [CapturedWebSocketFrame] {
+        recordedFrames
+    }
+
+}
+
+private final class TestWebSocketServer {
+    let endpoint: NetworkEndpoint
+
+    private let group: MultiThreadedEventLoopGroup
+    private let channel: Channel
+
+    private init(group: MultiThreadedEventLoopGroup, channel: Channel) throws {
+        guard let address = channel.localAddress,
+            let port = address.port,
+            let boundPort = UInt16(exactly: port)
+        else {
+            throw ProxyLensError.unsupportedOperation("Test WebSocket server has no local address")
+        }
+        self.group = group
+        self.channel = channel
+        endpoint = NetworkEndpoint(host: address.ipAddress ?? "127.0.0.1", port: boundPort)
+    }
+
+    static func start() async throws -> TestWebSocketServer {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        do {
+            let channel = try await ServerBootstrap(group: group)
+                .serverChannelOption(ChannelOptions.backlog, value: 16)
+                .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .childChannelInitializer { channel in
+                    let upgrader = NIOWebSocketServerUpgrader(
+                        shouldUpgrade: { channel, request in
+                            channel.eventLoop.makeSucceededFuture(
+                                request.uri == "/echo" ? NIOHTTP1.HTTPHeaders() : nil
+                            )
+                        },
+                        upgradePipelineHandler: { channel, _ in
+                            channel.pipeline.addHandler(WebSocketEchoHandler())
+                        }
+                    )
+                    let configuration: NIOHTTPServerUpgradeSendableConfiguration = (
+                        upgraders: [upgrader],
+                        completionHandler: { _ in }
+                    )
+                    return channel.pipeline.configureHTTPServerPipeline(
+                        withPipeliningAssistance: false,
+                        withServerUpgrade: configuration
+                    )
+                }
+                .bind(host: "127.0.0.1", port: 0)
+                .get()
+            return try TestWebSocketServer(group: group, channel: channel)
+        } catch {
+            await shutdown(group)
+            throw error
+        }
+    }
+
+    func stop() async {
+        _ = try? await channel.close().get()
+        await shutdown(group)
+    }
+}
+
+private final class WebSocketEchoHandler: ChannelInboundHandler, Sendable {
+    typealias InboundIn = WebSocketFrame
+    typealias OutboundOut = WebSocketFrame
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let frame = Self.unwrapInboundIn(data)
+        switch frame.opcode {
+        case .text:
+            let request = String(decoding: frame.unmaskedData.readableBytesView, as: UTF8.self)
+            var payload = context.channel.allocator.buffer(capacity: request.utf8.count + 5)
+            payload.writeString("echo:\(request)")
+            context.writeAndFlush(
+                Self.wrapOutboundOut(WebSocketFrame(fin: true, opcode: .text, data: payload)),
+                promise: nil
+            )
+        case .connectionClose:
+            let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
+            context.writeAndFlush(
+                Self.wrapOutboundOut(
+                    WebSocketFrame(
+                        fin: true,
+                        opcode: .connectionClose,
+                        data: frame.unmaskedData
+                    )
+                )
+            ).whenComplete { _ in
+                boundContext.value.close(promise: nil)
+            }
+        default:
+            break
+        }
+    }
+}
+
+private enum WebSocketTestClient {
+    static func exchange(
+        url: String,
+        through proxy: NetworkEndpoint,
+        message: String
+    ) async throws -> String {
+        guard let target = URL(string: url), let host = target.host, let port = target.port else {
+            throw ProxyLensError.invalidURL(url)
+        }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let responsePromise = group.next().makePromise(of: String.self)
+        let requestHandler = WebSocketUpgradeRequestHandler(
+            url: url,
+            hostHeader: "\(host):\(port)",
+            responsePromise: responsePromise
+        )
+        let upgrader = NIOWebSocketClientUpgrader(
+            requestKey: "AQIDBAUGBwgJCgsMDQ4PEC==",
+            upgradePipelineHandler: { channel, _ in
+                channel.pipeline.addHandler(
+                    WebSocketTestResponseHandler(promise: responsePromise)
+                ).flatMap {
+                    var payload = channel.allocator.buffer(capacity: message.utf8.count)
+                    payload.writeString(message)
+                    return channel.writeAndFlush(
+                        WebSocketFrame(
+                            fin: true,
+                            opcode: .text,
+                            maskKey: [1, 2, 3, 4],
+                            data: payload
+                        )
+                    )
+                }
+            }
+        )
+        let configuration: NIOHTTPClientUpgradeSendableConfiguration = (
+            upgraders: [upgrader],
+            completionHandler: { context in
+                context.pipeline.removeHandler(requestHandler, promise: nil)
+            }
+        )
+
+        do {
+            let channel = try await ClientBootstrap(group: group)
+                .channelInitializer { channel in
+                    channel.pipeline.addHTTPClientHandlers(withClientUpgrade: configuration)
+                        .flatMap {
+                            channel.pipeline.addHandler(requestHandler)
+                        }
+                }
+                .connect(host: proxy.host, port: Int(proxy.port))
+                .get()
+            let timeout = channel.eventLoop.scheduleTask(in: .seconds(3)) {
+                responsePromise.fail(
+                    ProxyLensError.unsupportedOperation(
+                        "Timed out waiting for the WebSocket echo response"
+                    )
+                )
+            }
+            responsePromise.futureResult.whenComplete { _ in
+                timeout.cancel()
+            }
+            let response = try await responsePromise.futureResult.get()
+            _ = try? await channel.close().get()
+            await shutdown(group)
+            return response
+        } catch {
+            await shutdown(group)
+            throw error
+        }
+    }
+}
+
+private final class WebSocketUpgradeRequestHandler:
+    ChannelInboundHandler,
+    RemovableChannelHandler,
+    Sendable
+{
+    typealias InboundIn = HTTPClientResponsePart
+    typealias OutboundOut = HTTPClientRequestPart
+
+    private let url: String
+    private let hostHeader: String
+    private let responsePromise: EventLoopPromise<String>
+
+    init(
+        url: String,
+        hostHeader: String,
+        responsePromise: EventLoopPromise<String>
+    ) {
+        self.url = url
+        self.hostHeader = hostHeader
+        self.responsePromise = responsePromise
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        var headers = NIOHTTP1.HTTPHeaders()
+        headers.add(name: "Host", value: hostHeader)
+        headers.add(name: "Content-Length", value: "0")
+        context.write(
+            Self.wrapOutboundOut(
+                .head(
+                    HTTPRequestHead(
+                        version: .http1_1,
+                        method: .GET,
+                        uri: url,
+                        headers: headers
+                    )
+                )
+            ),
+            promise: nil
+        )
+        context.writeAndFlush(Self.wrapOutboundOut(.end(nil)), promise: nil)
+        context.fireChannelActive()
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let response = Self.unwrapInboundIn(data)
+        if case .head(let head) = response {
+            responsePromise.fail(
+                ProxyLensError.unsupportedOperation(
+                    "WebSocket upgrade returned HTTP \(head.status.code)"
+                )
+            )
+        }
+        context.fireChannelRead(data)
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        responsePromise.fail(error)
+        context.close(promise: nil)
+    }
+}
+
+private final class WebSocketTestResponseHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = WebSocketFrame
+
+    private let promise: EventLoopPromise<String>
+    private var completed = false
+
+    init(promise: EventLoopPromise<String>) {
+        self.promise = promise
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let frame = Self.unwrapInboundIn(data)
+        guard frame.opcode == .text else {
+            return
+        }
+        completed = true
+        promise.succeed(String(decoding: frame.unmaskedData.readableBytesView, as: UTF8.self))
+        context.close(promise: nil)
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        completed = true
+        promise.fail(error)
+        context.close(promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        if !completed {
+            completed = true
+            promise.fail(ChannelError.eof)
+        }
+        context.fireChannelInactive()
+    }
+}
+
+private func eventually(
+    _ expectation: String,
+    attempts: Int = 100,
+    condition: () async -> Bool
+) async throws {
+    for _ in 0..<attempts {
+        if await condition() {
+            return
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    throw ProxyLensError.unsupportedOperation("Timed out waiting for \(expectation)")
+}
+
 private struct HTTPTestResponse: Sendable {
     let statusCode: UInt
     let headers: [(String, String)]
@@ -2002,9 +3457,16 @@ private enum HTTPTestClient {
     static func post(
         url: String,
         body: Data,
-        through proxy: NetworkEndpoint
+        through proxy: NetworkEndpoint,
+        extraHeaders: [(String, String)] = []
     ) async throws -> HTTPTestResponse {
-        try await request(method: .POST, url: url, body: body, through: proxy)
+        try await request(
+            method: .POST,
+            url: url,
+            body: body,
+            through: proxy,
+            extraHeaders: extraHeaders
+        )
     }
 
     static func postThenDisconnect(
@@ -2084,7 +3546,9 @@ private enum HTTPTestClient {
             }
             if let body {
                 headers.add(name: "Content-Length", value: "\(body.count)")
-                headers.add(name: "Content-Type", value: "text/plain")
+                if !headers.contains(name: "Content-Type") {
+                    headers.add(name: "Content-Type", value: "text/plain")
+                }
             }
 
             let request = HTTPRequestHead(
@@ -2119,6 +3583,7 @@ private final class HTTPTestResponseHandler: ChannelInboundHandler {
     private var statusCode: UInt = 0
     private var headers: [(String, String)] = []
     private var body = Data()
+    private var isFinished = false
 
     init(promise: EventLoopPromise<HTTPTestResponse>) {
         self.promise = promise
@@ -2134,6 +3599,7 @@ private final class HTTPTestResponseHandler: ChannelInboundHandler {
                 body.append(contentsOf: bytes)
             }
         case .end:
+            isFinished = true
             promise.succeed(
                 HTTPTestResponse(statusCode: statusCode, headers: headers, body: body)
             )
@@ -2142,8 +3608,17 @@ private final class HTTPTestResponseHandler: ChannelInboundHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        isFinished = true
         promise.fail(error)
         context.close(promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        if !isFinished {
+            isFinished = true
+            promise.fail(ChannelError.eof)
+        }
+        context.fireChannelInactive()
     }
 }
 

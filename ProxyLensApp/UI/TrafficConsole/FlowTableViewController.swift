@@ -1,4 +1,5 @@
 import AppKit
+import ProxyLensApplication
 import ProxyLensCore
 import UniformTypeIdentifiers
 
@@ -8,16 +9,24 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 {
     private let viewModel: TrafficConsoleViewModel
     private let tableView: NSTableView
+    private let networkConditionProfileStore: any TrafficNetworkConditionProfileStoring
     private let emptyLabel = NSTextField(labelWithString: "No traffic captured yet")
     private var rows: [TrafficFlowRow] = []
     private var isRendering = false
+    private lazy var annotationMenuController = FlowAnnotationMenuController(
+        viewModel: viewModel,
+        windowProvider: { [weak self] in self?.view.window }
+    )
 
     init(
         viewModel: TrafficConsoleViewModel,
-        tableView: NSTableView = NSTableView()
+        tableView: NSTableView = NSTableView(),
+        networkConditionProfileStore: any TrafficNetworkConditionProfileStoring =
+            InMemoryTrafficNetworkConditionProfileStore()
     ) {
         self.viewModel = viewModel
         self.tableView = tableView
+        self.networkConditionProfileStore = networkConditionProfileStore
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -28,7 +37,7 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 
     override func loadView() {
         tableView.usesAlternatingRowBackgroundColors = true
-        tableView.allowsMultipleSelection = false
+        tableView.allowsMultipleSelection = true
         tableView.allowsEmptySelection = true
         tableView.rowSizeStyle = .default
         tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
@@ -118,13 +127,21 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             }
         }
 
-        if let selectedFlowID = snapshot.selectedFlowID,
-            let row = rows.firstIndex(where: { $0.id == selectedFlowID })
-        {
-            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            tableView.scrollRowToVisible(row)
-        } else {
+        let rowIndexByFlowID = Dictionary(
+            uniqueKeysWithValues: rows.indices.map { (rows[$0].id, $0) }
+        )
+        let selectedRowIndexes = IndexSet(
+            snapshot.selectedFlowIDs.compactMap { rowIndexByFlowID[$0] }
+        )
+        if selectedRowIndexes.isEmpty {
             tableView.deselectAll(nil)
+        } else {
+            tableView.selectRowIndexes(selectedRowIndexes, byExtendingSelection: false)
+            if let selectedFlowID = snapshot.selectedFlowID,
+                let row = rows.firstIndex(where: { $0.id == selectedFlowID })
+            {
+                tableView.scrollRowToVisible(row)
+            }
         }
     }
 
@@ -205,12 +222,26 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         return cell
     }
 
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let identifier = NSUserInterfaceItemIdentifier("FlowTableRow")
+        let rowView =
+            (tableView.makeView(withIdentifier: identifier, owner: self)
+                as? FlowAnnotationTableRowView)
+            ?? FlowAnnotationTableRowView(identifier: identifier)
+        rowView.render(rows.indices.contains(row) ? rows[row].annotation : nil)
+        return rowView
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isRendering else {
             return
         }
+        let selectedFlowIDs = tableView.selectedRowIndexes.compactMap { row in
+            rows.indices.contains(row) ? rows[row].id : nil
+        }
         let selectedRow = tableView.selectedRow
-        viewModel.selectFlow(selectedRow >= 0 ? rows[selectedRow].id : nil)
+        let primaryFlowID = rows.indices.contains(selectedRow) ? rows[selectedRow].id : nil
+        viewModel.selectFlows(selectedFlowIDs, primary: primaryFlowID)
     }
 
     func tableView(
@@ -236,9 +267,18 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             return
         }
 
+        if !tableView.selectedRowIndexes.contains(rowIndex) {
+            tableView.selectRowIndexes(IndexSet(integer: rowIndex), byExtendingSelection: false)
+        }
+
         let host = rows[rowIndex].host
         let path = Self.mappingPath(for: rows[rowIndex])
         let flowID = rows[rowIndex].id
+        let selectedFlowIDs = tableView.selectedRowIndexes.compactMap { row in
+            rows.indices.contains(row) ? rows[row].id : nil
+        }
+        annotationMenuController.appendItems(to: menu, for: rows[rowIndex])
+        menu.addItem(.separator())
         menu.addItem(
             exportMenuItem(
                 title: "Repeat Request",
@@ -253,15 +293,50 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 action: #selector(editAndRepeat)
             )
         )
+        let compareItem = exportMenuItem(
+            title: "Compare Selected Flows…",
+            flowIDs: selectedFlowIDs,
+            action: #selector(compareSelectedFlows)
+        )
+        compareItem.isEnabled = selectedFlowIDs.count == 2
+        menu.addItem(compareItem)
         menu.addItem(.separator())
         menu.addItem(
-            exportMenuItem(title: "Copy as cURL", flowID: flowID, action: #selector(copyCURL))
+            exportMenuItem(
+                title: "Generate Request Code…",
+                flowID: flowID,
+                action: #selector(generateRequestCode)
+            )
+        )
+        menu.addItem(copyMenuItem(for: rows[rowIndex]))
+        menu.addItem(
+            exportMenuItem(
+                title: selectedFlowIDs.count == 1
+                    ? "Export HAR…" : "Export \(selectedFlowIDs.count) Flows as HAR…",
+                flowIDs: selectedFlowIDs,
+                action: #selector(exportHAR)
+            )
         )
         menu.addItem(
-            exportMenuItem(title: "Export HAR…", flowID: flowID, action: #selector(exportHAR))
+            exportMenuItem(
+                title: selectedFlowIDs.count == 1
+                    ? "Export OpenAPI…" : "Export \(selectedFlowIDs.count) Flows as OpenAPI…",
+                flowIDs: selectedFlowIDs,
+                action: #selector(exportOpenAPI)
+            )
         )
         menu.addItem(.separator())
         menu.addItem(ruleMenuItem(title: "Block \(host)", host: host, action: #selector(blockHost)))
+        if let operation = rows[rowIndex].graphqlOperationMetadata {
+            let operationBlockItem = NSMenuItem(
+                title: "Block GraphQL \(operation.kind.rawValue) \(operation.displayName)",
+                action: #selector(blockGraphQLOperation),
+                keyEquivalent: ""
+            )
+            operationBlockItem.target = self
+            operationBlockItem.representedObject = operation
+            menu.addItem(operationBlockItem)
+        }
         menu.addItem(ruleMenuItem(title: "Allow \(host)", host: host, action: #selector(allowHost)))
         menu.addItem(
             ruleMenuItem(
@@ -270,6 +345,107 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 action: #selector(disableCaching)
             )
         )
+        let networkConditionsItem = NSMenuItem(
+            title: "Network Conditions",
+            action: nil,
+            keyEquivalent: ""
+        )
+        let networkConditionsMenu = NSMenu(title: "Network Conditions")
+        let noThrottlingItem = NSMenuItem(
+            title: "No Throttling",
+            action: #selector(applyNetworkCondition),
+            keyEquivalent: ""
+        )
+        noThrottlingItem.target = self
+        noThrottlingItem.representedObject = HostNetworkConditionMenuTarget(
+            host: host,
+            preset: nil
+        )
+        networkConditionsMenu.addItem(noThrottlingItem)
+        networkConditionsMenu.addItem(.separator())
+        for preset in NetworkConditionPreset.latencyPresets {
+            let item = NSMenuItem(
+                title: preset.title,
+                action: #selector(applyNetworkCondition),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = HostNetworkConditionMenuTarget(
+                host: host,
+                preset: preset
+            )
+            networkConditionsMenu.addItem(item)
+        }
+        networkConditionsMenu.addItem(.separator())
+        for preset in NetworkConditionPreset.bandwidthPresets {
+            let item = NSMenuItem(
+                title: preset.title,
+                action: #selector(applyNetworkCondition),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = HostNetworkConditionMenuTarget(
+                host: host,
+                preset: preset
+            )
+            networkConditionsMenu.addItem(item)
+        }
+        let savedProfiles = networkConditionProfileStore.profiles
+        if !savedProfiles.isEmpty {
+            networkConditionsMenu.addItem(.separator())
+            let savedProfilesItem = NSMenuItem(
+                title: "Saved Profiles",
+                action: nil,
+                keyEquivalent: ""
+            )
+            let savedProfilesMenu = NSMenu(title: "Saved Profiles")
+            for profile in savedProfiles {
+                let item = NSMenuItem(
+                    title: profile.name,
+                    action: #selector(applyNetworkCondition),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = HostNetworkConditionMenuTarget(
+                    host: host,
+                    savedProfile: profile
+                )
+                savedProfilesMenu.addItem(item)
+            }
+            savedProfilesItem.submenu = savedProfilesMenu
+            networkConditionsMenu.addItem(savedProfilesItem)
+        }
+        networkConditionsMenu.addItem(.separator())
+        let customNetworkConditionItem = NSMenuItem(
+            title: "Custom…",
+            action: #selector(customNetworkCondition),
+            keyEquivalent: ""
+        )
+        customNetworkConditionItem.target = self
+        customNetworkConditionItem.representedObject = host
+        networkConditionsMenu.addItem(customNetworkConditionItem)
+        if !savedProfiles.isEmpty {
+            let removeProfilesItem = NSMenuItem(
+                title: "Remove Saved Profile",
+                action: nil,
+                keyEquivalent: ""
+            )
+            let removeProfilesMenu = NSMenu(title: "Remove Saved Profile")
+            for profile in savedProfiles {
+                let item = NSMenuItem(
+                    title: profile.name,
+                    action: #selector(removeNetworkConditionProfile),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = NetworkConditionProfileMenuTarget(id: profile.id)
+                removeProfilesMenu.addItem(item)
+            }
+            removeProfilesItem.submenu = removeProfilesMenu
+            networkConditionsMenu.addItem(removeProfilesItem)
+        }
+        networkConditionsItem.submenu = networkConditionsMenu
+        menu.addItem(networkConditionsItem)
         menu.addItem(.separator())
         let mapLocalItem = NSMenuItem(
             title: "Map Local \(host)\(path)…",
@@ -279,6 +455,16 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         mapLocalItem.target = self
         mapLocalItem.representedObject = HostPathMenuTarget(host: host, path: path)
         menu.addItem(mapLocalItem)
+        if let operation = rows[rowIndex].graphqlOperationMetadata {
+            let operationMapLocalItem = NSMenuItem(
+                title: "Map Local GraphQL \(operation.kind.rawValue) \(operation.displayName)…",
+                action: #selector(mapLocalGraphQLOperation),
+                keyEquivalent: ""
+            )
+            operationMapLocalItem.target = self
+            operationMapLocalItem.representedObject = operation
+            menu.addItem(operationMapLocalItem)
+        }
         let mapRemoteItem = NSMenuItem(
             title: "Map Remote \(host)\(path)…",
             action: #selector(mapRemote),
@@ -287,6 +473,60 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         mapRemoteItem.target = self
         mapRemoteItem.representedObject = HostPathMenuTarget(host: host, path: path)
         menu.addItem(mapRemoteItem)
+        let redirectItem = NSMenuItem(
+            title: "Redirect \(host)\(path)…",
+            action: #selector(redirect),
+            keyEquivalent: ""
+        )
+        redirectItem.target = self
+        redirectItem.representedObject = HostPathMenuTarget(host: host, path: path)
+        menu.addItem(redirectItem)
+        let replaceBodyItem = NSMenuItem(
+            title: "Replace Request Body \(host)\(path)…",
+            action: #selector(replaceBody),
+            keyEquivalent: ""
+        )
+        replaceBodyItem.target = self
+        replaceBodyItem.representedObject = HostPathMenuTarget(host: host, path: path)
+        menu.addItem(replaceBodyItem)
+        let replaceResponseBodyItem = NSMenuItem(
+            title: "Replace Response Body \(host)\(path)…",
+            action: #selector(replaceResponseBody),
+            keyEquivalent: ""
+        )
+        replaceResponseBodyItem.target = self
+        replaceResponseBodyItem.representedObject = HostPathMenuTarget(host: host, path: path)
+        menu.addItem(replaceResponseBodyItem)
+        if let operation = rows[rowIndex].graphqlOperationMetadata {
+            let operationMapRemoteItem = NSMenuItem(
+                title: "Map Remote GraphQL \(operation.kind.rawValue) \(operation.displayName)…",
+                action: #selector(mapRemoteGraphQLOperation),
+                keyEquivalent: ""
+            )
+            operationMapRemoteItem.target = self
+            operationMapRemoteItem.representedObject = operation
+            menu.addItem(operationMapRemoteItem)
+
+            let operationReplaceBodyItem = NSMenuItem(
+                title:
+                    "Replace Request Body GraphQL \(operation.kind.rawValue) \(operation.displayName)…",
+                action: #selector(replaceBodyGraphQLOperation),
+                keyEquivalent: ""
+            )
+            operationReplaceBodyItem.target = self
+            operationReplaceBodyItem.representedObject = operation
+            menu.addItem(operationReplaceBodyItem)
+
+            let operationReplaceResponseBodyItem = NSMenuItem(
+                title:
+                    "Replace Response Body GraphQL \(operation.kind.rawValue) \(operation.displayName)…",
+                action: #selector(replaceResponseBodyGraphQLOperation),
+                keyEquivalent: ""
+            )
+            operationReplaceResponseBodyItem.target = self
+            operationReplaceResponseBodyItem.representedObject = operation
+            menu.addItem(operationReplaceResponseBodyItem)
+        }
         menu.addItem(.separator())
         let requestBreakpointItem = NSMenuItem(
             title: "Breakpoint request \(host)\(path)",
@@ -304,12 +544,106 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         responseBreakpointItem.target = self
         responseBreakpointItem.representedObject = HostPathMenuTarget(host: host, path: path)
         menu.addItem(responseBreakpointItem)
+        if let operation = rows[rowIndex].graphqlOperationMetadata {
+            let operationBreakpointItem = NSMenuItem(
+                title:
+                    "Breakpoint GraphQL \(operation.kind.rawValue) \(operation.displayName)",
+                action: #selector(breakpointGraphQLOperation),
+                keyEquivalent: ""
+            )
+            operationBreakpointItem.target = self
+            operationBreakpointItem.representedObject = operation
+            menu.addItem(operationBreakpointItem)
+        }
     }
 
     private func exportMenuItem(title: String, flowID: FlowID, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         item.representedObject = flowID
+        return item
+    }
+
+    private func exportMenuItem(title: String, flowIDs: [FlowID], action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = flowIDs
+        return item
+    }
+
+    private func copyMenuItem(for row: TrafficFlowRow) -> NSMenuItem {
+        let item = NSMenuItem(title: "Copy", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Copy")
+        submenu.addItem(
+            copyValueMenuItem(title: "URL", row: row, kind: .url, isEnabled: true)
+        )
+        submenu.addItem(
+            copyValueMenuItem(
+                title: "Request Headers",
+                row: row,
+                kind: .requestHeaders,
+                isEnabled: true
+            )
+        )
+        submenu.addItem(
+            copyValueMenuItem(
+                title: "Request Body",
+                row: row,
+                kind: .requestBody,
+                isEnabled: row.hasRequestBody
+            )
+        )
+        submenu.addItem(
+            copyValueMenuItem(
+                title: "Request Cookies",
+                row: row,
+                kind: .requestCookies,
+                isEnabled: row.hasRequestCookies
+            )
+        )
+        submenu.addItem(.separator())
+        submenu.addItem(
+            copyValueMenuItem(
+                title: "Response Headers",
+                row: row,
+                kind: .responseHeaders,
+                isEnabled: row.hasResponse
+            )
+        )
+        submenu.addItem(
+            copyValueMenuItem(
+                title: "Response Body",
+                row: row,
+                kind: .responseBody,
+                isEnabled: row.hasResponseBody
+            )
+        )
+        submenu.addItem(
+            copyValueMenuItem(
+                title: "Response Cookies",
+                row: row,
+                kind: .responseCookies,
+                isEnabled: row.hasResponseCookies
+            )
+        )
+        submenu.addItem(.separator())
+        submenu.addItem(
+            exportMenuItem(title: "cURL", flowID: row.id, action: #selector(copyCURL))
+        )
+        item.submenu = submenu
+        return item
+    }
+
+    private func copyValueMenuItem(
+        title: String,
+        row: TrafficFlowRow,
+        kind: TrafficFlowCopyKind,
+        isEnabled: Bool
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(copyFlowValue), keyEquivalent: "")
+        item.target = self
+        item.representedObject = FlowCopyMenuTarget(flowID: row.id, kind: kind)
+        item.isEnabled = isEnabled
         return item
     }
 
@@ -341,6 +675,21 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 
         Task { @MainActor in
             await presentRequestEditor(flowID: flowID)
+        }
+    }
+
+    @objc private func compareSelectedFlows(_ sender: NSMenuItem) {
+        guard let flowIDs = sender.representedObject as? [FlowID], flowIDs.count == 2 else {
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                let comparison = try await viewModel.comparison(flowIDs: flowIDs)
+                presentAsSheet(FlowComparisonViewController(comparison: comparison))
+            } catch {
+                await presentError(error)
+            }
         }
     }
 
@@ -389,8 +738,45 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         Task { @MainActor in
             do {
                 let command = try await viewModel.curlCommand(for: flowID)
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(command, forType: .string)
+                copyToPasteboard(command)
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    @objc private func copyFlowValue(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? FlowCopyMenuTarget else {
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                let value = try await viewModel.copyText(
+                    for: target.flowID,
+                    kind: target.kind
+                )
+                copyToPasteboard(value)
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    @objc private func generateRequestCode(_ sender: NSMenuItem) {
+        guard let flowID = sender.representedObject as? FlowID else {
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                let snippets = try await viewModel.requestCodeSnippets(for: flowID)
+                presentAsSheet(RequestCodeViewController(snippets: snippets))
             } catch {
                 await presentError(error)
             }
@@ -398,14 +784,18 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
     }
 
     @objc private func exportHAR(_ sender: NSMenuItem) {
-        guard let flowID = sender.representedObject as? FlowID else {
+        guard let flowIDs = sender.representedObject as? [FlowID], !flowIDs.isEmpty else {
             return
         }
 
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
         panel.title = "Export HAR"
-        panel.nameFieldStringValue = "flow.har"
+        panel.nameFieldStringValue = flowIDs.count == 1 ? "flow.har" : "selected-flows.har"
+        panel.message =
+            flowIDs.count == 1
+            ? "Export the selected flow as HAR 1.2."
+            : "Export \(flowIDs.count) selected flows as one HAR 1.2 file."
         if let harType = UTType(filenameExtension: "har") {
             panel.allowedContentTypes = [harType]
         } else {
@@ -417,8 +807,41 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             }
             Task { @MainActor in
                 do {
-                    let data = try await self.viewModel.harFile(for: flowID)
-                    try data.write(to: url)
+                    try await self.viewModel.writeHAR(flowIDs: flowIDs, to: url)
+                } catch {
+                    await self.presentError(error)
+                }
+            }
+        }
+    }
+
+    @objc private func exportOpenAPI(_ sender: NSMenuItem) {
+        guard let flowIDs = sender.representedObject as? [FlowID], !flowIDs.isEmpty else {
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.title = "Export OpenAPI"
+        panel.nameFieldStringValue =
+            flowIDs.count == 1
+            ? "flow.openapi.yaml"
+            : "selected-flows.openapi.yaml"
+        panel.message =
+            flowIDs.count == 1
+            ? "Export the selected flow as an OpenAPI 3.0 YAML document."
+            : "Export \(flowIDs.count) selected flows as one OpenAPI 3.0 YAML document."
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "yaml") ?? .plainText,
+            UTType(filenameExtension: "yml") ?? .plainText
+        ]
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.writeOpenAPI(flowIDs: flowIDs, to: url)
                 } catch {
                     await self.presentError(error)
                 }
@@ -454,6 +877,49 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             return
         }
         viewModel.disableCaching(forHost: host)
+    }
+
+    @objc private func applyNetworkCondition(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostNetworkConditionMenuTarget else {
+            return
+        }
+        Task { @MainActor in
+            do {
+                if let preset = target.preset {
+                    try await viewModel.throttle(
+                        host: target.host,
+                        profile: preset.profile,
+                        label: preset.title
+                    )
+                } else if let savedProfile = target.savedProfile {
+                    try await viewModel.throttle(
+                        host: target.host,
+                        profile: savedProfile.profile,
+                        label: savedProfile.name
+                    )
+                } else {
+                    await viewModel.clearThrottle(forHost: target.host)
+                }
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    @objc private func customNetworkCondition(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        Task { @MainActor in
+            await promptCustomNetworkCondition(host: host)
+        }
+    }
+
+    @objc private func removeNetworkConditionProfile(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? NetworkConditionProfileMenuTarget else {
+            return
+        }
+        networkConditionProfileStore.remove(id: target.id)
     }
 
     @objc private func mapLocal(_ sender: NSMenuItem) {
@@ -500,6 +966,176 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         }
     }
 
+    @objc private func mapRemoteGraphQLOperation(_ sender: NSMenuItem) {
+        guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
+            return
+        }
+
+        Task { @MainActor in
+            await promptMapRemote(graphqlOperation: operation)
+        }
+    }
+
+    @objc private func redirect(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+
+        Task { @MainActor in
+            await promptRedirect(target: target)
+        }
+    }
+
+    @objc private func mapLocalGraphQLOperation(_ sender: NSMenuItem) {
+        guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Map Local GraphQL Operation"
+        panel.message =
+            "Choose a file to return for GraphQL \(operation.kind.rawValue) \(operation.displayName)"
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.mapLocal(
+                        graphqlOperation: operation,
+                        fileURL: url
+                    )
+                } catch {
+                    let alert = NSAlert(error: error)
+                    if let window = self.view.window {
+                        await alert.beginSheetModal(for: window)
+                    } else {
+                        alert.runModal()
+                    }
+                }
+            }
+        }
+    }
+
+    @objc private func replaceBodyGraphQLOperation(_ sender: NSMenuItem) {
+        guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Replace GraphQL Request Body"
+        panel.message =
+            "Choose the body sent for GraphQL \(operation.kind.rawValue) \(operation.displayName)"
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.replaceRequestBody(
+                        graphqlOperation: operation,
+                        fileURL: url
+                    )
+                } catch {
+                    await self.presentRuleError(error)
+                }
+            }
+        }
+    }
+
+    @objc private func replaceBody(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Replace Request Body"
+        panel.message = "Choose the body sent for \(target.host)\(target.path)"
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.replaceRequestBody(
+                        host: target.host,
+                        path: target.path,
+                        fileURL: url
+                    )
+                } catch {
+                    await self.presentRuleError(error)
+                }
+            }
+        }
+    }
+
+    @objc private func replaceResponseBodyGraphQLOperation(_ sender: NSMenuItem) {
+        guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Replace GraphQL Response Body"
+        panel.message =
+            "Choose the body returned for GraphQL \(operation.kind.rawValue) \(operation.displayName)"
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.replaceResponseBody(
+                        graphqlOperation: operation,
+                        fileURL: url
+                    )
+                } catch {
+                    await self.presentRuleError(error)
+                }
+            }
+        }
+    }
+
+    @objc private func replaceResponseBody(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Replace Response Body"
+        panel.message = "Choose the body returned for \(target.host)\(target.path)"
+        panel.begin { [weak self] result in
+            guard result == .OK, let url = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.replaceResponseBody(
+                        host: target.host,
+                        path: target.path,
+                        fileURL: url
+                    )
+                } catch {
+                    await self.presentRuleError(error)
+                }
+            }
+        }
+    }
+
     @objc private func breakpointRequest(_ sender: NSMenuItem) {
         guard let target = sender.representedObject as? HostPathMenuTarget else {
             return
@@ -514,11 +1150,173 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         viewModel.breakpoint(host: target.host, path: target.path, phase: .responseHeaders)
     }
 
+    @objc private func breakpointGraphQLOperation(_ sender: NSMenuItem) {
+        guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
+            return
+        }
+        viewModel.breakpoint(graphqlOperation: operation)
+    }
+
+    @objc private func blockGraphQLOperation(_ sender: NSMenuItem) {
+        guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
+            return
+        }
+        viewModel.block(graphqlOperation: operation)
+    }
+
     private func promptMapRemote(target: HostPathMenuTarget) async {
+        do {
+            guard
+                let destination = try await promptMapRemoteDestination(
+                    label: "\(target.host)\(target.path)"
+                )
+            else {
+                return
+            }
+            try await viewModel.mapRemote(
+                host: target.host,
+                path: target.path,
+                destination: destination
+            )
+        } catch {
+            await presentRuleError(error)
+        }
+    }
+
+    private func promptMapRemote(graphqlOperation: GraphQLOperationMetadata) async {
+        let label =
+            "GraphQL \(graphqlOperation.kind.rawValue) \(graphqlOperation.displayName)"
+        do {
+            guard let destination = try await promptMapRemoteDestination(label: label) else {
+                return
+            }
+            try await viewModel.mapRemote(
+                graphqlOperation: graphqlOperation,
+                destination: destination
+            )
+        } catch {
+            await presentRuleError(error)
+        }
+    }
+
+    private func promptRedirect(target: HostPathMenuTarget) async {
+        let alert = NSAlert()
+        alert.messageText = "Redirect"
+        alert.informativeText =
+            "Enter the absolute HTTP or HTTPS destination returned for \(target.host)\(target.path)."
+        alert.addButton(withTitle: "Redirect")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "https://example.com/new-location"
+        field.stringValue = "https://"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let destination = URL(string: text) else {
+            await presentRuleError(ProxyLensError.invalidURL(text))
+            return
+        }
+
+        do {
+            try await viewModel.redirect(
+                host: target.host,
+                path: target.path,
+                destination: destination
+            )
+        } catch {
+            await presentRuleError(error)
+        }
+    }
+
+    private func promptCustomNetworkCondition(host: String) async {
+        let alert = NSAlert()
+        alert.messageText = "Custom Network Conditions"
+        alert.informativeText =
+            "Apply latency, request loss, and optional transfer limits to new requests for \(host). Leave a bandwidth field blank for unlimited."
+        alert.addButton(withTitle: "Apply")
+        alert.addButton(withTitle: "Cancel")
+
+        let latencyField = NSTextField(string: "200")
+        latencyField.placeholderString = "0"
+        latencyField.setAccessibilityIdentifier("networkConditions.latency")
+        let downloadField = NSTextField(string: "512")
+        downloadField.placeholderString = "Unlimited"
+        downloadField.setAccessibilityIdentifier("networkConditions.download")
+        let uploadField = NSTextField(string: "256")
+        uploadField.placeholderString = "Unlimited"
+        uploadField.setAccessibilityIdentifier("networkConditions.upload")
+        let packetLossField = NSTextField(string: "0")
+        packetLossField.placeholderString = "0"
+        packetLossField.setAccessibilityIdentifier("networkConditions.packetLoss")
+        let nameField = NSTextField(string: "")
+        nameField.placeholderString = "Optional"
+        nameField.setAccessibilityIdentifier("networkConditions.profileName")
+
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: "Latency (ms)"), latencyField],
+            [NSTextField(labelWithString: "Download (KiB/s)"), downloadField],
+            [NSTextField(labelWithString: "Upload (KiB/s)"), uploadField],
+            [NSTextField(labelWithString: "Request loss (%)"), packetLossField],
+            [NSTextField(labelWithString: "Save as profile"), nameField]
+        ])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).width = 180
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        alert.accessoryView = grid
+        alert.window.initialFirstResponder = latencyField
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        do {
+            let profile = try TrafficNetworkConditionDraft(
+                latencyMilliseconds: latencyField.stringValue,
+                downloadKibibytesPerSecond: downloadField.stringValue,
+                uploadKibibytesPerSecond: uploadField.stringValue,
+                packetLossPercentage: packetLossField.stringValue
+            ).profile()
+            let profileName = nameField.stringValue.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let savedProfile =
+                try profileName.isEmpty
+                ? nil
+                : networkConditionProfileStore.save(name: profileName, profile: profile)
+            try await viewModel.throttle(
+                host: host,
+                profile: profile,
+                label: savedProfile?.name ?? "Custom"
+            )
+        } catch {
+            await presentRuleError(error)
+        }
+    }
+
+    private func promptMapRemoteDestination(label: String) async throws -> URL? {
         let alert = NSAlert()
         alert.messageText = "Map Remote"
         alert.informativeText =
-            "Enter the destination URL for \(target.host)\(target.path). A host-only URL keeps the original path and query."
+            "Enter the destination URL for \(label). A host-only URL keeps the original path and query."
         alert.addButton(withTitle: "Map")
         alert.addButton(withTitle: "Cancel")
 
@@ -535,26 +1333,22 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             response = alert.runModal()
         }
         guard response == .alertFirstButtonReturn else {
-            return
+            return nil
         }
 
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            guard let destination = URL(string: text) else {
-                throw ProxyLensError.invalidURL(text)
-            }
-            try await viewModel.mapRemote(
-                host: target.host,
-                path: target.path,
-                destination: destination
-            )
-        } catch {
-            let errorAlert = NSAlert(error: error)
-            if let window = view.window {
-                await errorAlert.beginSheetModal(for: window)
-            } else {
-                errorAlert.runModal()
-            }
+        guard let destination = URL(string: text) else {
+            throw ProxyLensError.invalidURL(text)
+        }
+        return destination
+    }
+
+    private func presentRuleError(_ error: Error) async {
+        let errorAlert = NSAlert(error: error)
+        if let window = view.window {
+            await errorAlert.beginSheetModal(for: window)
+        } else {
+            errorAlert.runModal()
         }
     }
 
@@ -576,10 +1370,116 @@ private final class HostPathMenuTarget: NSObject {
     }
 }
 
+private final class FlowCopyMenuTarget: NSObject {
+    let flowID: FlowID
+    let kind: TrafficFlowCopyKind
+
+    init(flowID: FlowID, kind: TrafficFlowCopyKind) {
+        self.flowID = flowID
+        self.kind = kind
+    }
+}
+
+private final class HostNetworkConditionMenuTarget: NSObject {
+    let host: String
+    let preset: NetworkConditionPreset?
+    let savedProfile: TrafficNetworkConditionProfile?
+
+    init(host: String, preset: NetworkConditionPreset?) {
+        self.host = host
+        self.preset = preset
+        self.savedProfile = nil
+    }
+
+    init(host: String, savedProfile: TrafficNetworkConditionProfile) {
+        self.host = host
+        self.preset = nil
+        self.savedProfile = savedProfile
+    }
+}
+
+private final class NetworkConditionProfileMenuTarget: NSObject {
+    let id: UUID
+
+    init(id: UUID) {
+        self.id = id
+    }
+}
+
+private enum NetworkConditionPreset: CaseIterable {
+    case lostConnection
+    case veryBadNetwork
+    case milliseconds200
+    case milliseconds500
+    case second1
+    case seconds2
+    case slow3G
+    case fast3G
+    case wifi
+
+    static let latencyPresets: [Self] = [
+        .lostConnection, .veryBadNetwork,
+        .milliseconds200, .milliseconds500, .second1, .seconds2
+    ]
+
+    static let bandwidthPresets: [Self] = [.slow3G, .fast3G, .wifi]
+
+    var title: String {
+        switch self {
+        case .lostConnection: "Lost Connection"
+        case .veryBadNetwork: "Very Bad Network"
+        case .milliseconds200: "200 ms Latency"
+        case .milliseconds500: "500 ms Latency"
+        case .second1: "1 s Latency"
+        case .seconds2: "2 s Latency"
+        case .slow3G: "Slow 3G"
+        case .fast3G: "Fast 3G"
+        case .wifi: "Wi-Fi"
+        }
+    }
+
+    var profile: ThrottleProfile {
+        switch self {
+        case .lostConnection:
+            ThrottleProfile(packetLossPercentage: 100)
+        case .veryBadNetwork:
+            ThrottleProfile(
+                latency: 1,
+                downloadBytesPerSecond: 50_000,
+                uploadBytesPerSecond: 20_000,
+                packetLossPercentage: 20
+            )
+        case .milliseconds200: ThrottleProfile(latency: 0.2)
+        case .milliseconds500: ThrottleProfile(latency: 0.5)
+        case .second1: ThrottleProfile(latency: 1)
+        case .seconds2: ThrottleProfile(latency: 2)
+        case .slow3G:
+            ThrottleProfile(
+                latency: 0.4,
+                downloadBytesPerSecond: 100_000,
+                uploadBytesPerSecond: 50_000
+            )
+        case .fast3G:
+            ThrottleProfile(
+                latency: 0.15,
+                downloadBytesPerSecond: 1_500_000,
+                uploadBytesPerSecond: 750_000
+            )
+        case .wifi:
+            ThrottleProfile(
+                latency: 0.03,
+                downloadBytesPerSecond: 10_000_000,
+                uploadBytesPerSecond: 5_000_000
+            )
+        }
+    }
+}
+
 private enum FlowColumn: String, CaseIterable {
     case method
     case host
     case path
+    case graphqlOperation
     case status
     case startedAt
     case duration
@@ -590,6 +1490,7 @@ private enum FlowColumn: String, CaseIterable {
         case .method: "Method"
         case .host: "Host"
         case .path: "Path"
+        case .graphqlOperation: "Query"
         case .status: "Status"
         case .startedAt: "Time"
         case .duration: "Duration"
@@ -602,6 +1503,7 @@ private enum FlowColumn: String, CaseIterable {
         case .method: 68
         case .host: 160
         case .path: 240
+        case .graphqlOperation: 132
         case .status: 72
         case .startedAt: 88
         case .duration: 82
@@ -614,6 +1516,7 @@ private enum FlowColumn: String, CaseIterable {
         case .method: 58
         case .host: 100
         case .path: 120
+        case .graphqlOperation: 90
         case .status: 60
         case .startedAt: 72
         case .duration: 68
@@ -626,6 +1529,7 @@ private enum FlowColumn: String, CaseIterable {
         case .method: .method
         case .host: .host
         case .path: .path
+        case .graphqlOperation: .graphqlOperation
         case .status: .status
         case .startedAt: .startedAt
         case .duration: .duration
@@ -639,6 +1543,7 @@ private struct FlowCellPresentation {
     let textColor: NSColor
     let font: NSFont
     let toolTip: String?
+    let isStruckThrough: Bool
 }
 
 @MainActor
@@ -664,51 +1569,95 @@ private enum FlowCellFormatter {
                 text: flow.method,
                 textColor: methodColor(flow.method),
                 font: .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
-                toolTip: nil
+                toolTip: nil,
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         case .host:
             return FlowCellPresentation(
                 text: flow.usesTLS ? "🔒 \(flow.host)" : flow.host,
                 textColor: .labelColor,
                 font: regularFont,
-                toolTip: flow.fullURL
+                toolTip: annotationToolTip(flow),
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         case .path:
             return FlowCellPresentation(
-                text: flow.path,
+                text: annotationMarker(flow) + flow.path,
                 textColor: .labelColor,
                 font: regularFont,
-                toolTip: flow.fullURL
+                toolTip: annotationToolTip(flow),
+                isStruckThrough: flow.annotation?.isStruckThrough == true
+            )
+        case .graphqlOperation:
+            return FlowCellPresentation(
+                text: flow.graphqlOperation ?? "",
+                textColor: .secondaryLabelColor,
+                font: regularFont,
+                toolTip: flow.graphqlOperation,
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         case .status:
             return FlowCellPresentation(
                 text: statusText(flow),
                 textColor: statusColor(flow),
                 font: monospacedFont,
-                toolTip: nil
+                toolTip: nil,
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         case .startedAt:
             return FlowCellPresentation(
                 text: timeFormatter.string(from: flow.startedAt),
                 textColor: .secondaryLabelColor,
                 font: monospacedFont,
-                toolTip: nil
+                toolTip: nil,
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         case .duration:
             return FlowCellPresentation(
                 text: formattedDuration(flow.duration),
                 textColor: .secondaryLabelColor,
                 font: monospacedFont,
-                toolTip: nil
+                toolTip: nil,
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         case .size:
             return FlowCellPresentation(
                 text: formattedByteCount(flow.byteCount),
                 textColor: .secondaryLabelColor,
                 font: monospacedFont,
-                toolTip: nil
+                toolTip: nil,
+                isStruckThrough: flow.annotation?.isStruckThrough == true
             )
         }
+    }
+
+    private static func annotationMarker(_ flow: TrafficFlowRow) -> String {
+        guard let annotation = flow.annotation else {
+            return ""
+        }
+        return switch (annotation.highlight, annotation.comment) {
+        case (.some, .some): "● ✎ "
+        case (.some, .none): "● "
+        case (.none, .some): "✎ "
+        case (.none, .none): ""
+        }
+    }
+
+    private static func annotationToolTip(_ flow: TrafficFlowRow) -> String {
+        guard let annotation = flow.annotation else {
+            return flow.fullURL
+        }
+        var lines = [flow.fullURL]
+        if let highlight = annotation.highlight {
+            lines.append("\(highlight.menuTitle) highlight")
+        }
+        if annotation.isStruckThrough {
+            lines.append("Struck through")
+        }
+        if let comment = annotation.comment {
+            lines.append(comment)
+        }
+        return lines.joined(separator: "\n")
     }
 
     private static func methodColor(_ method: String) -> NSColor {
@@ -780,6 +1729,10 @@ private final class FlowTableCellView: NSTableCellView {
         self.identifier = identifier
         label.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingMiddle
+        label.usesSingleLineMode = true
+        label.maximumNumberOfLines = 1
+        label.cell?.truncatesLastVisibleLine = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         addSubview(label)
         textField = label
         NSLayoutConstraint.activate([
@@ -795,9 +1748,21 @@ private final class FlowTableCellView: NSTableCellView {
     }
 
     func render(_ presentation: FlowCellPresentation) {
-        label.stringValue = presentation.text
-        label.textColor = presentation.textColor
-        label.font = presentation.font
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byTruncatingMiddle
+        var attributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: presentation.textColor,
+            .font: presentation.font,
+            .paragraphStyle: paragraphStyle
+        ]
+        if presentation.isStruckThrough {
+            attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            attributes[.strikethroughColor] = NSColor.secondaryLabelColor
+        }
+        label.attributedStringValue = NSAttributedString(
+            string: presentation.text,
+            attributes: attributes
+        )
         label.toolTip = presentation.toolTip
     }
 }

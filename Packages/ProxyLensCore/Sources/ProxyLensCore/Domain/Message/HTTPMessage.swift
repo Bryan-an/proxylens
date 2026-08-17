@@ -37,6 +37,7 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
     public private(set) var body: BodyReference?
     public let version: HTTPVersion
     public let rawTarget: String?
+    public private(set) var graphqlOperation: GraphQLOperationMetadata?
 
     public init(
         method: HTTPMethod,
@@ -44,7 +45,8 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
         headers: HTTPHeaders = HTTPHeaders(),
         body: BodyReference? = nil,
         version: HTTPVersion = .http11,
-        rawTarget: String? = nil
+        rawTarget: String? = nil,
+        graphqlOperation: GraphQLOperationMetadata? = nil
     ) {
         self.method = method
         self.url = url
@@ -52,10 +54,20 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
         self.body = body
         self.version = version
         self.rawTarget = rawTarget
+        self.graphqlOperation = graphqlOperation ?? Self.inferGraphQLOperation(from: body)
     }
 
     public mutating func attachBody(_ body: BodyReference) {
         self.body = body
+        graphqlOperation = Self.inferGraphQLOperation(from: body)
+    }
+
+    public mutating func attachBody(
+        _ body: BodyReference,
+        graphqlOperation: GraphQLOperationMetadata?
+    ) {
+        self.body = body
+        self.graphqlOperation = graphqlOperation
     }
 
     public func replacingHeaders(_ headers: HTTPHeaders) -> HTTPRequest {
@@ -65,7 +77,8 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
             headers: headers,
             body: body,
             version: version,
-            rawTarget: rawTarget
+            rawTarget: rawTarget,
+            graphqlOperation: graphqlOperation
         )
     }
 
@@ -77,6 +90,35 @@ public struct HTTPRequest: Codable, Equatable, Hashable, Sendable {
             body: body,
             version: version,
             rawTarget: rawTarget
+        )
+    }
+
+    public func replacingBody(
+        _ body: BodyReference?,
+        graphqlOperation: GraphQLOperationMetadata?
+    ) -> HTTPRequest {
+        HTTPRequest(
+            method: method,
+            url: url,
+            headers: headers,
+            body: body,
+            version: version,
+            rawTarget: rawTarget,
+            graphqlOperation: graphqlOperation
+        )
+    }
+
+    private static func inferGraphQLOperation(
+        from body: BodyReference?
+    ) -> GraphQLOperationMetadata? {
+        guard let body, let data = body.inlineData else {
+            return nil
+        }
+        return GraphQLBodyView.operationMetadata(
+            data: data,
+            contentType: body.contentType,
+            contentEncoding: body.contentEncoding,
+            isTruncated: body.isTruncated
         )
     }
 }

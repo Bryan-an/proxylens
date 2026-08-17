@@ -54,7 +54,10 @@ public struct NIORequestReplayClient: RequestReplayClient {
         try validate(request)
         let target = try ProxyTarget(url: request.url)
         let duplicatedBody = try await duplicateRequestBody(request.body)
-        let replayedRequest = request.replacingBody(duplicatedBody.reference)
+        let replayedRequest = request.replacingBody(
+            duplicatedBody.reference,
+            graphqlOperation: request.graphqlOperation
+        )
         let startedAt = Date()
         var flow = Flow(
             sessionID: sessionID,

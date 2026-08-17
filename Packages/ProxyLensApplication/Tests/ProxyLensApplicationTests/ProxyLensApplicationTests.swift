@@ -5,6 +5,136 @@ import XCTest
 @testable import ProxyLensApplication
 
 final class ProxyLensApplicationTests: XCTestCase {
+    func testCURLImportParsesACommonMultilineJSONRequestWithoutExecutingShellCode()
+        throws
+    {
+        let request = try CURLRequestImporter.parse(
+            #"""
+            curl 'https://api.example.com/v1/items?draft=1' \
+              -X PATCH \
+              -H 'Content-Type: application/json' \
+              -H 'X-Debug: enabled' \
+              --data-raw '{"name":"Ada","enabled":true}' \
+              --compressed
+            """#
+        )
+
+        XCTAssertEqual(request.method, .patch)
+        XCTAssertEqual(request.url.absoluteString, "https://api.example.com/v1/items?draft=1")
+        XCTAssertEqual(request.headers.firstValue(for: "Content-Type"), "application/json")
+        XCTAssertEqual(request.headers.firstValue(for: "X-Debug"), "enabled")
+        XCTAssertEqual(
+            request.body?.inlineData,
+            Data(#"{"name":"Ada","enabled":true}"#.utf8)
+        )
+        XCTAssertEqual(request.headers.firstValue(for: "Content-Length"), "29")
+    }
+
+    func testCURLImportAppliesJSONDefaultsAndSupportsAttachedOptions() throws {
+        let request = try CURLRequestImporter.parse(
+            #"curl --url=https://api.example.com/events -HAccept-Language:en -btoken=abc --json='{"name":"ProxyLens"}'"#
+        )
+
+        XCTAssertEqual(request.method, .post)
+        XCTAssertEqual(request.headers.firstValue(for: "Accept-Language"), "en")
+        XCTAssertEqual(request.headers.firstValue(for: "Cookie"), "token=abc")
+        XCTAssertEqual(request.headers.firstValue(for: "Content-Type"), "application/json")
+        XCTAssertEqual(request.headers.firstValue(for: "Accept"), "application/json")
+        XCTAssertEqual(request.body?.inlineData, Data(#"{"name":"ProxyLens"}"#.utf8))
+    }
+
+    func testCURLImportRejectsFileReferencesUnsupportedOptionsAndOversizedInput() {
+        for command in [
+            "curl https://example.com --data-binary @payload.json",
+            "curl https://example.com --cookie @cookies.txt",
+            "curl https://example.com --form avatar=@photo.png",
+            "curl https://example.com --definitely-not-a-real-option",
+            #"curl https://example.com --data-binary $'\xff'"#
+        ] {
+            XCTAssertThrowsError(try CURLRequestImporter.parse(command))
+        }
+
+        XCTAssertThrowsError(
+            try CURLRequestImporter.parse(
+                "curl https://example.com/" + String(repeating: "a", count: 262_145)
+            )
+        )
+    }
+
+    func testExportServiceBuildsDeterministicOpenAPISpecWithoutSecretHeaderValues()
+        async throws
+    {
+        let first = try Self.exportFlow(
+            method: .get,
+            url: "https://api.example.com/users?q=ada",
+            requestHeaders: [
+                ("Authorization", "Bearer secret-token"),
+                ("Accept", "application/json")
+            ],
+            statusCode: 200,
+            reasonPhrase: "OK",
+            responseHeaders: [("Content-Type", "application/json")],
+            responseBody: Data(#"{"id":1,"name":"Ada"}"#.utf8)
+        )
+        let second = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/users",
+            requestHeaders: [("Content-Type", "application/json")],
+            requestBody: Data(#"{"name":"Grace"}"#.utf8),
+            statusCode: 201,
+            reasonPhrase: "Created",
+            responseHeaders: [("Content-Type", "application/json")],
+            responseBody: Data(#"{"id":2}"#.utf8)
+        )
+
+        let service = ExportService(bodyStore: RecordingBodyStore())
+        let data = try await service.openAPI(
+            for: [second, first],
+            options: OpenAPIExportOptions(title: "Captured API", version: "2026.08")
+        )
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+
+        XCTAssertTrue(text.hasPrefix("openapi: \"3.0.3\"\n"))
+        XCTAssertTrue(text.contains("title: \"Captured API\""))
+        XCTAssertTrue(text.contains("version: \"2026.08\""))
+        XCTAssertTrue(text.contains("- url: \"https://api.example.com\""))
+        XCTAssertTrue(text.contains("\"/users\":"))
+        XCTAssertTrue(text.contains("operationId: \"getUsers\""))
+        XCTAssertTrue(text.contains("operationId: \"postUsers\""))
+        XCTAssertTrue(text.contains("name: \"q\""))
+        XCTAssertTrue(text.contains("\"200\":\n"))
+        XCTAssertTrue(text.contains("\"201\":\n"))
+        XCTAssertTrue(text.contains("application/json"))
+        XCTAssertFalse(text.contains("secret-token"))
+        XCTAssertTrue(
+            text.range(of: "operationId: \"getUsers\"")!.lowerBound
+                < text.range(of: "operationId: \"postUsers\"")!.lowerBound
+        )
+    }
+
+    func testExportServiceRejectsEmptyAndUnsupportedOpenAPIFlows() async throws {
+        let service = ExportService(bodyStore: RecordingBodyStore())
+
+        do {
+            _ = try await service.openAPI(for: [])
+            XCTFail("Expected an empty OpenAPI export to be rejected")
+        } catch let error as OpenAPIExportError {
+            XCTAssertEqual(error, .noFlows)
+        }
+
+        let connect = try Self.exportFlow(
+            method: .connect,
+            url: "https://api.example.com/",
+            statusCode: 200
+        )
+        do {
+            _ = try await service.openAPI(for: [connect])
+            XCTFail("Expected CONNECT to be rejected by OpenAPI export")
+        } catch let error as OpenAPIExportError {
+            XCTAssertEqual(error, .unsupportedMethod("CONNECT"))
+        }
+    }
+
     func testReplayServiceRepeatsTheOriginalRequestAndPersistsTheNewFlow() async throws {
         let original = try Self.exportFlow(
             method: .post,
@@ -187,6 +317,119 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertTrue(snapshot.currentRules().rules.isEmpty)
     }
 
+    func testRuleEngineCapturesAndRestoresCompleteRuleProfiles() async throws {
+        let sourceSnapshot = MutableRuleSnapshot()
+        let sourceEngine = RuleEngine(snapshot: sourceSnapshot, maximumMapLocalBytes: 1_024)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-rule-profile-\(UUID().uuidString).json")
+        let body = Data(#"{"profile":true}"#.utf8)
+        try body.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        _ = try await sourceEngine.mapLocal(
+            host: "api.example.com",
+            path: "/profile",
+            fileURL: fileURL
+        )
+        _ = await sourceEngine.blockHost("tracker.example.com")
+        let profile = try await sourceEngine.makeProfile(name: "Daily debugging")
+
+        XCTAssertEqual(profile.name, "Daily debugging")
+        XCTAssertEqual(profile.rules.rules.count, 2)
+        XCTAssertEqual(profile.mappedLocals.count, 1)
+
+        let restoredSnapshot = MutableRuleSnapshot()
+        let restoredEngine = RuleEngine(snapshot: restoredSnapshot)
+        try await restoredEngine.apply(profile)
+
+        let restoredRules = await restoredEngine.currentRules()
+        XCTAssertEqual(restoredRules, profile.rules)
+        XCTAssertEqual(
+            restoredSnapshot.mappedLocal(for: profile.mappedLocals[0].resourceID),
+            profile.mappedLocals[0]
+        )
+    }
+
+    func testRuleProfileArchiveRoundTripsAPortableVersionedDocument() async throws {
+        let service = RuleProfileArchiveService(maximumArchiveByteCount: 4_096)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("portable-rules-\(UUID().uuidString).proxylensrules")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let profile = RuleProfile(
+            id: UUID(uuidString: "57E012DC-67E7-486D-95E2-D44DBF15DCCA")!,
+            name: "API debugging",
+            rules: RuleSet(rules: [await RuleEngine().blockHost("tracker.example.com")]),
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+
+        try await service.export(profile, to: fileURL)
+        let exportedText = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(exportedText.contains("\"schemaVersion\" : 1"))
+        XCTAssertTrue(exportedText.contains("\"API debugging\""))
+
+        let imported = try await service.importProfile(from: fileURL)
+        XCTAssertEqual(imported, profile)
+    }
+
+    func testRuleProfileArchiveRejectsOversizedAndUnsupportedDocuments() async throws {
+        let service = RuleProfileArchiveService(maximumArchiveByteCount: 128)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("invalid-rules-\(UUID().uuidString).proxylensrules")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        try Data(repeating: 0x61, count: 129).write(to: fileURL)
+        do {
+            _ = try await service.importProfile(from: fileURL)
+            XCTFail("Expected the oversized archive to be rejected")
+        } catch let error as RuleProfileArchiveError {
+            XCTAssertEqual(error, .archiveTooLarge(byteCount: 129, maximumByteCount: 128))
+        }
+
+        let unsupported = RuleProfile(
+            schemaVersion: RuleProfile.currentSchemaVersion + 1,
+            name: "Future rules",
+            rules: RuleSet()
+        )
+        let roomyService = RuleProfileArchiveService()
+        do {
+            try await roomyService.export(unsupported, to: fileURL)
+            XCTFail("Expected the unsupported schema to be rejected")
+        } catch let error as RuleProfileArchiveError {
+            XCTAssertEqual(
+                error,
+                .unsupportedSchema(RuleProfile.currentSchemaVersion + 1)
+            )
+        }
+
+        let resource = MapLocalSpec(
+            resourceID: "duplicate-resource",
+            body: BodyReference(inline: Data("local".utf8))
+        )
+        let duplicated = RuleProfile(
+            name: "Invalid resources",
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local",
+                    phase: .requestHeaders,
+                    matcher: .any,
+                    action: .mapLocal(resourceID: resource.resourceID)
+                )
+            ]),
+            mappedLocals: [resource, resource]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(duplicated).write(to: fileURL)
+        do {
+            _ = try await roomyService.importProfile(from: fileURL)
+            XCTFail("Expected duplicate embedded resources to be rejected")
+        } catch let error as RuleEngineError {
+            XCTAssertEqual(error, .duplicateMappedLocalResource(resource.resourceID))
+        }
+    }
+
     func testRuleEnginePublishesMapRemoteRules() async throws {
         let snapshot = MutableRuleSnapshot()
         let engine = RuleEngine(snapshot: snapshot)
@@ -232,6 +475,140 @@ final class ProxyLensApplicationTests: XCTestCase {
         }
     }
 
+    func testRuleEnginePublishesRedirectRules() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+        let destination = URL(string: "https://login.example.com/continue")!
+
+        let rule = try await engine.redirect(
+            host: "api.example.com",
+            path: "/users?unused=1",
+            destination: destination
+        )
+
+        XCTAssertEqual(rule.name, "Redirect api.example.com/users")
+        XCTAssertEqual(rule.priority, 14)
+        XCTAssertEqual(rule.phase, .requestHeaders)
+        XCTAssertEqual(rule.action, .redirect(url: destination))
+        XCTAssertEqual(snapshot.currentRules().rules.map(\.id), [rule.id])
+
+        do {
+            _ = try await engine.redirect(
+                host: "api.example.com",
+                path: "/users",
+                destination: URL(string: "file:///tmp/redirect")!
+            )
+            XCTFail("Expected an unsupported Redirect destination to be rejected")
+        } catch let error as RuleEngineError {
+            XCTAssertEqual(
+                error,
+                .redirectInvalidDestination("file:///tmp/redirect")
+            )
+        }
+    }
+
+    func testRuleEnginePublishesHostThrottleRules() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+
+        let rule = try await engine.throttle(host: "api.example.com", latency: 0.5)
+
+        XCTAssertEqual(rule.name, "Throttle api.example.com (500 ms latency)")
+        XCTAssertEqual(rule.priority, 17)
+        XCTAssertEqual(rule.phase, .requestHeaders)
+        XCTAssertEqual(rule.matcher, .host(.exact("api.example.com")))
+        XCTAssertEqual(rule.action, .throttle(ThrottleProfile(latency: 0.5)))
+        XCTAssertEqual(snapshot.currentRules().rules.map(\.id), [rule.id])
+
+        let replacementProfile = ThrottleProfile(
+            latency: 0.4,
+            downloadBytesPerSecond: 100_000,
+            uploadBytesPerSecond: 50_000
+        )
+        let replacement = try await engine.throttle(
+            host: "api.example.com",
+            profile: replacementProfile,
+            label: "Slow 3G"
+        )
+        XCTAssertEqual(replacement.name, "Throttle api.example.com (Slow 3G)")
+        XCTAssertEqual(snapshot.currentRules().rules.map(\.id), [replacement.id])
+
+        await engine.clearThrottle(forHost: "api.example.com")
+        XCTAssertTrue(snapshot.currentRules().rules.isEmpty)
+    }
+
+    func testRuleEngineRejectsInvalidThrottleLatency() async throws {
+        let engine = RuleEngine()
+
+        for latency in [-0.1, .infinity, 60.1] {
+            do {
+                _ = try await engine.throttle(host: "api.example.com", latency: latency)
+                XCTFail("Expected invalid latency \(latency) to be rejected")
+            } catch let error as RuleEngineError {
+                XCTAssertEqual(error, .invalidThrottleLatency(latency))
+            }
+        }
+    }
+
+    func testRuleEngineRejectsInvalidThrottleBandwidth() async throws {
+        let engine = RuleEngine()
+
+        for bandwidth in [0, 1_023, 1_000_000_001] as [Int64] {
+            do {
+                _ = try await engine.throttle(
+                    host: "api.example.com",
+                    profile: ThrottleProfile(downloadBytesPerSecond: bandwidth),
+                    label: "Custom"
+                )
+                XCTFail("Expected invalid bandwidth \(bandwidth) to be rejected")
+            } catch let error as RuleEngineError {
+                XCTAssertEqual(error, .invalidThrottleBandwidth(bandwidth))
+            }
+        }
+    }
+
+    func testRuleEngineRejectsInvalidThrottlePacketLoss() async throws {
+        let engine = RuleEngine()
+
+        for percentage in [-0.1, 100.1, .infinity] {
+            do {
+                _ = try await engine.throttle(
+                    host: "api.example.com",
+                    profile: ThrottleProfile(packetLossPercentage: percentage),
+                    label: "Lossy"
+                )
+                XCTFail("Expected invalid packet loss \(percentage) to be rejected")
+            } catch let error as RuleEngineError {
+                XCTAssertEqual(error, .invalidThrottlePacketLoss(percentage))
+            }
+        }
+    }
+
+    func testRuleEngineCanToggleAndRemoveRulesWithoutChangingStableIdentity() async {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+        let blocked = await engine.blockHost("api.example.com")
+        let allowed = await engine.allowHost("assets.example.com")
+
+        let disabled = await engine.setEnabled(false, for: blocked.id)
+        let currentRuleIDs = await engine.currentRules().rules.map(\.id)
+        let missing = await engine.setEnabled(true, for: RuleID())
+
+        XCTAssertEqual(disabled?.id, blocked.id)
+        XCTAssertEqual(disabled?.enabled, false)
+        XCTAssertEqual(currentRuleIDs, [blocked.id, allowed.id])
+        XCTAssertEqual(
+            snapshot.currentRules().rules.first(where: { $0.id == blocked.id })?.enabled,
+            false
+        )
+        XCTAssertNil(missing)
+
+        await engine.remove(id: allowed.id)
+        let remainingRuleIDs = await engine.currentRules().rules.map(\.id)
+        XCTAssertEqual(remainingRuleIDs, [blocked.id])
+        XCTAssertEqual(snapshot.currentRules().rules.map(\.id), [blocked.id])
+    }
+
     func testRuleEnginePublishesBreakpointRules() async {
         let snapshot = MutableRuleSnapshot()
         let engine = RuleEngine(snapshot: snapshot)
@@ -264,6 +641,254 @@ final class ProxyLensApplicationTests: XCTestCase {
             phase: .requestHeaders
         )
         XCTAssertEqual(matching.map(\.id), [requestRule.id])
+    }
+
+    func testRuleEnginePublishesGraphQLOperationBreakpointRule() async {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+        let operation = GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+
+        let rule = await engine.breakpoint(graphqlOperation: operation)
+
+        XCTAssertEqual(rule.name, "Breakpoint GraphQL mutation SaveProfile")
+        XCTAssertEqual(rule.priority, 18)
+        XCTAssertEqual(rule.phase, .requestBody)
+        XCTAssertEqual(rule.action, .breakpoint)
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .post,
+                    url: URL(string: "https://api.example.com/graphql")!,
+                    graphqlOperation: operation
+                )
+            ),
+            phase: .requestBody
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+    }
+
+    func testRuleEnginePublishesGraphQLOperationBlockRule() async {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+        let operation = GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+
+        let rule = await engine.block(graphqlOperation: operation)
+
+        XCTAssertEqual(rule.name, "Block GraphQL mutation SaveProfile")
+        XCTAssertEqual(rule.priority, 10)
+        XCTAssertEqual(rule.phase, .requestBody)
+        XCTAssertEqual(rule.action, .block(reason: "Blocked GraphQL operation"))
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .post,
+                    url: URL(string: "https://api.example.com/graphql")!,
+                    graphqlOperation: operation
+                )
+            ),
+            phase: .requestBody
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+    }
+
+    func testRuleEnginePublishesGraphQLOperationMapLocalRule() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot, maximumMapLocalBytes: 1_024)
+        let operation = GraphQLOperationMetadata(kind: .query, name: "Catalog")
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-graphql-map-local-\(UUID().uuidString).json")
+        let body = Data(#"{"data":{"catalog":[]}}"#.utf8)
+        try body.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let rule = try await engine.mapLocal(
+            graphqlOperation: operation,
+            fileURL: fileURL,
+            statusCode: 201
+        )
+
+        XCTAssertEqual(rule.name, "Map local GraphQL query Catalog")
+        XCTAssertEqual(rule.priority, 15)
+        XCTAssertEqual(rule.phase, .requestBody)
+        guard case .mapLocal(let resourceID) = rule.action else {
+            return XCTFail("Expected a map local action")
+        }
+        let spec = try XCTUnwrap(snapshot.mappedLocal(for: resourceID))
+        XCTAssertEqual(spec.statusCode, 201)
+        XCTAssertEqual(spec.body.storage, .inline(body))
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .post,
+                    url: URL(string: "https://api.example.com/graphql")!,
+                    graphqlOperation: operation
+                )
+            ),
+            phase: .requestBody
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+    }
+
+    func testRuleEnginePublishesGraphQLOperationMapRemoteRule() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot)
+        let operation = GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        let destination = URL(string: "http://127.0.0.1:9000/graphql")!
+
+        let rule = try await engine.mapRemote(
+            graphqlOperation: operation,
+            destination: destination
+        )
+
+        XCTAssertEqual(rule.name, "Map remote GraphQL mutation SaveProfile")
+        XCTAssertEqual(rule.priority, 15)
+        XCTAssertEqual(rule.phase, .requestBody)
+        XCTAssertEqual(rule.action, .mapRemote(url: destination))
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .post,
+                    url: URL(string: "https://api.example.com/graphql")!,
+                    graphqlOperation: operation
+                )
+            ),
+            phase: .requestBody
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+    }
+
+    func testRuleEnginePublishesGraphQLOperationBodyReplacementRule() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot, maximumMapLocalBytes: 1_024)
+        let operation = GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-graphql-replace-body-\(UUID().uuidString).json")
+        let body = Data(#"{"name":"Ada"}"#.utf8)
+        try body.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let rule = try await engine.replaceRequestBody(
+            graphqlOperation: operation,
+            fileURL: fileURL
+        )
+
+        XCTAssertEqual(rule.name, "Replace body GraphQL mutation SaveProfile")
+        XCTAssertEqual(rule.priority, 16)
+        XCTAssertEqual(rule.phase, .requestBody)
+        guard case .replaceBody(let replacement) = rule.action else {
+            return XCTFail("Expected a body replacement action")
+        }
+        XCTAssertEqual(replacement.inlineData, body)
+        XCTAssertEqual(replacement.contentType, "application/json")
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .post,
+                    url: URL(string: "https://api.example.com/graphql")!,
+                    graphqlOperation: operation
+                )
+            ),
+            phase: .requestBody
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+
+        let tooLarge = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "proxylens-graphql-replace-body-too-large-\(UUID().uuidString).bin")
+        try Data(repeating: 0x61, count: 2_048).write(to: tooLarge)
+        defer { try? FileManager.default.removeItem(at: tooLarge) }
+
+        do {
+            _ = try await engine.replaceRequestBody(
+                graphqlOperation: operation,
+                fileURL: tooLarge
+            )
+            XCTFail("Expected an oversized replacement body to be rejected")
+        } catch let error as RuleEngineError {
+            XCTAssertEqual(
+                error,
+                .replacementFileTooLarge(byteCount: 2_048, maximumByteCount: 1_024)
+            )
+        }
+    }
+
+    func testRuleEnginePublishesHostPathBodyReplacementRule() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot, maximumMapLocalBytes: 1_024)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-replace-body-\(UUID().uuidString).txt")
+        let body = Data("replacement".utf8)
+        try body.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let rule = try await engine.replaceRequestBody(
+            host: "api.example.com",
+            path: "/users?ignored=1",
+            fileURL: fileURL
+        )
+
+        XCTAssertEqual(rule.name, "Replace body api.example.com/users")
+        XCTAssertEqual(rule.priority, 16)
+        XCTAssertEqual(rule.phase, .requestBody)
+        guard case .replaceBody(let replacement) = rule.action else {
+            return XCTFail("Expected a body replacement action")
+        }
+        XCTAssertEqual(replacement.inlineData, body)
+        XCTAssertEqual(replacement.contentType, "text/plain; charset=utf-8")
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(
+                request: HTTPRequest(
+                    method: .post,
+                    url: URL(string: "https://api.example.com/users")!
+                )
+            ),
+            phase: .requestBody
+        )
+        XCTAssertEqual(matching.map(\.id), [rule.id])
+    }
+
+    func testRuleEnginePublishesResponseBodyReplacementRules() async throws {
+        let snapshot = MutableRuleSnapshot()
+        let engine = RuleEngine(snapshot: snapshot, maximumMapLocalBytes: 1_024)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-replace-response-body-\(UUID().uuidString).json")
+        let body = Data(#"{"users":[]}"#.utf8)
+        try body.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let generic = try await engine.replaceResponseBody(
+            host: "api.example.com",
+            path: "/users?ignored=1",
+            fileURL: fileURL
+        )
+        let operation = GraphQLOperationMetadata(kind: .query, name: "Users")
+        let graphql = try await engine.replaceResponseBody(
+            graphqlOperation: operation,
+            fileURL: fileURL
+        )
+
+        XCTAssertEqual(generic.name, "Replace response body api.example.com/users")
+        XCTAssertEqual(generic.phase, .responseBody)
+        XCTAssertEqual(graphql.name, "Replace response body GraphQL query Users")
+        XCTAssertEqual(graphql.phase, .responseBody)
+        for rule in [generic, graphql] {
+            guard case .replaceBody(let replacement) = rule.action else {
+                return XCTFail("Expected response body replacement actions")
+            }
+            XCTAssertEqual(replacement.inlineData, body)
+            XCTAssertEqual(replacement.contentType, "application/json")
+        }
+
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/users")!,
+            graphqlOperation: operation
+        )
+        let matching = snapshot.currentRules().matchingRules(
+            for: RuleMatchContext(request: request, response: try HTTPResponse(statusCode: 200)),
+            phase: .responseBody
+        )
+        XCTAssertEqual(Set(matching.map(\.id)), Set([generic.id, graphql.id]))
     }
 
     func testBreakpointCoordinatorWaitsUntilResumeOrAbort() async {
@@ -332,6 +957,78 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(readIDs, [flow.request.body?.id].compactMap { $0 })
     }
 
+    func testExportServiceWritesVersionedWebSocketFramesWithPortablePayloadEncodings()
+        async throws
+    {
+        let flowID = FlowID(
+            rawValue: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        )
+        let textFrame = CapturedWebSocketFrame(
+            id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
+            flowID: flowID,
+            sequenceNumber: 1,
+            direction: .clientToServer,
+            opcode: .text,
+            isFinal: true,
+            wasMasked: true,
+            payload: BodyReference(
+                inline: Data(#"{"action":"subscribe"}"#.utf8),
+                metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+            ),
+            receivedAt: Date(timeIntervalSince1970: 1_786_800_000.125)
+        )
+        let binaryPayload = Data([0x00, 0x7F, 0xFF])
+        let binaryFrame = CapturedWebSocketFrame(
+            id: UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF")!,
+            flowID: flowID,
+            sequenceNumber: 2,
+            direction: .serverToClient,
+            opcode: .binary,
+            isFinal: false,
+            reservedBits: [.rsv1],
+            payload: BodyReference(
+                inline: binaryPayload,
+                metadata: BodyMetadata(
+                    contentType: "application/octet-stream",
+                    isTruncated: true
+                )
+            ),
+            receivedAt: Date(timeIntervalSince1970: 1_786_800_001.5)
+        )
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "proxylens-websocket-export-\(UUID().uuidString).json"
+        )
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        try await exporter.writeWebSocketFrames(
+            [binaryFrame, textFrame],
+            for: flowID,
+            exportedAt: Date(timeIntervalSince1970: 1_786_800_010),
+            to: destination
+        )
+
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: destination))
+                as? [String: Any]
+        )
+        XCTAssertEqual(document["format"] as? String, "proxylens-websocket-frames")
+        XCTAssertEqual(document["version"] as? Int, 1)
+        XCTAssertEqual(document["flowID"] as? String, flowID.description)
+        let frames = try XCTUnwrap(document["frames"] as? [[String: Any]])
+        XCTAssertEqual(frames.compactMap { $0["sequenceNumber"] as? Int }, [1, 2])
+        XCTAssertEqual(frames[0]["direction"] as? String, "sent")
+        XCTAssertEqual(frames[0]["opcode"] as? String, "text")
+        XCTAssertEqual(frames[0]["payloadEncoding"] as? String, "utf8")
+        XCTAssertEqual(frames[0]["payload"] as? String, #"{"action":"subscribe"}"#)
+        XCTAssertEqual(frames[1]["direction"] as? String, "received")
+        XCTAssertEqual(frames[1]["opcode"] as? String, "binary")
+        XCTAssertEqual(frames[1]["payloadEncoding"] as? String, "base64")
+        XCTAssertEqual(frames[1]["payload"] as? String, binaryPayload.base64EncodedString())
+        XCTAssertEqual(frames[1]["isTruncated"] as? Bool, true)
+        XCTAssertEqual(frames[1]["reservedBits"] as? [String], ["RSV1"])
+    }
+
     func testExportServiceEscapesBinaryCURLBodiesAndOmitsGETMethod() async throws {
         let binary = Data([0x00, 0x01, 0xFF])
         var post = try Self.exportFlow(
@@ -368,6 +1065,80 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertTrue(getCommand.contains("curl 'https://api.example.com/health'"))
         XCTAssertFalse(getCommand.contains("-X"))
         XCTAssertFalse(getCommand.contains("--data-binary"))
+    }
+
+    func testExportServiceGeneratesCopyReadyRequestCodeForCommonClients() async throws {
+        let body = Data(#"{"name":"ProxyLens","enabled":true}"#.utf8)
+        let flow = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/events?source=desktop",
+            requestHeaders: [
+                ("Content-Type", "application/json"),
+                ("Authorization", "Bearer test-token"),
+                ("Content-Length", "35"),
+                ("Connection", "keep-alive")
+            ],
+            requestBody: body,
+            statusCode: 201
+        )
+        let store = RecordingBodyStore()
+        let exporter = ExportService(bodyStore: store)
+
+        let generated = try await exporter.requestCodeSnippets(for: flow)
+        let snippets = Dictionary(
+            uniqueKeysWithValues: generated.map { ($0.language, $0.source) }
+        )
+
+        XCTAssertTrue(
+            snippets[.curl]?.contains("curl 'https://api.example.com/events?source=desktop'")
+                == true)
+        XCTAssertTrue(
+            snippets[.httpie]?.contains(
+                "http 'POST' 'https://api.example.com/events?source=desktop'") == true)
+        XCTAssertTrue(
+            snippets[.javascriptFetch]?.contains(
+                "await fetch(\"https://api.example.com/events?source=desktop\"") == true)
+        XCTAssertTrue(snippets[.javascriptAxios]?.contains("await axios.request({") == true)
+        XCTAssertTrue(snippets[.pythonRequests]?.contains("requests.request(") == true)
+        XCTAssertTrue(
+            snippets[.swiftURLSession]?.contains("URLSession.shared.data(for: request)") == true)
+        XCTAssertTrue(snippets[.goNetHTTP]?.contains("http.NewRequest(") == true)
+        XCTAssertTrue(snippets[.javaHttpClient]?.contains("HttpRequest.newBuilder()") == true)
+        for source in snippets.values {
+            XCTAssertTrue(source.contains("Authorization"))
+            XCTAssertTrue(source.contains("Bearer test-token"))
+            XCTAssertFalse(source.contains("Content-Length"))
+            XCTAssertFalse(source.contains("Connection"))
+        }
+        let readIDs = await store.readIDs()
+        XCTAssertEqual(readIDs, [flow.request.body?.id].compactMap { $0 })
+    }
+
+    func testRequestCodeGenerationPreservesBinaryBodiesWithBase64() async throws {
+        let body = Data([0x00, 0x01, 0xFE, 0xFF])
+        let flow = try Self.exportFlow(
+            method: .put,
+            url: "https://api.example.com/binary",
+            requestHeaders: [("Content-Type", "application/octet-stream")],
+            requestBody: body,
+            statusCode: 204
+        )
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+        let encoded = body.base64EncodedString()
+
+        let javascript = try await exporter.requestCode(for: flow, language: .javascriptFetch)
+        let axios = try await exporter.requestCode(for: flow, language: .javascriptAxios)
+        let python = try await exporter.requestCode(for: flow, language: .pythonRequests)
+        let swift = try await exporter.requestCode(for: flow, language: .swiftURLSession)
+        let go = try await exporter.requestCode(for: flow, language: .goNetHTTP)
+        let java = try await exporter.requestCode(for: flow, language: .javaHttpClient)
+
+        XCTAssertTrue(javascript.contains("atob(\"\(encoded)\")"))
+        XCTAssertTrue(axios.contains("Buffer.from(\"\(encoded)\", \"base64\")"))
+        XCTAssertTrue(python.contains("base64.b64decode(\"\(encoded)\")"))
+        XCTAssertTrue(swift.contains("Data(base64Encoded: \"\(encoded)\")!"))
+        XCTAssertTrue(go.contains("base64.StdEncoding.DecodeString(\"\(encoded)\")"))
+        XCTAssertTrue(java.contains("Base64.getDecoder().decode(\"\(encoded)\")"))
     }
 
     func testExportServiceWritesHARForCompletedAndIncompleteFlows() async throws {
@@ -492,6 +1263,669 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual((failedTimings["ssl"] as? NSNumber)?.doubleValue, -1)
     }
 
+    func testExportServiceWritesSessionHARInSuppliedCaptureOrder() async throws {
+        let first = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/first",
+            requestHeaders: [("Content-Type", "application/json")],
+            requestBody: Data(#"{"step":1}"#.utf8),
+            statusCode: 201,
+            responseHeaders: [("Content-Type", "application/json")],
+            responseBody: Data(#"{"created":true}"#.utf8),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let second = try Self.exportFlow(
+            method: .get,
+            url: "https://api.example.com/second",
+            statusCode: 204,
+            startedAt: Date(timeIntervalSince1970: 1_001)
+        )
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-har-export-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directoryURL.appendingPathComponent("Checkout.har")
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        try Data("stale".utf8).write(to: fileURL)
+
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+        try await exporter.writeHAR(for: [first, second], to: fileURL)
+
+        let json = try Self.harObject(Data(contentsOf: fileURL))
+        let log = try XCTUnwrap(json["log"] as? [String: Any])
+        let entries = try XCTUnwrap(log["entries"] as? [[String: Any]])
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(
+            entries.compactMap { ($0["request"] as? [String: Any])?["url"] as? String },
+            [
+                "https://api.example.com/first",
+                "https://api.example.com/second"
+            ]
+        )
+        let firstRequest = try XCTUnwrap(entries.first?["request"] as? [String: Any])
+        let firstPostData = try XCTUnwrap(firstRequest["postData"] as? [String: Any])
+        XCTAssertEqual(firstPostData["text"] as? String, #"{"step":1}"#)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directoryURL.path),
+            ["Checkout.har"]
+        )
+    }
+
+    func testExportServiceKeepsExistingHARWhenSessionExportFails() async throws {
+        var flow = try Self.exportFlow(
+            method: .post,
+            url: "https://api.example.com/missing-body",
+            statusCode: 200
+        )
+        flow.attachRequestBody(
+            try BodyReference(
+                externalID: BodyID(),
+                byteCount: 10,
+                metadata: BodyMetadata(contentType: "application/octet-stream")
+            )
+        )
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("proxylens-har-failure-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directoryURL.appendingPathComponent("Existing.har")
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let original = Data("existing HAR".utf8)
+        try original.write(to: fileURL)
+
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+        do {
+            try await exporter.writeHAR(for: [flow], to: fileURL)
+            XCTFail("Expected the missing body to fail session export")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription, "Unsupported operation: Missing exported body")
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directoryURL.path),
+            ["Existing.har"]
+        )
+    }
+
+    func testHARImportCreatesInspectableStoppedSessionFromTextAndBase64Bodies() async throws {
+        let recorder = CallRecorder()
+        let sessionStore = RecordingSessionStore(sessionID: SessionID(), recorder: recorder)
+        let bodyStore = RecordingBodyStore()
+        let importer = HARImportService(sessionStore: sessionStore, bodyStore: bodyStore)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Checkout debugging.har")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try Data(
+            """
+            {
+              "log": {
+                "version": "1.2",
+                "creator": { "name": "Browser", "version": "1" },
+                "entries": [
+                  {
+                    "startedDateTime": "2026-08-16T15:00:00.000Z",
+                    "time": 42,
+                    "request": {
+                      "method": "POST",
+                      "url": "https://api.example.test/checkout?currency=USD",
+                      "httpVersion": "HTTP/2",
+                      "headers": [
+                        { "name": "Content-Type", "value": "application/json" },
+                        { "name": "X-Trace", "value": "first" },
+                        { "name": "X-Trace", "value": "second" }
+                      ],
+                      "postData": {
+                        "mimeType": "application/json",
+                        "text": "{\\"operationName\\":\\"Checkout\\",\\"query\\":\\"mutation Checkout { checkout { id } }\\"}"
+                      }
+                    },
+                    "response": {
+                      "status": 201,
+                      "statusText": "Created",
+                      "httpVersion": "HTTP/2",
+                      "headers": [
+                        { "name": "Content-Type", "value": "application/octet-stream" }
+                      ],
+                      "content": {
+                        "size": 3,
+                        "mimeType": "application/octet-stream",
+                        "text": "AAH/",
+                        "encoding": "base64"
+                      }
+                    },
+                    "timings": { "send": 2, "wait": 30, "receive": 10 }
+                  },
+                  {
+                    "startedDateTime": "2026-08-16T15:00:01.000Z",
+                    "time": 0,
+                    "request": {
+                      "method": "GET",
+                      "url": "http://api.example.test/incomplete",
+                      "httpVersion": "HTTP/1.1",
+                      "headers": []
+                    },
+                    "response": {
+                      "status": 0,
+                      "statusText": "",
+                      "httpVersion": "HTTP/1.1",
+                      "headers": [],
+                      "content": { "size": 0, "mimeType": "" }
+                    },
+                    "timings": { "send": 0, "wait": 0, "receive": 0 },
+                    "comment": "Connection closed before a response"
+                  }
+                ]
+              }
+            }
+            """.utf8
+        ).write(to: fileURL)
+
+        let imported = try await importer.importHAR(from: fileURL)
+
+        XCTAssertEqual(imported.session.name, "Checkout debugging")
+        XCTAssertEqual(imported.session.state, .stopped)
+        XCTAssertEqual(imported.session.flowCount, 2)
+        XCTAssertEqual(imported.flows.count, 2)
+        let completed = imported.flows[0]
+        XCTAssertEqual(completed.source.kind, .importedSession)
+        XCTAssertEqual(completed.request.method, .post)
+        XCTAssertEqual(completed.request.version, .http2)
+        XCTAssertEqual(completed.request.headers.values(for: "X-Trace"), ["first", "second"])
+        XCTAssertEqual(completed.response?.statusCode, 201)
+        XCTAssertEqual(completed.state, .completed)
+        XCTAssertEqual(try XCTUnwrap(completed.timing.totalDuration), 0.042, accuracy: 0.0001)
+        let requestBody = try await bodyStore.read(try XCTUnwrap(completed.request.body))
+        let responseBody = try await bodyStore.read(try XCTUnwrap(completed.response?.body))
+        XCTAssertEqual(
+            requestBody,
+            Data(
+                #"{"operationName":"Checkout","query":"mutation Checkout { checkout { id } }"}"#
+                    .utf8
+            )
+        )
+        XCTAssertEqual(
+            completed.request.graphqlOperation,
+            GraphQLOperationMetadata(kind: .mutation, name: "Checkout")
+        )
+        XCTAssertEqual(responseBody, Data([0x00, 0x01, 0xFF]))
+        XCTAssertEqual(completed.response?.body?.contentType, "application/octet-stream")
+
+        let incomplete = imported.flows[1]
+        XCTAssertNil(incomplete.response)
+        XCTAssertEqual(
+            incomplete.state,
+            .failed(.unknown("Connection closed before a response"))
+        )
+        let persistedSession = await sessionStore.loadSession(sessionID: imported.session.id)
+        let persistedFlows = await sessionStore.listFlows(in: imported.session.id)
+        XCTAssertEqual(persistedSession, imported.session)
+        XCTAssertEqual(persistedFlows.count, 2)
+    }
+
+    func testHARImportRejectsOversizedFilesBeforeCreatingASession() async throws {
+        let sessionStore = RecordingSessionStore(sessionID: SessionID(), recorder: CallRecorder())
+        let importer = HARImportService(
+            sessionStore: sessionStore,
+            bodyStore: RecordingBodyStore(),
+            maximumFileByteCount: 8
+        )
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("oversized.har")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try Data(#"{"log":{"version":"1.2","entries":[]}}"#.utf8).write(to: fileURL)
+
+        do {
+            _ = try await importer.importHAR(from: fileURL)
+            XCTFail("Expected the bounded reader to reject the HAR file")
+        } catch {
+            XCTAssertEqual(error as? HARImportError, .fileTooLarge(maximumByteCount: 8))
+        }
+        let sessions = await sessionStore.listSessions()
+        XCTAssertTrue(sessions.isEmpty)
+    }
+
+    func testPortableSessionRoundTripsMetadataAnnotationsAndAuthoritativeBodies() async throws {
+        let sourceSessionID = SessionID()
+        var sourceSession = Session(
+            id: sourceSessionID,
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        try sourceSession.rename(to: "Checkout investigation")
+        sourceSession.stop(at: Date(timeIntervalSince1970: 1_010))
+
+        let requestBytes = Data(#"{"cart":["coffee"]}"#.utf8)
+        let responseBytes = Data(#"{"accepted":true}"#.utf8)
+        let requestMetadata = BodyMetadata(
+            digest: BodyDigest(
+                algorithm: .sha256,
+                value: "f986d5ef2bbadb3ff0fb8b5773a7a548011f6d41f157573b31f978a82e1ade5a"
+            )
+        )
+        let responseMetadata = BodyMetadata(
+            digest: BodyDigest(
+                algorithm: .sha256,
+                value: "11a49f853eb8befe94fef278d487125cd20930b9e41c4c0934394443e7f00878"
+            )
+        )
+        var requestHeaders = HTTPHeaders()
+        try requestHeaders.append(name: "Content-Type", value: "application/json")
+        var responseHeaders = HTTPHeaders()
+        try responseHeaders.append(name: "Content-Type", value: "application/json")
+        var sourceFlow = Flow(
+            sessionID: sourceSessionID,
+            source: FlowSource(
+                kind: .desktopProxy,
+                label: "Desktop proxy",
+                clientAddress: "127.0.0.1:51234"
+            ),
+            request: HTTPRequest(
+                method: .post,
+                url: URL(string: "https://shop.example.com/checkout")!,
+                headers: requestHeaders,
+                body: BodyReference(inline: requestBytes, metadata: requestMetadata)
+            ),
+            connection: ConnectionInfo(
+                protocolKind: .https,
+                upstreamHost: "shop.example.com",
+                upstreamPort: 443,
+                tlsIntercepted: true
+            ),
+            startedAt: Date(timeIntervalSince1970: 1_001)
+        )
+        try sourceFlow.transition(to: .receivingRequest)
+        sourceFlow.markRequestHeadersReceived(at: Date(timeIntervalSince1970: 1_001.1))
+        sourceFlow.markRequestBodyCompleted(at: Date(timeIntervalSince1970: 1_001.2))
+        try sourceFlow.transition(to: .receivingResponse)
+        sourceFlow.attachResponse(
+            try HTTPResponse(
+                statusCode: 201,
+                reasonPhrase: "Created",
+                headers: responseHeaders,
+                body: BodyReference(inline: responseBytes, metadata: responseMetadata)
+            )
+        )
+        sourceFlow.markResponseHeadersReceived(at: Date(timeIntervalSince1970: 1_001.3))
+        sourceFlow.markResponseBodyCompleted(at: Date(timeIntervalSince1970: 1_001.4))
+        sourceFlow.setAnnotation(
+            try FlowAnnotation(
+                comment: "Keep this response",
+                highlight: .green,
+                isStruckThrough: false
+            )
+        )
+        try sourceFlow.transition(to: .completed)
+        sourceFlow.markCompleted(at: Date(timeIntervalSince1970: 1_001.5))
+
+        let sourceStore = RecordingSessionStore(
+            sessionID: sourceSessionID,
+            recorder: CallRecorder()
+        )
+        await sourceStore.seed(session: sourceSession, flows: [sourceFlow])
+        let sourceBodies = RecordingBodyStore()
+        let exporter = PortableSessionService(
+            sessionStore: sourceStore,
+            bodyStore: sourceBodies
+        )
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round-trip-\(UUID().uuidString).proxylens", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        try await exporter.exportSession(sessionID: sourceSessionID, to: packageURL)
+
+        let importedSessionID = SessionID()
+        let importedStore = RecordingSessionStore(
+            sessionID: importedSessionID,
+            recorder: CallRecorder()
+        )
+        let importedBodies = RecordingBodyStore()
+        let importer = PortableSessionService(
+            sessionStore: importedStore,
+            bodyStore: importedBodies
+        )
+        let result = try await importer.importSession(from: packageURL)
+
+        XCTAssertEqual(result.session.id, importedSessionID)
+        XCTAssertEqual(result.session.name, sourceSession.name)
+        XCTAssertEqual(result.session.startedAt, sourceSession.startedAt)
+        XCTAssertEqual(result.session.endedAt, sourceSession.endedAt)
+        XCTAssertEqual(result.session.state, .stopped)
+        XCTAssertEqual(result.session.flowCount, 1)
+        let importedFlow = try XCTUnwrap(result.flows.first)
+        XCTAssertNotEqual(importedFlow.id, sourceFlow.id)
+        XCTAssertEqual(importedFlow.sessionID, importedSessionID)
+        XCTAssertEqual(importedFlow.source, sourceFlow.source)
+        XCTAssertEqual(importedFlow.request.method, sourceFlow.request.method)
+        XCTAssertEqual(importedFlow.request.url, sourceFlow.request.url)
+        XCTAssertEqual(importedFlow.request.headers, sourceFlow.request.headers)
+        XCTAssertEqual(importedFlow.response?.statusCode, sourceFlow.response?.statusCode)
+        XCTAssertEqual(importedFlow.response?.headers, sourceFlow.response?.headers)
+        XCTAssertEqual(importedFlow.connection, sourceFlow.connection)
+        XCTAssertEqual(importedFlow.timing, sourceFlow.timing)
+        XCTAssertEqual(importedFlow.state, sourceFlow.state)
+        XCTAssertEqual(importedFlow.annotation, sourceFlow.annotation)
+        let importedRequestBytes = try await importedBodies.read(
+            try XCTUnwrap(importedFlow.request.body)
+        )
+        let importedResponseBytes = try await importedBodies.read(
+            try XCTUnwrap(importedFlow.response?.body)
+        )
+        XCTAssertEqual(importedRequestBytes, requestBytes)
+        XCTAssertEqual(importedResponseBytes, responseBytes)
+    }
+
+    func testPortableSessionExportPreservesExistingPackageWhenBodyLoadingFails() async throws {
+        let sessionID = SessionID()
+        var session = Session(id: sessionID, startedAt: Date(timeIntervalSince1970: 2_000))
+        session.stop(at: Date(timeIntervalSince1970: 2_001))
+        let missingBody = try BodyReference(
+            externalID: BodyID(),
+            byteCount: 4,
+            metadata: BodyMetadata(
+                contentType: "application/octet-stream",
+                digest: BodyDigest(
+                    algorithm: .sha256,
+                    value: "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"
+                )
+            )
+        )
+        let flow = Flow(
+            sessionID: sessionID,
+            request: HTTPRequest(
+                method: .post,
+                url: URL(string: "https://example.com/upload")!,
+                body: missingBody
+            )
+        )
+        let store = RecordingSessionStore(sessionID: sessionID, recorder: CallRecorder())
+        await store.seed(session: session, flows: [flow])
+        let service = PortableSessionService(
+            sessionStore: store,
+            bodyStore: RecordingBodyStore()
+        )
+        let parentURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("portable-atomic-\(UUID().uuidString)", isDirectory: true)
+        let packageURL = parentURL.appendingPathComponent("existing.proxylens", isDirectory: true)
+        let markerURL = packageURL.appendingPathComponent("keep.txt")
+        try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: markerURL)
+        defer { try? FileManager.default.removeItem(at: parentURL) }
+
+        await assertThrowsErrorAsync(
+            try await service.exportSession(sessionID: sessionID, to: packageURL)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: markerURL), Data("keep".utf8))
+        let siblingNames = try FileManager.default.contentsOfDirectory(atPath: parentURL.path)
+        XCTAssertEqual(siblingNames, ["existing.proxylens"])
+    }
+
+    func testPortableSessionExportReplacesAnExistingPackageAfterACompleteWrite() async throws {
+        let sessionID = SessionID()
+        var session = Session(id: sessionID, startedAt: Date(timeIntervalSince1970: 2_500))
+        try session.rename(to: "Replacement")
+        session.stop(at: Date(timeIntervalSince1970: 2_501))
+        let store = RecordingSessionStore(sessionID: sessionID, recorder: CallRecorder())
+        await store.seed(session: session)
+        let service = PortableSessionService(
+            sessionStore: store,
+            bodyStore: RecordingBodyStore()
+        )
+        let parentURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("portable-replace-\(UUID().uuidString)", isDirectory: true)
+        let packageURL = parentURL.appendingPathComponent("existing.proxylens", isDirectory: true)
+        let markerURL = packageURL.appendingPathComponent("old.txt")
+        try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: markerURL)
+        defer { try? FileManager.default.removeItem(at: parentURL) }
+
+        try await service.exportSession(sessionID: sessionID, to: packageURL)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markerURL.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: packageURL.appendingPathComponent("manifest.json").path
+            )
+        )
+    }
+
+    func testPortableSessionExportEnforcesTheCumulativeBodyLimit() async throws {
+        let sessionID = SessionID()
+        var session = Session(id: sessionID, startedAt: Date(timeIntervalSince1970: 3_000))
+        session.stop(at: Date(timeIntervalSince1970: 3_001))
+        var flow = Flow(
+            sessionID: sessionID,
+            request: HTTPRequest(
+                method: .post,
+                url: URL(string: "https://example.com/limited")!,
+                body: BodyReference(
+                    inline: Data("1234".utf8),
+                    metadata: BodyMetadata(
+                        digest: BodyDigest(
+                            algorithm: .sha256,
+                            value:
+                                "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"
+                        )
+                    )
+                )
+            )
+        )
+        flow.attachResponse(
+            try HTTPResponse(
+                statusCode: 200,
+                body: BodyReference(
+                    inline: Data("5678".utf8),
+                    metadata: BodyMetadata(
+                        digest: BodyDigest(
+                            algorithm: .sha256,
+                            value:
+                                "f8638b979b2f4f793ddb6dbd197e0ee25a7a6ea32b0ae22f5e3c5d119d839e75"
+                        )
+                    )
+                )
+            )
+        )
+        let store = RecordingSessionStore(sessionID: sessionID, recorder: CallRecorder())
+        await store.seed(session: session, flows: [flow])
+        let service = PortableSessionService(
+            sessionStore: store,
+            bodyStore: RecordingBodyStore(),
+            maximumPackageBodyByteCount: 7
+        )
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("too-large-\(UUID().uuidString).proxylens", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        await assertThrowsErrorAsync(
+            try await service.exportSession(sessionID: sessionID, to: packageURL)
+        ) { error in
+            XCTAssertEqual(error as? PortableSessionError, .packageTooLarge(maximumByteCount: 7))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: packageURL.path))
+    }
+
+    func testPortableSessionImportRejectsSymlinkedBodiesAndRollsBack() async throws {
+        let sourceSessionID = SessionID()
+        var sourceSession = Session(
+            id: sourceSessionID,
+            startedAt: Date(timeIntervalSince1970: 4_000)
+        )
+        sourceSession.stop(at: Date(timeIntervalSince1970: 4_001))
+        let sourceFlow = Flow(
+            sessionID: sourceSessionID,
+            request: HTTPRequest(
+                method: .post,
+                url: URL(string: "https://example.com/unsafe")!,
+                body: BodyReference(
+                    inline: Data("safe".utf8),
+                    metadata: BodyMetadata(
+                        digest: BodyDigest(
+                            algorithm: .sha256,
+                            value:
+                                "8b3369944dd2a3fab39e32d1aeb1f763946a458ae3e6368a46432adc8f3a0860"
+                        )
+                    )
+                )
+            )
+        )
+        let sourceStore = RecordingSessionStore(
+            sessionID: sourceSessionID,
+            recorder: CallRecorder()
+        )
+        await sourceStore.seed(session: sourceSession, flows: [sourceFlow])
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("unsafe-\(UUID().uuidString).proxylens", isDirectory: true)
+        let outsideURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("outside-\(UUID().uuidString).body")
+        defer {
+            try? FileManager.default.removeItem(at: packageURL)
+            try? FileManager.default.removeItem(at: outsideURL)
+        }
+        try await PortableSessionService(
+            sessionStore: sourceStore,
+            bodyStore: RecordingBodyStore()
+        ).exportSession(sessionID: sourceSessionID, to: packageURL)
+        try Data("unsafe".utf8).write(to: outsideURL)
+        let bodyURL =
+            packageURL
+            .appendingPathComponent("bodies", isDirectory: true)
+            .appendingPathComponent("00000000-request.body")
+        try FileManager.default.removeItem(at: bodyURL)
+        try FileManager.default.createSymbolicLink(at: bodyURL, withDestinationURL: outsideURL)
+
+        let importedStore = RecordingSessionStore(
+            sessionID: SessionID(),
+            recorder: CallRecorder()
+        )
+        let importer = PortableSessionService(
+            sessionStore: importedStore,
+            bodyStore: RecordingBodyStore()
+        )
+
+        await assertThrowsErrorAsync(try await importer.importSession(from: packageURL)) { error in
+            guard case .invalidPackage = error as? PortableSessionError else {
+                return XCTFail("Expected an unsafe-file package error, got \(error)")
+            }
+        }
+        let remainingSessions = await importedStore.listSessions()
+        XCTAssertTrue(remainingSessions.isEmpty)
+    }
+
+    func testPortableSessionImportRejectsBodiesWithoutADigest() async throws {
+        let sourceSessionID = SessionID()
+        var sourceSession = Session(id: sourceSessionID)
+        sourceSession.stop()
+        let body = BodyReference(
+            inline: Data("safe".utf8),
+            metadata: BodyMetadata(
+                digest: BodyDigest(
+                    algorithm: .sha256,
+                    value: "8b3369944dd2a3fab39e32d1aeb1f763946a458ae3e6368a46432adc8f3a0860"
+                )
+            )
+        )
+        let sourceFlow = Flow(
+            sessionID: sourceSessionID,
+            request: HTTPRequest(
+                method: .post,
+                url: URL(string: "https://example.com/missing-digest")!,
+                body: body
+            )
+        )
+        let sourceStore = RecordingSessionStore(
+            sessionID: sourceSessionID,
+            recorder: CallRecorder()
+        )
+        await sourceStore.seed(session: sourceSession, flows: [sourceFlow])
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "missing-digest-\(UUID().uuidString).proxylens", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+        try await PortableSessionService(
+            sessionStore: sourceStore,
+            bodyStore: RecordingBodyStore()
+        ).exportSession(sessionID: sourceSessionID, to: packageURL)
+
+        let metadataURL = packageURL.appendingPathComponent("flows/00000000.json")
+        var metadata = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL))
+                as? [String: Any]
+        )
+        var requestBody = try XCTUnwrap(metadata["requestBody"] as? [String: Any])
+        requestBody.removeValue(forKey: "digest")
+        metadata["requestBody"] = requestBody
+        try JSONSerialization.data(withJSONObject: metadata).write(
+            to: metadataURL, options: .atomic)
+
+        let importedStore = RecordingSessionStore(
+            sessionID: SessionID(),
+            recorder: CallRecorder()
+        )
+        await assertThrowsErrorAsync(
+            try await PortableSessionService(
+                sessionStore: importedStore,
+                bodyStore: RecordingBodyStore()
+            ).importSession(from: packageURL)
+        ) { error in
+            guard case .invalidPackage = error as? PortableSessionError else {
+                return XCTFail("Expected a missing-digest package error, got \(error)")
+            }
+        }
+        let remainingSessions = await importedStore.listSessions()
+        XCTAssertTrue(remainingSessions.isEmpty)
+    }
+
+    func testPortableSessionTurnsLiveFlowSnapshotsIntoOfflineFailures() async throws {
+        let sourceSessionID = SessionID()
+        let sourceSession = Session(
+            id: sourceSessionID,
+            startedAt: Date(timeIntervalSince1970: 5_000)
+        )
+        var sourceFlow = Flow(
+            sessionID: sourceSessionID,
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://example.com/live")!
+            ),
+            startedAt: Date(timeIntervalSince1970: 5_001)
+        )
+        try sourceFlow.transition(to: .receivingRequest)
+        let sourceStore = RecordingSessionStore(
+            sessionID: sourceSessionID,
+            recorder: CallRecorder()
+        )
+        await sourceStore.seed(session: sourceSession, flows: [sourceFlow])
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("live-\(UUID().uuidString).proxylens", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+        try await PortableSessionService(
+            sessionStore: sourceStore,
+            bodyStore: RecordingBodyStore()
+        ).exportSession(sessionID: sourceSessionID, to: packageURL)
+        let importedStore = RecordingSessionStore(
+            sessionID: SessionID(),
+            recorder: CallRecorder()
+        )
+
+        let result = try await PortableSessionService(
+            sessionStore: importedStore,
+            bodyStore: RecordingBodyStore()
+        ).importSession(from: packageURL)
+
+        let importedFlow = try XCTUnwrap(result.flows.first)
+        guard case .failed(.unknown(let message)) = importedFlow.state else {
+            return XCTFail("Expected a terminal imported snapshot, got \(importedFlow.state)")
+        }
+        XCTAssertEqual(message, "Session was exported before this flow completed")
+        XCTAssertTrue(importedFlow.state.isTerminal)
+        XCTAssertNotNil(importedFlow.timing.completedAt)
+    }
+
     func testSessionServiceLoadsWorkspaceFlowsOldestFirstAndClearsEverySession() async throws {
         let recorder = CallRecorder()
         let sessionStore = RecordingSessionStore(sessionID: SessionID(), recorder: recorder)
@@ -566,6 +2000,82 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(createdSession?.state, .stopped)
         let calls = await recorder.snapshot()
         XCTAssertEqual(Array(calls.suffix(2)), ["session.create", "session.stop"])
+    }
+
+    func testSessionServiceUpdatesAndClearsFlowAnnotations() async throws {
+        let sessionID = SessionID()
+        let sessionStore = RecordingSessionStore(sessionID: sessionID, recorder: CallRecorder())
+        let flow = Flow(
+            sessionID: sessionID,
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://annotations.example.test/important")!
+            )
+        )
+        await sessionStore.seed(session: Session(id: sessionID), flows: [flow])
+        let service = SessionService(sessionStore: sessionStore)
+        let annotation = try FlowAnnotation(
+            comment: "Investigate this response",
+            highlight: .yellow,
+            isStruckThrough: true
+        )
+
+        let updated = try await service.updateAnnotation(annotation, for: flow.id)
+
+        XCTAssertEqual(updated?.annotation, annotation)
+        let persisted = await sessionStore.load(flowID: flow.id)
+        XCTAssertEqual(persisted?.annotation, annotation)
+
+        let cleared = try await service.updateAnnotation(nil, for: flow.id)
+        XCTAssertNil(cleared?.annotation)
+    }
+
+    func testSessionServiceListsRenamesAndRemovesInactiveSessions() async throws {
+        let sessionStore = RecordingSessionStore(
+            sessionID: SessionID(),
+            recorder: CallRecorder()
+        )
+        var older = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        older.stop(at: Date(timeIntervalSince1970: 1_100))
+        let recording = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        await sessionStore.seed(session: older)
+        await sessionStore.seed(session: recording)
+        let service = SessionService(sessionStore: sessionStore)
+
+        let sessions = try await service.loadSessions()
+
+        XCTAssertEqual(sessions.map(\.id), [recording.id, older.id])
+        let renamed = try await service.renameSession(
+            sessionID: older.id,
+            to: "  Login investigation  "
+        )
+        XCTAssertEqual(renamed?.name, "Login investigation")
+        let persisted = await sessionStore.loadSession(sessionID: older.id)
+        XCTAssertEqual(persisted?.name, "Login investigation")
+
+        do {
+            _ = try await service.renameSession(sessionID: recording.id, to: "Active capture")
+            XCTFail("Expected a recording session rename to be protected")
+        } catch let error as ProxyLensError {
+            XCTAssertEqual(error, .cannotRenameRecordingSession)
+        }
+
+        do {
+            try await service.removeSession(sessionID: recording.id)
+            XCTFail("Expected a recording session to be protected")
+        } catch let error as ProxyLensError {
+            XCTAssertEqual(error, .cannotRemoveRecordingSession)
+        }
+
+        try await service.removeSession(sessionID: older.id)
+        let remaining = try await service.loadSessions()
+        XCTAssertEqual(remaining.map(\.id), [recording.id])
     }
 
     func testCertificateTrustServiceDelegatesInstallRemoveExportAndState() async throws {
@@ -743,6 +2253,37 @@ final class ProxyLensApplicationTests: XCTestCase {
         let secondEvent = await secondIterator.next()
         XCTAssertEqual(firstEvent, event)
         XCTAssertEqual(secondEvent, event)
+        let subscriptionCount = await bus.subscriptionCount()
+        XCTAssertEqual(subscriptionCount, 2)
+
+        await bus.finish()
+        let finishedSubscriptionCount = await bus.subscriptionCount()
+        XCTAssertEqual(finishedSubscriptionCount, 0)
+    }
+
+    func testWebSocketFrameEventBusMulticastsCapturedFrames() async {
+        let bus = WebSocketFrameEventBus()
+        let firstStream = await bus.frames(bufferingPolicy: .unbounded)
+        let secondStream = await bus.frames(bufferingPolicy: .unbounded)
+        let frame = CapturedWebSocketFrame(
+            flowID: FlowID(),
+            sequenceNumber: 1,
+            direction: .clientToServer,
+            opcode: .text,
+            isFinal: true,
+            wasMasked: true,
+            payload: BodyReference(inline: Data(#"{"message":"hello"}"#.utf8)),
+            receivedAt: Date(timeIntervalSince1970: 123)
+        )
+
+        await bus.publish(frame)
+
+        var firstIterator = firstStream.makeAsyncIterator()
+        var secondIterator = secondStream.makeAsyncIterator()
+        let firstFrame = await firstIterator.next()
+        let secondFrame = await secondIterator.next()
+        XCTAssertEqual(firstFrame, frame)
+        XCTAssertEqual(secondFrame, frame)
         let subscriptionCount = await bus.subscriptionCount()
         XCTAssertEqual(subscriptionCount, 2)
 
@@ -986,6 +2527,20 @@ private enum TestFailure: LocalizedError {
     }
 }
 
+private func assertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ verify: (Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected an error to be thrown", file: file, line: line)
+    } catch {
+        verify(error)
+    }
+}
+
 private actor CallRecorder {
     private var calls: [String] = []
 
@@ -1005,7 +2560,7 @@ private actor RecordingBodyStore: BodyStore {
         metadata: BodyMetadata,
         maximumByteCount: Int64?
     ) async throws -> any BodyWriter {
-        RecordingBodyWriter()
+        RecordingBodyWriter(metadata: metadata, maximumByteCount: maximumByteCount)
     }
 
     func read(_ reference: BodyReference) async throws -> Data {
@@ -1024,14 +2579,40 @@ private actor RecordingBodyStore: BodyStore {
 }
 
 private actor RecordingBodyWriter: BodyWriter {
+    private let metadata: BodyMetadata
+    private let maximumByteCount: Int64?
     private var buffer = Data()
+    private var isTruncated = false
+
+    init(metadata: BodyMetadata, maximumByteCount: Int64?) {
+        self.metadata = metadata
+        self.maximumByteCount = maximumByteCount
+    }
 
     func append(_ data: Data) {
+        guard let maximumByteCount else {
+            buffer.append(data)
+            return
+        }
+        let remainingByteCount = max(0, maximumByteCount - Int64(buffer.count))
+        guard Int64(data.count) <= remainingByteCount else {
+            buffer.append(data.prefix(Int(remainingByteCount)))
+            isTruncated = true
+            return
+        }
         buffer.append(data)
     }
 
     func finalize() -> BodyReference {
-        BodyReference(inline: buffer)
+        BodyReference(
+            inline: buffer,
+            metadata: BodyMetadata(
+                contentType: metadata.contentType,
+                contentEncoding: metadata.contentEncoding,
+                digest: metadata.digest,
+                isTruncated: metadata.isTruncated || isTruncated
+            )
+        )
     }
 
     func cancel() {}
@@ -1259,7 +2840,12 @@ private actor RecordingSessionStore: SessionStore {
     }
 
     func save(_ flow: Flow) {
+        let isNewFlow = flows[flow.id] == nil
         flows[flow.id] = flow
+        if isNewFlow, var session = sessions[flow.sessionID] {
+            session.registerFlow()
+            sessions[flow.sessionID] = session
+        }
     }
 
     func load(flowID: FlowID) -> Flow? {

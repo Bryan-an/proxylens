@@ -5,6 +5,7 @@ public enum FlowFailure: Codable, Equatable, Hashable, Sendable {
     case upstreamUnavailable
     case timeout
     case tlsHandshakeFailed
+    case simulatedNetworkFailure
     case protocolError(String)
     case persistenceError(String)
     case unknown(String)

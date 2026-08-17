@@ -9,9 +9,11 @@ import ProxyLensCore
 public actor NIOProxyEngine: ProxyEngine {
     private let eventLoopThreadCount: Int
     private let eventSink: any FlowEventSink
+    private let webSocketFrameEventSink: any WebSocketFrameEventSink
     private let maxPendingRequestBytes: Int
     private let bodyStore: (any BodyStore)?
     private let maximumCapturedBodyBytes: Int64
+    private let maximumWebSocketFrameBytes: Int
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSConfiguration: UpstreamTLSConfiguration
     private let ruleSnapshot: (any RuleSnapshotSource)?
@@ -25,9 +27,11 @@ public actor NIOProxyEngine: ProxyEngine {
     public init(
         eventLoopThreads: Int = 1,
         eventSink: any FlowEventSink = NoOpFlowEventSink(),
+        webSocketFrameEventSink: (any WebSocketFrameEventSink)? = nil,
         maxPendingRequestBytes: Int = 1_048_576,
         bodyStore: (any BodyStore)? = nil,
         maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
+        maximumWebSocketFrameBytes: Int = 16 * 1_024 * 1_024,
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration(),
         ruleSnapshot: (any RuleSnapshotSource)? = nil,
@@ -36,9 +40,14 @@ public actor NIOProxyEngine: ProxyEngine {
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
         self.eventSink = eventSink
+        self.webSocketFrameEventSink = webSocketFrameEventSink ?? NoOpWebSocketFrameEventSink()
         self.maxPendingRequestBytes = max(1, maxPendingRequestBytes)
         self.bodyStore = bodyStore
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
+        self.maximumWebSocketFrameBytes = min(
+            max(1, maximumWebSocketFrameBytes),
+            Int(UInt32.max)
+        )
         self.certificateProvider = certificateProvider
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
         self.ruleSnapshot = ruleSnapshot
@@ -80,10 +89,12 @@ public actor NIOProxyEngine: ProxyEngine {
                 .childChannelInitializer {
                     [
                         eventSink,
+                        webSocketFrameEventSink,
                         sessionID,
                         maxPendingRequestBytes,
                         bodyStore,
                         maximumCapturedBodyBytes,
+                        maximumWebSocketFrameBytes,
                         certificateProvider,
                         upstreamTLSContext,
                         ruleSnapshot,
@@ -109,9 +120,11 @@ public actor NIOProxyEngine: ProxyEngine {
                             handler: HTTPProxyHandler(
                                 sessionID: sessionID,
                                 eventSink: eventSink,
+                                webSocketFrameEventSink: webSocketFrameEventSink,
                                 maxPendingRequestBytes: maxPendingRequestBytes,
                                 bodyStore: bodyStore,
                                 maximumCapturedBodyBytes: maximumCapturedBodyBytes,
+                                maximumWebSocketFrameBytes: maximumWebSocketFrameBytes,
                                 interceptHTTPS: interceptHTTPS,
                                 certificateProvider: certificateProvider,
                                 upstreamTLSContext: upstreamTLSContext,

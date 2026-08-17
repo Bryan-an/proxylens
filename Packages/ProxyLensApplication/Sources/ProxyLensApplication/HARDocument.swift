@@ -5,6 +5,33 @@ enum HARDocument {
     static let creatorName = "ProxyLens"
     static let creatorVersion = "0.1.0"
 
+    static var streamPreamble: Data {
+        Data(
+            """
+            {
+              "log" : {
+                "creator" : {
+                  "name" : "\(creatorName)",
+                  "version" : "\(creatorVersion)"
+                },
+                "entries" : [
+
+            """.utf8
+        )
+    }
+
+    static let streamEntrySeparator = Data(",\n".utf8)
+    static let streamEpilogue = Data(
+        """
+
+            ],
+            "version" : "1.2"
+          }
+        }
+
+        """.utf8
+    )
+
     static func serialize(
         flow: Flow,
         requestBody: Data?,
@@ -27,6 +54,24 @@ enum HARDocument {
                         )
                     ]
                 )
+            )
+        )
+    }
+
+    static func serializeEntry(
+        flow: Flow,
+        requestBody: Data?,
+        responseBody: Data?,
+        comments: [String] = []
+    ) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(
+            Entry(
+                flow: flow,
+                requestBody: requestBody,
+                responseBody: responseBody,
+                comments: comments
             )
         )
     }

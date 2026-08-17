@@ -5,6 +5,8 @@ import ProxyLensCore
 import ProxyLensPersistence
 import ProxyLensPlatform
 
+extension GRDBSessionStore: TrafficWebSocketFrameLoading {}
+
 @MainActor
 final class CompositionRoot {
     let captureCoordinator: CaptureCoordinator
@@ -25,6 +27,11 @@ final class CompositionRoot {
             flowStore: sessionStore,
             downstream: flowEvents
         )
+        let webSocketFrameEvents = WebSocketFrameEventBus()
+        let webSocketFramePersistenceSink = PersistingWebSocketFrameEventSink(
+            frameStore: sessionStore,
+            downstream: webSocketFrameEvents
+        )
         let certificateProvider = KeychainCertificateProvider()
         let certificateTrustStore = SystemCertificateTrustStore(
             certificateProvider: certificateProvider
@@ -34,6 +41,7 @@ final class CompositionRoot {
         let flowSourceResolver = MacOSFlowSourceResolver()
         let proxyEngine = NIOProxyEngine(
             eventSink: persistenceSink,
+            webSocketFrameEventSink: webSocketFramePersistenceSink,
             bodyStore: bodyStore,
             maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes,
             certificateProvider: certificateProvider,
@@ -64,7 +72,21 @@ final class CompositionRoot {
             flowStore: sessionStore
         )
         let sessionService = SessionService(sessionStore: sessionStore)
+        let harImporter = HARImportService(
+            sessionStore: sessionStore,
+            bodyStore: bodyStore,
+            maximumBodyByteCount: databaseConfiguration.maximumCapturedBodyBytes
+        )
+        let portableSessionService = PortableSessionService(
+            sessionStore: sessionStore,
+            bodyStore: bodyStore,
+            maximumBodyByteCount: databaseConfiguration.maximumCapturedBodyBytes
+        )
         let certificateTrustService = CertificateTrustService(trustStore: certificateTrustStore)
+        let ruleProfileStore = FileRuleProfileStore(
+            directoryURL: storageRoot.appendingPathComponent("RuleProfiles", isDirectory: true)
+        )
+        let ruleProfileArchive = RuleProfileArchiveService()
 
         self.flowEvents = flowEvents
         self.captureCoordinator = captureCoordinator
@@ -78,12 +100,18 @@ final class CompositionRoot {
                     interceptHTTPS: true
                 )
             ),
+            webSocketFrameLoader: sessionStore,
+            webSocketFrameEventSource: webSocketFrameEvents,
             ruleEngine: ruleEngine,
             breakpointCoordinator: breakpointCoordinator,
             exportService: exportService,
             requestReplayer: replayService,
             sessionService: sessionService,
+            harImporter: harImporter,
+            portableSessionTransfer: portableSessionService,
             certificateTrust: certificateTrustService,
+            ruleProfileStore: ruleProfileStore,
+            ruleProfileArchive: ruleProfileArchive,
             pinnedDomainsStore: UserDefaultsTrafficPinnedDomainsStore()
         )
     }

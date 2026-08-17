@@ -8,6 +8,544 @@ import XCTest
 
 @MainActor
 final class ProxyLensIntegrationTests: XCTestCase {
+    func testLineDiffAlignsModifiedAndAddedLines() {
+        let rows = TrafficLineDiff.rows(
+            left: "first\nsecond\nthird",
+            right: "first\nchanged\nthird\nfourth"
+        )
+
+        XCTAssertEqual(
+            rows,
+            [
+                TrafficDiffRow(
+                    leftLineNumber: 1,
+                    rightLineNumber: 1,
+                    leftText: "first",
+                    rightText: "first",
+                    kind: .unchanged
+                ),
+                TrafficDiffRow(
+                    leftLineNumber: 2,
+                    rightLineNumber: 2,
+                    leftText: "second",
+                    rightText: "changed",
+                    kind: .modified
+                ),
+                TrafficDiffRow(
+                    leftLineNumber: 3,
+                    rightLineNumber: 3,
+                    leftText: "third",
+                    rightText: "third",
+                    kind: .unchanged
+                ),
+                TrafficDiffRow(
+                    leftLineNumber: nil,
+                    rightLineNumber: 4,
+                    leftText: nil,
+                    rightText: "fourth",
+                    kind: .added
+                )
+            ]
+        )
+    }
+
+    func testLineDiffFallsBackToBoundedPositionalComparison() {
+        let rows = TrafficLineDiff.rows(
+            left: "one\ntwo\nthree",
+            right: "one\ninserted\ntwo\nthree",
+            maximumMatrixCellCount: 1
+        )
+
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertEqual(rows[0].kind, .unchanged)
+        XCTAssertEqual(rows[1].kind, .modified)
+        XCTAssertEqual(rows[3].kind, .added)
+    }
+
+    func testNetworkConditionDraftBuildsBoundedProfileAndSupportsUnlimitedBandwidth() throws {
+        let profile = try TrafficNetworkConditionDraft(
+            latencyMilliseconds: " 250 ",
+            downloadKibibytesPerSecond: "512",
+            uploadKibibytesPerSecond: "128.5"
+        ).profile()
+
+        XCTAssertEqual(profile.latency, 0.25)
+        XCTAssertEqual(profile.downloadBytesPerSecond, 524_288)
+        XCTAssertEqual(profile.uploadBytesPerSecond, 131_584)
+        XCTAssertEqual(profile.packetLossPercentage, 0)
+
+        let lossy = try TrafficNetworkConditionDraft(
+            latencyMilliseconds: "",
+            downloadKibibytesPerSecond: "",
+            uploadKibibytesPerSecond: "",
+            packetLossPercentage: "12.5"
+        ).profile()
+        XCTAssertEqual(lossy, ThrottleProfile(packetLossPercentage: 12.5))
+
+        let unlimited = try TrafficNetworkConditionDraft(
+            latencyMilliseconds: "10",
+            downloadKibibytesPerSecond: " ",
+            uploadKibibytesPerSecond: ""
+        ).profile()
+        XCTAssertEqual(unlimited, ThrottleProfile(latency: 0.01))
+    }
+
+    func testNetworkConditionDraftRejectsInvalidLatencyAndBandwidth() {
+        XCTAssertThrowsError(
+            try TrafficNetworkConditionDraft(
+                latencyMilliseconds: "60001",
+                downloadKibibytesPerSecond: "512",
+                uploadKibibytesPerSecond: "128"
+            ).profile()
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficNetworkConditionDraftError,
+                .invalidLatency("60001")
+            )
+        }
+
+        XCTAssertThrowsError(
+            try TrafficNetworkConditionDraft(
+                latencyMilliseconds: "10",
+                downloadKibibytesPerSecond: "zero",
+                uploadKibibytesPerSecond: "128"
+            ).profile()
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficNetworkConditionDraftError,
+                .invalidBandwidth(field: "Download", value: "zero")
+            )
+        }
+
+        XCTAssertThrowsError(
+            try TrafficNetworkConditionDraft(
+                latencyMilliseconds: "0",
+                downloadKibibytesPerSecond: "",
+                uploadKibibytesPerSecond: "",
+                packetLossPercentage: "101"
+            ).profile()
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficNetworkConditionDraftError,
+                .invalidPacketLoss("101")
+            )
+        }
+
+        XCTAssertThrowsError(
+            try TrafficNetworkConditionDraft(
+                latencyMilliseconds: "0",
+                downloadKibibytesPerSecond: "",
+                uploadKibibytesPerSecond: "",
+                packetLossPercentage: "0"
+            ).profile()
+        ) { error in
+            XCTAssertEqual(error as? TrafficNetworkConditionDraftError, .emptyProfile)
+        }
+    }
+
+    func testNetworkConditionProfilesPersistUpdateAndRemoveByStableIdentity() throws {
+        let suiteName = "ProxyLensIntegrationTests.NetworkConditions.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = UserDefaultsTrafficNetworkConditionProfileStore(defaults: defaults)
+
+        let original = try store.save(
+            name: " Slow VPN ",
+            profile: ThrottleProfile(
+                latency: 0.5,
+                downloadBytesPerSecond: 128_000,
+                uploadBytesPerSecond: 64_000
+            )
+        )
+        let updated = try store.save(
+            name: "slow vpn",
+            profile: ThrottleProfile(latency: 0.8)
+        )
+
+        XCTAssertEqual(updated.id, original.id)
+        XCTAssertEqual(updated.name, "slow vpn")
+        XCTAssertEqual(store.profiles, [updated])
+        XCTAssertEqual(
+            UserDefaultsTrafficNetworkConditionProfileStore(defaults: defaults).profiles,
+            [updated]
+        )
+
+        store.remove(id: updated.id)
+        XCTAssertTrue(store.profiles.isEmpty)
+        XCTAssertTrue(
+            UserDefaultsTrafficNetworkConditionProfileStore(defaults: defaults).profiles.isEmpty
+        )
+    }
+
+    func testNetworkConditionProfileStoreRejectsEmptyAndOversizedNames() {
+        let store = InMemoryTrafficNetworkConditionProfileStore()
+
+        XCTAssertThrowsError(
+            try store.save(name: "  ", profile: ThrottleProfile(latency: 0.2))
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficNetworkConditionProfileStoreError,
+                .invalidName
+            )
+        }
+        XCTAssertThrowsError(
+            try store.save(
+                name: String(repeating: "a", count: 81),
+                profile: ThrottleProfile(latency: 0.2)
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficNetworkConditionProfileStoreError,
+                .invalidName
+            )
+        }
+    }
+
+    func testRuleManagerPresentsTogglesAndRemovesCurrentRules() async {
+        let engine = RuleEngine()
+        let rule = await engine.blockHost("api.example.com")
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            ruleEngine: engine
+        )
+
+        var rows = await viewModel.currentRulePresentations()
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].id, rule.id)
+        XCTAssertEqual(rows[0].name, "Block api.example.com")
+        XCTAssertEqual(rows[0].action, "Block")
+        XCTAssertEqual(rows[0].phase, "Request Headers")
+        XCTAssertEqual(rows[0].matcher, "Host api.example.com")
+        XCTAssertTrue(rows[0].enabled)
+
+        await viewModel.setRuleEnabled(false, id: rule.id)
+        rows = await viewModel.currentRulePresentations()
+        XCTAssertFalse(rows[0].enabled)
+
+        await viewModel.removeRule(id: rule.id)
+        rows = await viewModel.currentRulePresentations()
+        XCTAssertTrue(rows.isEmpty)
+    }
+
+    func testTrafficRuleDraftBuildsValidatedNativeRules() throws {
+        let rule = try TrafficRuleDraft(
+            name: "Block staging APIs",
+            priority: 12,
+            action: .block,
+            phase: .requestHeaders,
+            matcher: .host,
+            patternKind: .wildcard,
+            matcherValue: "*.staging.example.com"
+        ).makeRule()
+
+        XCTAssertEqual(rule.name, "Block staging APIs")
+        XCTAssertEqual(rule.priority, 12)
+        XCTAssertEqual(rule.phase, .requestHeaders)
+        XCTAssertEqual(rule.matcher, .host(.wildcard("*.staging.example.com")))
+        XCTAssertEqual(rule.action, .block(reason: "Blocked by ProxyLens"))
+
+        XCTAssertThrowsError(
+            try TrafficRuleDraft(
+                name: "Broken regex",
+                priority: 0,
+                action: .breakpoint,
+                phase: .responseHeaders,
+                matcher: .path,
+                patternKind: .regularExpression,
+                matcherValue: "["
+            ).makeRule()
+        ) { error in
+            XCTAssertEqual(error as? TrafficRuleDraftError, .invalidRegularExpression)
+        }
+
+        XCTAssertThrowsError(
+            try TrafficRuleDraft(
+                name: "Invalid allow phase",
+                priority: 0,
+                action: .allow,
+                phase: .responseHeaders,
+                matcher: .any,
+                patternKind: .exact,
+                matcherValue: ""
+            ).makeRule()
+        ) { error in
+            XCTAssertEqual(error as? TrafficRuleDraftError, .unsupportedPhase)
+        }
+    }
+
+    func testRuleManagerAddsValidatedDraftToLiveRules() async throws {
+        let engine = RuleEngine()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            ruleEngine: engine
+        )
+        let rule = try TrafficRuleDraft(
+            name: "Pause API responses",
+            priority: 18,
+            action: .breakpoint,
+            phase: .responseHeaders,
+            matcher: .host,
+            patternKind: .exact,
+            matcherValue: "api.example.com"
+        ).makeRule()
+
+        await viewModel.addRule(rule)
+
+        let rows = await viewModel.currentRulePresentations()
+        XCTAssertEqual(rows.map(\.name), ["Pause API responses"])
+        XCTAssertEqual(rows.map(\.action), ["Breakpoint"])
+        XCTAssertEqual(rows.map(\.phase), ["Response Headers"])
+    }
+
+    func testTrafficRuleDraftRoundTripsEditableRuleWithoutChangingIdentity() throws {
+        let rule = Rule(
+            name: "Block staging APIs",
+            enabled: false,
+            priority: 12,
+            phase: .requestHeaders,
+            matcher: .host(.wildcard("*.staging.example.com")),
+            action: .block(reason: "Staging is offline")
+        )
+
+        let draft = try XCTUnwrap(TrafficRuleDraft(rule: rule))
+
+        XCTAssertEqual(try draft.makeRule(), rule)
+        XCTAssertNil(
+            TrafficRuleDraft(
+                rule: Rule(
+                    name: "Map API",
+                    phase: .requestHeaders,
+                    action: .mapRemote(url: URL(string: "https://local.example.com")!)
+                )
+            )
+        )
+    }
+
+    func testRuleManagerUpdatesExistingRuleWithoutChangingIdentity() async throws {
+        let engine = RuleEngine()
+        let original = await engine.blockHost("api.example.com", reason: "Old reason")
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            ruleEngine: engine
+        )
+        let replacement = try TrafficRuleDraft(
+            id: original.id,
+            name: "Pause API responses",
+            priority: 18,
+            action: .breakpoint,
+            phase: .responseHeaders,
+            matcher: .host,
+            patternKind: .exact,
+            matcherValue: "api.example.com"
+        ).makeRule()
+
+        let didUpdate = await viewModel.updateRule(replacement)
+        XCTAssertTrue(didUpdate)
+
+        let rules = await engine.currentRules().rules
+        XCTAssertEqual(rules.count, 1)
+        XCTAssertEqual(rules[0].id, original.id)
+        XCTAssertEqual(rules[0].name, "Pause API responses")
+        XCTAssertEqual(rules[0].action, .breakpoint)
+    }
+
+    func testRuleManagerSavesAppliesAndRemovesCompleteProfiles() async throws {
+        let engine = RuleEngine()
+        let profileStore = RecordingRuleProfileStore()
+        let original = await engine.blockHost("api.example.com")
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            ruleEngine: engine,
+            ruleProfileStore: profileStore
+        )
+
+        let profile = try await viewModel.saveRuleProfile(name: " Debug API ")
+        XCTAssertEqual(profile.name, "Debug API")
+        XCTAssertEqual(profile.rules.rules.map(\.id), [original.id])
+        var savedProfiles = try await viewModel.currentRuleProfiles()
+        XCTAssertEqual(savedProfiles, [profile])
+
+        await viewModel.removeRule(id: original.id)
+        var activeRules = await engine.currentRules().rules
+        XCTAssertTrue(activeRules.isEmpty)
+
+        try await viewModel.applyRuleProfile(id: profile.id)
+        activeRules = await engine.currentRules().rules
+        XCTAssertEqual(activeRules.map(\.id), [original.id])
+
+        try await viewModel.removeRuleProfile(id: profile.id)
+        savedProfiles = try await viewModel.currentRuleProfiles()
+        XCTAssertTrue(savedProfiles.isEmpty)
+    }
+
+    func testRuleManagerImportsAndExportsPortableProfiles() async throws {
+        let engine = RuleEngine()
+        let profileStore = RecordingRuleProfileStore()
+        _ = await engine.blockHost("tracker.example.com")
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            ruleEngine: engine,
+            ruleProfileStore: profileStore
+        )
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("shared-rules-\(UUID().uuidString).proxylensrules")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let saved = try await viewModel.saveRuleProfile(name: "Tracking blockers")
+        try await viewModel.exportRuleProfile(id: saved.id, to: fileURL)
+        try await viewModel.removeRuleProfile(id: saved.id)
+        let profilesAfterRemoval = try await viewModel.currentRuleProfiles()
+        XCTAssertTrue(profilesAfterRemoval.isEmpty)
+
+        let imported = try await viewModel.importRuleProfile(from: fileURL)
+        XCTAssertEqual(imported.id, saved.id)
+        XCTAssertEqual(imported.name, "Tracking blockers")
+        XCTAssertEqual(imported.rules, saved.rules)
+        let profilesAfterImport = try await viewModel.currentRuleProfiles()
+        XCTAssertEqual(profilesAfterImport, [imported])
+    }
+
+    func testRuleManagerRendersNativeRuleTableAndRemovesSelection() async throws {
+        let engine = RuleEngine()
+        await engine.blockHost("api.example.com")
+        await engine.allowHost("assets.example.com")
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            ruleEngine: engine
+        )
+        let controller = RuleManagerViewController(viewModel: viewModel)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 860, height: 480)
+        controller.view.layoutSubtreeIfNeeded()
+
+        await controller.reloadRules()
+
+        let table = try XCTUnwrap(
+            Self.descendant(
+                of: NSTableView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "ruleManager.table" }
+            )
+        )
+        XCTAssertEqual(table.numberOfRows, 2)
+        XCTAssertEqual(
+            table.tableColumns.map(\.title),
+            ["On", "Rule", "Action", "Phase", "Priority", "Matcher"]
+        )
+        let removeButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "ruleManager.remove" }
+            )
+        )
+        XCTAssertFalse(removeButton.isEnabled)
+        let editButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "ruleManager.edit" }
+            )
+        )
+        XCTAssertFalse(editButton.isEnabled)
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "ruleManager.add" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "ruleManager.profile" }
+            )
+        )
+        for identifier in [
+            "ruleManager.saveProfile", "ruleManager.applyProfile", "ruleManager.deleteProfile",
+            "ruleManager.importProfile", "ruleManager.exportProfile"
+        ] {
+            XCTAssertNotNil(
+                Self.descendant(
+                    of: NSButton.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == identifier }
+                )
+            )
+        }
+
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        XCTAssertTrue(removeButton.isEnabled)
+        XCTAssertTrue(editButton.isEnabled)
+        removeButton.performClick(nil)
+        try await waitUntil { table.numberOfRows == 1 }
+        let remainingRules = await engine.currentRules().rules
+        XCTAssertEqual(remainingRules.count, 1)
+    }
+
+    func testConsoleStoreProjectsFiltersAndRemovesSavedSessions() throws {
+        var olderSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        try olderSession.rename(to: "Checkout debugging")
+        olderSession.stop(at: Date(timeIntervalSince1970: 1_100))
+        let recordingSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        let olderFlow = try Self.makeFlow(
+            index: 1,
+            host: "old.example.com",
+            statusCode: 200,
+            sessionID: olderSession.id
+        )
+        let recordingFlow = try Self.makeFlow(
+            index: 2,
+            host: "live.example.com",
+            statusCode: 202,
+            sessionID: recordingSession.id
+        )
+        var store = TrafficConsoleStore()
+        store.replaceSessions([olderSession, recordingSession])
+        store.apply([.finished(olderFlow), .finished(recordingFlow)])
+
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.sessions.map(\.id), [recordingSession.id, olderSession.id])
+        XCTAssertEqual(snapshot.sessions.map(\.flowCount), [1, 1])
+        XCTAssertEqual(snapshot.sessions.last?.name, "Checkout debugging")
+
+        store.selectSource(.session(olderSession.id))
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [olderFlow.id])
+        XCTAssertEqual(store.flows(in: olderSession.id).map(\.id), [olderFlow.id])
+
+        store.removeSession(olderSession.id)
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.selectedSource, .allTraffic)
+        XCTAssertEqual(snapshot.sessions.map(\.id), [recordingSession.id])
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [recordingFlow.id])
+    }
+
     func testConsoleStoreGroupsFiltersSortsAndPreservesSelectionAcrossUpdates() throws {
         let first = try Self.makeFlow(index: 1, host: "api.example.com", statusCode: 204)
         let second = try Self.makeFlow(index: 2, host: "cdn.example.com", statusCode: 404)
@@ -44,6 +582,28 @@ final class ProxyLensIntegrationTests: XCTestCase {
         snapshot = store.snapshot(capture: .stopped, inspection: .empty)
         XCTAssertNil(snapshot.selectedFlowID)
         XCTAssertEqual(snapshot.visibleRows.map(\.id), [second.id])
+    }
+
+    func testConsoleStoreKeepsOrderedMultiSelectionAndDropsOnlyHiddenFlows() throws {
+        let first = try Self.makeFlow(index: 1, host: "first.example.com", statusCode: 204)
+        let second = try Self.makeFlow(index: 2, host: "second.example.com", statusCode: 404)
+        let third = try Self.makeFlow(index: 3, host: "third.example.com", statusCode: 200)
+        var store = TrafficConsoleStore()
+        store.apply([.finished(first), .finished(second), .finished(third)])
+        store.setSort(TrafficConsoleSort(key: .status, ascending: true))
+
+        store.selectFlows([second.id, third.id], primary: second.id)
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [third.id, first.id, second.id])
+        XCTAssertEqual(snapshot.selectedFlowIDs, [third.id, second.id])
+        XCTAssertEqual(snapshot.selectedFlowID, second.id)
+
+        store.selectSource(.domain("third.example.com"))
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+
+        XCTAssertEqual(snapshot.selectedFlowIDs, [third.id])
+        XCTAssertEqual(snapshot.selectedFlowID, third.id)
     }
 
     func testConsoleStoreKeepsPinnedDomainsVisibleAcrossSessionChanges() throws {
@@ -96,6 +656,105 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         let restored = UserDefaultsTrafficPinnedDomainsStore(defaults: defaults)
         XCTAssertEqual(restored.domains, ["api.example.com", "cdn.example.com"])
+    }
+
+    func testSourceListVisibilityStoreDefaultsVisibleAndPersistsChanges() throws {
+        let suiteName = "ProxyLensIntegrationTests.SourceListVisibility.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsTrafficSourceListVisibilityStore(defaults: defaults)
+        XCTAssertTrue(store.isVisible)
+
+        store.save(isVisible: false)
+        XCTAssertFalse(
+            UserDefaultsTrafficSourceListVisibilityStore(defaults: defaults).isVisible
+        )
+
+        store.save(isVisible: true)
+        XCTAssertTrue(
+            UserDefaultsTrafficSourceListVisibilityStore(defaults: defaults).isVisible
+        )
+    }
+
+    func testRequestComposerStorePersistsNamedPresetsAndBoundsHistory() throws {
+        let suiteName = "ProxyLensIntegrationTests.RequestComposer.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = UserDefaultsTrafficRequestComposerStore(defaults: defaults)
+
+        let original = try store.savePreset(
+            name: " Demo ",
+            headersText: "GET https://example.com/ HTTP/1.1",
+            bodyText: ""
+        )
+        let updated = try store.savePreset(
+            name: "demo",
+            headersText: "POST https://example.com/events HTTP/1.1",
+            bodyText: "{\"enabled\":true}"
+        )
+
+        XCTAssertEqual(updated.id, original.id)
+        XCTAssertEqual(updated.name, "demo")
+        XCTAssertEqual(store.presets, [updated])
+        XCTAssertEqual(
+            UserDefaultsTrafficRequestComposerStore(defaults: defaults).presets,
+            [updated]
+        )
+
+        for index in 0..<TrafficRequestComposerStoreLimits.maximumHistoryEntries + 5 {
+            _ = store.recordHistory(
+                headersText: "GET https://example.com/\(index) HTTP/1.1",
+                bodyText: ""
+            )
+        }
+        XCTAssertEqual(
+            store.history.count,
+            TrafficRequestComposerStoreLimits.maximumHistoryEntries
+        )
+        XCTAssertTrue(store.history[0].headersText.contains("/54"))
+        XCTAssertTrue(store.history.allSatisfy { $0.kind == .history })
+    }
+
+    func testRequestComposerStoreRejectsInvalidPresetNamesAndOversizedEntries() {
+        let store = InMemoryTrafficRequestComposerStore()
+
+        XCTAssertThrowsError(
+            try store.savePreset(
+                name: "  ",
+                headersText: "GET https://example.com/ HTTP/1.1",
+                bodyText: ""
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficRequestComposerStoreError,
+                .invalidPresetName
+            )
+        }
+
+        XCTAssertThrowsError(
+            try store.savePreset(
+                name: "Demo",
+                headersText: String(
+                    repeating: "x",
+                    count: TrafficRequestComposerStoreLimits.maximumStoredBytes + 1
+                ),
+                bodyText: ""
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? TrafficRequestComposerStoreError,
+                .contentTooLarge
+            )
+        }
+
+        XCTAssertNil(
+            store.recordHistory(
+                headersText: "\n",
+                bodyText: ""
+            )
+        )
+        XCTAssertTrue(store.history.isEmpty)
     }
 
     func testConsoleStoreReplaceAllResetsRowsAndKeepsFilters() throws {
@@ -288,6 +947,92 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertNil(snapshot.selectedFlowID)
         XCTAssertEqual(snapshot.visibleRows.count, 39)
         XCTAssertEqual(snapshot.displayFilter, filter)
+    }
+
+    func testGraphQLOperationIsSearchableFilterableAndShownInRows() throws {
+        let graphqlBody = Data(
+            #"{"query":"mutation SaveProfile { saveProfile { id } }"}"#.utf8
+        )
+        let graphql = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: graphqlBody,
+            method: .post,
+            responseContentType: "application/json",
+            requestContentType: "application/json"
+        )
+        let ordinaryJSON = try Self.makeFlow(
+            index: 2,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data(#"{"status":"ok"}"#.utf8),
+            method: .post,
+            responseContentType: "application/json",
+            requestContentType: "application/json"
+        )
+        var store = TrafficConsoleStore()
+        store.apply([.finished(graphql), .finished(ordinaryJSON)])
+        store.setDisplayFilter(TrafficDisplayFilter(contentType: .graphql))
+
+        var snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [graphql.id])
+        XCTAssertEqual(snapshot.visibleRows.first?.graphqlOperation, "SaveProfile")
+
+        store.setDisplayFilter(
+            TrafficDisplayFilter(searchText: "mutation saveprofile", contentType: .graphql)
+        )
+        snapshot = store.snapshot(capture: .stopped, inspection: .empty)
+        XCTAssertEqual(snapshot.visibleRows.map(\.id), [graphql.id])
+    }
+
+    func testAnnotationSearchFiltersAndStaleCaptureUpdatesPreserveLocalMetadata() throws {
+        var annotated = try Self.makeFlow(
+            index: 31,
+            host: "annotations.example.com",
+            statusCode: 200
+        )
+        let annotation = try FlowAnnotation(
+            comment: "Investigate the authentication redirect",
+            highlight: .purple,
+            isStruckThrough: true
+        )
+        annotated.setAnnotation(annotation)
+        let staleCaptureSnapshot = Flow(
+            id: annotated.id,
+            sessionID: annotated.sessionID,
+            source: annotated.source,
+            request: annotated.request,
+            connection: annotated.connection,
+            startedAt: annotated.createdAt
+        )
+        var store = TrafficConsoleStore()
+        store.apply([.finished(annotated)])
+
+        store.setDisplayFilter(
+            TrafficDisplayFilter(
+                searchText: "authentication redirect",
+                annotation: .commented
+            )
+        )
+        XCTAssertEqual(
+            store.snapshot(capture: .stopped, inspection: .empty).visibleRows.map(\.id),
+            [annotated.id]
+        )
+
+        store.setDisplayFilter(TrafficDisplayFilter(annotation: .purple))
+        XCTAssertEqual(
+            store.snapshot(capture: .stopped, inspection: .empty).visibleRows.map(\.id),
+            [annotated.id]
+        )
+        store.apply([.updated(staleCaptureSnapshot)])
+        XCTAssertEqual(store.flow(id: annotated.id)?.annotation, annotation)
+
+        store.updateAnnotation(nil, for: annotated.id)
+        XCTAssertNil(store.flow(id: annotated.id)?.annotation)
+        XCTAssertTrue(
+            store.snapshot(capture: .stopped, inspection: .empty).visibleRows.isEmpty
+        )
     }
 
     func testActiveFilterIncrementallyProjectsLiveInsertionsAndUpdates() throws {
@@ -525,7 +1270,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(tableView.numberOfRows, 1)
     }
 
-    func testFlowTableContextMenuOffersRepeatRequestFirst() throws {
+    func testFlowTableContextMenuOffersAnnotationsBeforeRequestActions() throws {
         let tableView = RecordingTableView()
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
@@ -534,6 +1279,416 @@ final class ProxyLensIntegrationTests: XCTestCase {
             captureConfiguration: Self.captureConfiguration
         )
         let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+        let first = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200
+        )
+        let second = try Self.makeFlow(
+            index: 2,
+            host: "cdn.example.com",
+            statusCode: 201
+        )
+        let third = try Self.makeFlow(
+            index: 3,
+            host: "other.example.com",
+            statusCode: 202
+        )
+        var store = TrafficConsoleStore()
+        store.apply([.finished(first), .finished(second), .finished(third)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        XCTAssertTrue(tableView.allowsMultipleSelection)
+        tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+
+        controller.menuNeedsUpdate(menu)
+
+        XCTAssertEqual(menu.items[0].title, "Add Comment…")
+        XCTAssertEqual(menu.items[0].action, NSSelectorFromString("editComment:"))
+        XCTAssertEqual(menu.items[1].title, "Highlight")
+        XCTAssertEqual(
+            menu.items[1].submenu?.items.map(\.title),
+            [
+                "None", "Red", "Yellow", "Green", "Blue", "Purple", "Gray"
+            ])
+        XCTAssertEqual(menu.items[2].title, "Strikethrough")
+        XCTAssertEqual(menu.items[4].title, "Repeat Request")
+        XCTAssertEqual(menu.items[4].action, NSSelectorFromString("repeatRequest:"))
+        XCTAssertEqual(menu.items[5].title, "Edit & Repeat…")
+        XCTAssertEqual(menu.items[5].action, NSSelectorFromString("editAndRepeat:"))
+        XCTAssertEqual(menu.items[6].title, "Compare Selected Flows…")
+        XCTAssertEqual(menu.items[6].action, NSSelectorFromString("compareSelectedFlows:"))
+        XCTAssertTrue(menu.items[6].isEnabled)
+        XCTAssertEqual(menu.items[6].representedObject as? [FlowID], [first.id, second.id])
+        XCTAssertEqual(menu.items[8].title, "Generate Request Code…")
+        XCTAssertEqual(menu.items[8].action, NSSelectorFromString("generateRequestCode:"))
+        XCTAssertEqual(menu.items[9].title, "Copy")
+        XCTAssertEqual(
+            menu.items[9].submenu?.items.filter { !$0.isSeparatorItem }.map(\.title),
+            [
+                "URL", "Request Headers", "Request Body", "Request Cookies",
+                "Response Headers", "Response Body", "Response Cookies", "cURL"
+            ]
+        )
+        let copyItems = try XCTUnwrap(menu.items[9].submenu?.items)
+        XCTAssertTrue(try XCTUnwrap(copyItems.first { $0.title == "URL" }).isEnabled)
+        XCTAssertTrue(
+            try XCTUnwrap(copyItems.first { $0.title == "Request Headers" }).isEnabled
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(copyItems.first { $0.title == "Request Body" }).isEnabled
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(copyItems.first { $0.title == "Request Cookies" }).isEnabled
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(copyItems.first { $0.title == "Response Headers" }).isEnabled
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(copyItems.first { $0.title == "Response Body" }).isEnabled
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(copyItems.first { $0.title == "Response Cookies" }).isEnabled
+        )
+        XCTAssertEqual(menu.items[10].title, "Export 2 Flows as HAR…")
+        XCTAssertEqual(menu.items[10].action, NSSelectorFromString("exportHAR:"))
+        XCTAssertEqual(menu.items[10].representedObject as? [FlowID], [first.id, second.id])
+        XCTAssertEqual(menu.items[11].title, "Export 2 Flows as OpenAPI…")
+        XCTAssertEqual(menu.items[11].action, NSSelectorFromString("exportOpenAPI:"))
+        XCTAssertEqual(menu.items[11].representedObject as? [FlowID], [first.id, second.id])
+
+        tableView.clickedRowOverride = 2
+        controller.menuNeedsUpdate(menu)
+
+        XCTAssertEqual(tableView.selectedRowIndexes, IndexSet(integer: 2))
+        XCTAssertEqual(menu.items[6].title, "Compare Selected Flows…")
+        XCTAssertFalse(menu.items[6].isEnabled)
+        XCTAssertEqual(menu.items[10].title, "Export HAR…")
+        XCTAssertEqual(menu.items[10].representedObject as? [FlowID], [third.id])
+        XCTAssertEqual(menu.items[11].title, "Export OpenAPI…")
+        XCTAssertEqual(menu.items[11].representedObject as? [FlowID], [third.id])
+    }
+
+    func testFlowComparisonViewExposesRequestAndResponseDiffs() {
+        let comparison = TrafficFlowComparison(
+            leftTitle: "GET first.example.com/a",
+            rightTitle: "POST second.example.com/b",
+            request: TrafficMessageComparison(
+                rows: TrafficLineDiff.rows(left: "GET /a", right: "POST /b")
+            ),
+            response: TrafficMessageComparison(
+                rows: TrafficLineDiff.rows(left: "HTTP/1.1 200", right: "HTTP/1.1 404")
+            )
+        )
+        let controller = FlowComparisonViewController(comparison: comparison)
+
+        _ = controller.view
+
+        XCTAssertEqual(controller.view.accessibilityIdentifier(), "flowComparison")
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.message" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.presentation" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.left" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.right" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.unified" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.copy" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "flowComparison.export" }
+            )
+        )
+    }
+
+    func testUnifiedDiffRendersHeadersAndModifiedLines() {
+        let comparison = TrafficMessageComparison(
+            rows: TrafficLineDiff.rows(
+                left: "GET /items\nAccept: application/json\n\nold",
+                right: "GET /items\nAccept: application/json\n\nnew"
+            )
+        )
+
+        let diff = TrafficUnifiedDiff.text(
+            leftTitle: "GET first.example.com/items",
+            rightTitle: "GET second.example.com/items",
+            sectionTitle: "Request",
+            comparison: comparison
+        )
+
+        XCTAssertTrue(diff.hasPrefix("--- GET first.example.com/items\n"))
+        XCTAssertTrue(diff.contains("+++ GET second.example.com/items\n"))
+        XCTAssertTrue(diff.contains("@@ -1,4 +1,4 @@ Request\n"))
+        XCTAssertTrue(diff.contains("  GET /items\n"))
+        XCTAssertTrue(diff.contains("- old\n"))
+        XCTAssertTrue(diff.contains("+ new\n"))
+    }
+
+    func testRequestCodeViewExposesLanguageSelectionSourceAndCopyAction() {
+        let controller = RequestCodeViewController(
+            snippets: RequestCodeLanguage.allCases.map {
+                RequestCodeSnippet(language: $0, source: "// \($0.displayName)")
+            }
+        )
+
+        _ = controller.view
+
+        XCTAssertEqual(controller.view.accessibilityIdentifier(), "requestCode")
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestCode.language" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestCode.source" }
+            )
+        )
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestCode.copy" }
+            )
+        )
+    }
+
+    func testViewModelBuildsCopyValuesFromAuthoritativeFlowData() async throws {
+        let flow = try Self.makeFlow(
+            index: 17,
+            host: "copy.example.com",
+            statusCode: 201,
+            requestBody: Data(#"{"name":"ProxyLens"}"#.utf8),
+            responseBody: Data("created".utf8),
+            requestCookieValues: ["session=abc; theme=dark"],
+            responseSetCookieValues: ["token=xyz; Secure; HttpOnly"]
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+
+        let url = try await viewModel.copyText(for: flow.id, kind: .url)
+        let requestHeaders = try await viewModel.copyText(
+            for: flow.id, kind: .requestHeaders)
+        let requestBody = try await viewModel.copyText(for: flow.id, kind: .requestBody)
+        let requestCookies = try await viewModel.copyText(
+            for: flow.id, kind: .requestCookies)
+        let responseHeaders = try await viewModel.copyText(
+            for: flow.id, kind: .responseHeaders)
+        let responseBody = try await viewModel.copyText(for: flow.id, kind: .responseBody)
+        let responseCookies = try await viewModel.copyText(
+            for: flow.id, kind: .responseCookies)
+
+        XCTAssertEqual(url, "https://copy.example.com/v1/items/17?source=test")
+        XCTAssertTrue(requestHeaders.contains("POST /v1/items/17?source=test HTTP/1.1"))
+        XCTAssertEqual(requestBody, #"{"name":"ProxyLens"}"#)
+        XCTAssertEqual(requestCookies, "session=abc\ntheme=dark")
+        XCTAssertTrue(responseHeaders.hasPrefix("HTTP/1.1 201 Result"))
+        XCTAssertEqual(responseBody, "created")
+        XCTAssertEqual(responseCookies, "token=xyz\n  Secure\n  HttpOnly")
+    }
+
+    func testFlowTableContextMenuOffersGraphQLOperationBreakpoint() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+        let flow = try Self.makeFlow(
+            index: 1,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data(
+                #"{"query":"mutation SaveProfile { saveProfile { id } }"}"#.utf8
+            ),
+            method: .post,
+            requestContentType: "application/json"
+        )
+        var store = TrafficConsoleStore()
+        store.apply([.finished(flow)])
+        controller.render(store.snapshot(capture: .stopped, inspection: .empty))
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+
+        controller.menuNeedsUpdate(menu)
+
+        let item = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("breakpointGraphQLOperation:")
+            }
+        )
+        XCTAssertEqual(item.title, "Breakpoint GraphQL mutation SaveProfile")
+        XCTAssertEqual(
+            item.representedObject as? GraphQLOperationMetadata,
+            GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+
+        let blockItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("blockGraphQLOperation:")
+            }
+        )
+        XCTAssertEqual(blockItem.title, "Block GraphQL mutation SaveProfile")
+        XCTAssertEqual(
+            blockItem.representedObject as? GraphQLOperationMetadata,
+            GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+
+        let mapLocalItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("mapLocalGraphQLOperation:")
+            }
+        )
+        XCTAssertEqual(mapLocalItem.title, "Map Local GraphQL mutation SaveProfile…")
+        XCTAssertEqual(
+            mapLocalItem.representedObject as? GraphQLOperationMetadata,
+            GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+
+        let mapRemoteItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("mapRemoteGraphQLOperation:")
+            }
+        )
+        XCTAssertEqual(mapRemoteItem.title, "Map Remote GraphQL mutation SaveProfile…")
+        XCTAssertEqual(
+            mapRemoteItem.representedObject as? GraphQLOperationMetadata,
+            GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+
+        let genericReplaceBodyItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("replaceBody:")
+            }
+        )
+        XCTAssertEqual(
+            genericReplaceBodyItem.title,
+            "Replace Request Body api.example.com/v1/items/1…"
+        )
+
+        let genericReplaceResponseBodyItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("replaceResponseBody:")
+            }
+        )
+        XCTAssertEqual(
+            genericReplaceResponseBodyItem.title,
+            "Replace Response Body api.example.com/v1/items/1…"
+        )
+
+        let redirectItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("redirect:")
+            }
+        )
+        XCTAssertEqual(redirectItem.title, "Redirect api.example.com/v1/items/1…")
+
+        let networkConditionsItem = try XCTUnwrap(
+            menu.items.first { $0.title == "Network Conditions" }
+        )
+        XCTAssertEqual(
+            networkConditionsItem.submenu?.items.map(\.title),
+            [
+                "No Throttling", "", "Lost Connection", "Very Bad Network", "200 ms Latency",
+                "500 ms Latency", "1 s Latency", "2 s Latency", "", "Slow 3G", "Fast 3G",
+                "Wi-Fi", "", "Custom…"
+            ]
+        )
+
+        let replaceBodyItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("replaceBodyGraphQLOperation:")
+            }
+        )
+        XCTAssertEqual(replaceBodyItem.title, "Replace Request Body GraphQL mutation SaveProfile…")
+        XCTAssertEqual(
+            replaceBodyItem.representedObject as? GraphQLOperationMetadata,
+            GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+
+        let replaceResponseBodyItem = try XCTUnwrap(
+            menu.items.first {
+                $0.action == NSSelectorFromString("replaceResponseBodyGraphQLOperation:")
+            }
+        )
+        XCTAssertEqual(
+            replaceResponseBodyItem.title,
+            "Replace Response Body GraphQL mutation SaveProfile…"
+        )
+        XCTAssertEqual(
+            replaceResponseBodyItem.representedObject as? GraphQLOperationMetadata,
+            GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+    }
+
+    func testFlowTableContextMenuOffersReusableAndRemovableNetworkProfiles() throws {
+        let tableView = RecordingTableView()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration
+        )
+        let profileStore = InMemoryTrafficNetworkConditionProfileStore()
+        _ = try profileStore.save(
+            name: "Office VPN",
+            profile: ThrottleProfile(latency: 0.35, downloadBytesPerSecond: 256_000)
+        )
+        let controller = FlowTableViewController(
+            viewModel: viewModel,
+            tableView: tableView,
+            networkConditionProfileStore: profileStore
+        )
         _ = controller.view
         let flow = try Self.makeFlow(
             index: 1,
@@ -548,12 +1703,56 @@ final class ProxyLensIntegrationTests: XCTestCase {
 
         controller.menuNeedsUpdate(menu)
 
-        XCTAssertEqual(menu.items.first?.title, "Repeat Request")
-        XCTAssertEqual(menu.items.first?.action, NSSelectorFromString("repeatRequest:"))
-        XCTAssertEqual(menu.items.first?.representedObject as? FlowID, flow.id)
-        XCTAssertEqual(menu.items[1].title, "Edit & Repeat…")
-        XCTAssertEqual(menu.items[1].action, NSSelectorFromString("editAndRepeat:"))
-        XCTAssertEqual(menu.items[1].representedObject as? FlowID, flow.id)
+        let conditions = try XCTUnwrap(
+            menu.items.first { $0.title == "Network Conditions" }?.submenu
+        )
+        let saved = try XCTUnwrap(
+            conditions.items.first { $0.title == "Saved Profiles" }?.submenu
+        )
+        XCTAssertEqual(saved.items.map(\.title), ["Office VPN"])
+        XCTAssertEqual(
+            saved.items.first?.action,
+            NSSelectorFromString("applyNetworkCondition:")
+        )
+        let removal = try XCTUnwrap(
+            conditions.items.first { $0.title == "Remove Saved Profile" }?.submenu
+        )
+        XCTAssertEqual(removal.items.map(\.title), ["Office VPN"])
+        XCTAssertEqual(
+            removal.items.first?.action,
+            NSSelectorFromString("removeNetworkConditionProfile:")
+        )
+    }
+
+    func testFlowTablePublishesNativeMultiSelectionAndPrimaryInspection() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+        let first = try Self.makeFlow(index: 7, host: "first.example.com", statusCode: 200)
+        let second = try Self.makeFlow(index: 8, host: "second.example.com", statusCode: 201)
+        viewModel.receive(.finished(first))
+        viewModel.receive(.finished(second))
+        viewModel.flushPendingEvents()
+
+        let tableView = RecordingTableView()
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+
+        tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+
+        try await waitUntil {
+            viewModel.snapshot.selectedFlowIDs == [first.id, second.id]
+                && viewModel.snapshot.inspection.flowID == viewModel.snapshot.selectedFlowID
+        }
+        XCTAssertTrue(
+            viewModel.snapshot.selectedFlowID.map { [first.id, second.id].contains($0) } ?? false
+        )
     }
 
     func testRequestEditorExposesAccessiblePlainTextFieldsAndOnlyReturnsChangedBody() throws {
@@ -681,6 +1880,104 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(controller.changedBodyText, #"{"count":42}"#)
     }
 
+    func testRequestEditorImportsCURLIntoTheComposeFields() throws {
+        let controller = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: "GET https://example.com/ HTTP/1.1",
+                bodyText: "",
+                canEditBody: true,
+                bodyMessage: nil
+            ),
+            allowsCURLImport: true
+        )
+        _ = controller.view
+
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.importCURL" }
+            )
+        )
+
+        try controller.importCURLCommand(
+            #"curl 'https://api.example.com/events' -H 'Content-Type: application/json' --data-raw '{"name":"ProxyLens","enabled":true}'"#
+        )
+
+        XCTAssertTrue(controller.headersText.hasPrefix("POST https://api.example.com/events"))
+        XCTAssertTrue(controller.headersText.contains("Content-Type: application/json"))
+        XCTAssertEqual(
+            controller.bodyText,
+            """
+            {
+              "enabled" : true,
+              "name" : "ProxyLens"
+            }
+            """
+        )
+    }
+
+    func testRequestEditorExposesComposerHistoryAndPresetControls() throws {
+        let store = InMemoryTrafficRequestComposerStore(
+            history: [
+                TrafficRequestComposerEntry(
+                    kind: .history,
+                    name: "Recent request",
+                    headersText: "GET https://example.com/ HTTP/1.1",
+                    bodyText: ""
+                )
+            ],
+            presets: [
+                TrafficRequestComposerEntry(
+                    kind: .preset,
+                    name: "Demo API",
+                    headersText: "POST https://example.com/events HTTP/1.1",
+                    bodyText: "{}"
+                )
+            ]
+        )
+        let controller = RequestEditorViewController(
+            draft: TrafficRequestEditDraft(
+                headersText: "GET https://example.com/ HTTP/1.1",
+                bodyText: "",
+                canEditBody: true,
+                bodyMessage: nil
+            ),
+            allowsCURLImport: true,
+            composerStore: store
+        )
+        _ = controller.view
+
+        let historyPopup = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.history" }
+            )
+        )
+        let presetsPopup = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.presets" }
+            )
+        )
+        XCTAssertTrue(historyPopup.itemTitles.contains("Recent request"))
+        XCTAssertTrue(presetsPopup.itemTitles.contains("Demo API"))
+        historyPopup.menu?.performActionForItem(at: 1)
+        XCTAssertTrue(controller.headersText.hasPrefix("GET https://example.com/"))
+        presetsPopup.menu?.performActionForItem(at: 1)
+        XCTAssertTrue(controller.headersText.hasPrefix("POST https://example.com/events"))
+        XCTAssertEqual(controller.bodyText.filter { !$0.isWhitespace }, "{}")
+        XCTAssertNotNil(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "requestEditor.savePreset" }
+            )
+        )
+    }
+
     func testViewModelBatchesLargeFlowListsAndLoadsAuthoritativeBodies() async throws {
         let captureController = RecordingCaptureController()
         let viewModel = TrafficConsoleViewModel(
@@ -794,10 +2091,373 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertTrue(command.contains("curl 'https://api.example.com/v1/items/1?source=test'"))
         XCTAssertTrue(command.contains("--data-binary 'request body'"))
 
+        let snippets = try await viewModel.requestCodeSnippets(for: first.id)
+        XCTAssertEqual(snippets.map(\.language), RequestCodeLanguage.allCases)
+        XCTAssertTrue(
+            snippets.first { $0.language == .javascriptFetch }?.source.contains(
+                "await fetch(\"https://api.example.com/v1/items/1?source=test\""
+            ) == true
+        )
+
         try await viewModel.clearSession()
         let didClear = await sessionService.cleared()
         XCTAssertTrue(didClear)
         XCTAssertEqual(viewModel.snapshot.allFlowCount, 0)
+        XCTAssertTrue(viewModel.snapshot.visibleRows.isEmpty)
+        XCTAssertNil(viewModel.snapshot.selectedFlowID)
+        XCTAssertEqual(viewModel.snapshot.inspection, .empty)
+    }
+
+    func testViewModelImportsHARAndSelectsTheNewSavedSession() async throws {
+        var session = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        try session.rename(to: "Imported checkout")
+        session.registerFlow()
+        session.stop(at: Date(timeIntervalSince1970: 1_001))
+        let flow = try Self.makeFlow(
+            index: 14,
+            host: "imported.example.com",
+            statusCode: 201,
+            sessionID: session.id
+        )
+        let harImporter = RecordingHARImporter(
+            result: HARImportResult(session: session, flows: [flow])
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            harImporter: harImporter
+        )
+        await viewModel.prepare()
+
+        let importedSessionID = try await viewModel.importHAR(
+            from: URL(fileURLWithPath: "/tmp/imported.har")
+        )
+
+        XCTAssertEqual(importedSessionID, session.id)
+        XCTAssertEqual(viewModel.snapshot.sessions.map(\.id), [session.id])
+        XCTAssertEqual(viewModel.snapshot.selectedSource, .session(session.id))
+        XCTAssertEqual(viewModel.snapshot.visibleRows.map(\.id), [flow.id])
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, flow.id)
+        let importedURLs = await harImporter.importedURLs()
+        XCTAssertEqual(importedURLs, [URL(fileURLWithPath: "/tmp/imported.har")])
+    }
+
+    func testViewModelImportsAndExportsPortableSessions() async throws {
+        var session = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        try session.rename(to: "Portable checkout")
+        session.registerFlow()
+        session.stop(at: Date(timeIntervalSince1970: 2_001))
+        let flow = try Self.makeFlow(
+            index: 15,
+            host: "portable.example.com",
+            statusCode: 202,
+            sessionID: session.id
+        )
+        let transfer = RecordingPortableSessionTransfer(
+            result: PortableSessionImportResult(session: session, flows: [flow])
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            portableSessionTransfer: transfer
+        )
+        await viewModel.prepare()
+        let importURL = URL(fileURLWithPath: "/tmp/imported.proxylens", isDirectory: true)
+
+        let importedSessionID = try await viewModel.importPortableSession(from: importURL)
+
+        XCTAssertEqual(importedSessionID, session.id)
+        XCTAssertEqual(viewModel.snapshot.sessions.map(\.id), [session.id])
+        XCTAssertEqual(viewModel.snapshot.selectedSource, .session(session.id))
+        XCTAssertEqual(viewModel.snapshot.visibleRows.map(\.id), [flow.id])
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, flow.id)
+        let exportURL = URL(fileURLWithPath: "/tmp/exported.proxylens", isDirectory: true)
+        try await viewModel.writePortableSession(sessionID: session.id, to: exportURL)
+        let calls = await transfer.calls()
+        XCTAssertEqual(calls.importedURLs, [importURL])
+        XCTAssertEqual(calls.exports.map(\.sessionID), [session.id])
+        XCTAssertEqual(calls.exports.map(\.fileURL), [exportURL])
+    }
+
+    func testViewModelExportsEveryFlowInSessionRegardlessOfVisibleFilters() async throws {
+        var selectedSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        try selectedSession.rename(to: "Checkout")
+        selectedSession.stop(at: Date(timeIntervalSince1970: 1_100))
+        var otherSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        otherSession.stop(at: Date(timeIntervalSince1970: 2_100))
+        let first = try Self.makeFlow(
+            index: 21,
+            host: "first.example.com",
+            statusCode: 200,
+            requestBody: Data(#"{"step":1}"#.utf8),
+            requestContentType: "application/json",
+            sessionID: selectedSession.id
+        )
+        let second = try Self.makeFlow(
+            index: 22,
+            host: "second.example.com",
+            statusCode: 201,
+            sessionID: selectedSession.id
+        )
+        let unrelated = try Self.makeFlow(
+            index: 23,
+            host: "other.example.com",
+            statusCode: 204,
+            sessionID: otherSession.id
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            exportService: ExportService(bodyStore: InlineBodyStore()),
+            sessionService: RecordingSessionService(
+                flows: [first, second, unrelated],
+                sessions: [selectedSession, otherSession]
+            )
+        )
+        await viewModel.prepare()
+        viewModel.setSearchText("no visible flow matches")
+        XCTAssertTrue(viewModel.snapshot.visibleRows.isEmpty)
+
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "proxylens-session-export-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directoryURL.appendingPathComponent("Checkout.har")
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        try await viewModel.writeHAR(sessionID: selectedSession.id, to: fileURL)
+
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        let log = try XCTUnwrap(document["log"] as? [String: Any])
+        let entries = try XCTUnwrap(log["entries"] as? [[String: Any]])
+        XCTAssertEqual(
+            entries.compactMap { ($0["request"] as? [String: Any])?["url"] as? String },
+            [
+                "https://first.example.com/v1/items/21?source=test",
+                "https://second.example.com/v1/items/22?source=test"
+            ]
+        )
+    }
+
+    func testViewModelExportsSelectedFlowsInRequestedVisibleOrder() async throws {
+        let first = try Self.makeFlow(
+            index: 31,
+            host: "first.example.com",
+            statusCode: 200,
+            requestBody: Data(#"{"selected":1}"#.utf8),
+            requestContentType: "application/json"
+        )
+        let second = try Self.makeFlow(
+            index: 32,
+            host: "second.example.com",
+            statusCode: 201
+        )
+        let unselected = try Self.makeFlow(
+            index: 33,
+            host: "unselected.example.com",
+            statusCode: 202
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            exportService: ExportService(bodyStore: InlineBodyStore())
+        )
+        await viewModel.prepare()
+        for flow in [first, second, unselected] {
+            viewModel.receive(.finished(flow))
+        }
+        viewModel.flushPendingEvents()
+        viewModel.selectFlows([second.id, first.id], primary: second.id)
+
+        XCTAssertEqual(viewModel.snapshot.selectedFlowIDs, [first.id, second.id])
+        XCTAssertEqual(viewModel.snapshot.selectedFlowID, second.id)
+
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "proxylens-selected-export-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directoryURL.appendingPathComponent("Selected.har")
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        try await viewModel.writeHAR(flowIDs: viewModel.snapshot.selectedFlowIDs, to: fileURL)
+
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        let log = try XCTUnwrap(document["log"] as? [String: Any])
+        let entries = try XCTUnwrap(log["entries"] as? [[String: Any]])
+        XCTAssertEqual(
+            entries.compactMap { ($0["request"] as? [String: Any])?["url"] as? String },
+            [
+                "https://first.example.com/v1/items/31?source=test",
+                "https://second.example.com/v1/items/32?source=test"
+            ]
+        )
+    }
+
+    func testViewModelBuildsComparisonForExactlyTwoFlows() async throws {
+        let first = try Self.makeFlow(
+            index: 41,
+            host: "first.example.com",
+            statusCode: 200,
+            requestBody: Data("{\n  \"value\": 1\n}".utf8),
+            responseBody: Data("first response".utf8),
+            responseContentType: "text/plain",
+            requestContentType: "application/json"
+        )
+        let second = try Self.makeFlow(
+            index: 42,
+            host: "second.example.com",
+            statusCode: 201,
+            requestBody: Data("{\n  \"value\": 2\n}".utf8),
+            responseBody: Data("second response".utf8),
+            responseContentType: "text/plain",
+            requestContentType: "application/json"
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(first))
+        viewModel.receive(.finished(second))
+        viewModel.flushPendingEvents()
+
+        let comparison = try await viewModel.comparison(
+            flowIDs: [second.id, first.id]
+        )
+
+        XCTAssertTrue(comparison.leftTitle.contains("second.example.com"))
+        XCTAssertTrue(comparison.rightTitle.contains("first.example.com"))
+        XCTAssertTrue(
+            comparison.request.rows.contains {
+                $0.leftText?.contains("\"value\": 2") == true
+                    && $0.rightText?.contains("\"value\": 1") == true
+                    && $0.kind == .modified
+            }
+        )
+        XCTAssertTrue(
+            comparison.response.rows.contains {
+                $0.leftText == "second response"
+                    && $0.rightText == "first response"
+                    && $0.kind == .modified
+            }
+        )
+
+        do {
+            _ = try await viewModel.comparison(flowIDs: [first.id])
+            XCTFail("Expected comparing fewer than two flows to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("exactly two"))
+        }
+    }
+
+    func testViewModelHydratesRenamesAndDeletesSavedSessions() async throws {
+        var session = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        session.stop(at: Date(timeIntervalSince1970: 1_100))
+        let flow = try Self.makeFlow(
+            index: 12,
+            host: "session.example.com",
+            statusCode: 200,
+            sessionID: session.id
+        )
+        let sessionService = RecordingSessionService(
+            flows: [flow],
+            sessions: [session]
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            sessionService: sessionService
+        )
+
+        await viewModel.prepare()
+
+        XCTAssertEqual(viewModel.snapshot.sessions.map(\.id), [session.id])
+        try await viewModel.renameSession(session.id, to: "Payments investigation")
+        XCTAssertEqual(viewModel.snapshot.sessions.first?.name, "Payments investigation")
+
+        viewModel.selectSource(.session(session.id))
+        viewModel.selectFlow(flow.id)
+        try await viewModel.deleteSession(session.id)
+
+        XCTAssertTrue(viewModel.snapshot.sessions.isEmpty)
+        XCTAssertEqual(viewModel.snapshot.selectedSource, .allTraffic)
+        XCTAssertEqual(viewModel.snapshot.allFlowCount, 0)
+        XCTAssertEqual(viewModel.snapshot.inspection, .empty)
+        let removedSessionIDs = await sessionService.removedSessionIDs()
+        XCTAssertEqual(removedSessionIDs, [session.id])
+    }
+
+    func testViewModelPersistsAnnotationsAndRefreshesSelectedInspector() async throws {
+        let flow = try Self.makeFlow(
+            index: 8,
+            host: "annotations.example.com",
+            statusCode: 200
+        )
+        let sessionService = RecordingSessionService(flows: [flow])
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            sessionService: sessionService
+        )
+        await viewModel.prepare()
+        viewModel.selectFlow(flow.id)
+        let annotation = try FlowAnnotation(
+            comment: "Useful response",
+            highlight: .green,
+            isStruckThrough: false
+        )
+
+        try await viewModel.updateAnnotation(annotation, for: flow.id)
+
+        XCTAssertEqual(viewModel.snapshot.visibleRows.first?.annotation, annotation)
+        XCTAssertEqual(viewModel.snapshot.inspection.annotation, annotation)
+        var annotationFilter = TrafficDisplayFilter(annotation: .green)
+        viewModel.setAnnotationFilter(annotationFilter.annotation)
+        XCTAssertEqual(viewModel.snapshot.visibleRows.map(\.id), [flow.id])
+
+        annotationFilter.annotation = .red
+        viewModel.setAnnotationFilter(annotationFilter.annotation)
         XCTAssertTrue(viewModel.snapshot.visibleRows.isEmpty)
         XCTAssertNil(viewModel.snapshot.selectedFlowID)
         XCTAssertEqual(viewModel.snapshot.inspection, .empty)
@@ -951,6 +2611,38 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
         let calls = await captureController.calls()
         XCTAssertEqual(calls, ["recover", "start", "stop"])
+    }
+
+    func testCaptureControlRefreshesSavedSessionsAfterStartAndStop() async throws {
+        let sessionService = RecordingSessionService()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            sessionService: sessionService
+        )
+
+        await viewModel.prepare()
+        let initialLoadCount = await sessionService.loadSessionsCallCount()
+        XCTAssertEqual(initialLoadCount, 1)
+
+        viewModel.toggleCapture()
+        try await waitUntil {
+            if case .running = viewModel.snapshot.capture {
+                return true
+            }
+            return false
+        }
+        let loadCountAfterStart = await sessionService.loadSessionsCallCount()
+        XCTAssertEqual(loadCountAfterStart, 2)
+
+        viewModel.toggleCapture()
+        try await waitUntil {
+            viewModel.snapshot.capture == .stopped
+        }
+        let loadCountAfterStop = await sessionService.loadSessionsCallCount()
+        XCTAssertEqual(loadCountAfterStop, 3)
     }
 
     func testCaptureControlKeepsStopAvailableAfterProxyRestoreFailure() async throws {
@@ -1413,6 +3105,29 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(composeButton.keyEquivalent, "n")
         XCTAssertEqual(composeButton.keyEquivalentModifierMask, [.command])
 
+        let rulesButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "rules.manage" }
+            )
+        )
+        XCTAssertEqual(rulesButton.accessibilityLabel(), "Manage Rules")
+        XCTAssertEqual(rulesButton.action, NSSelectorFromString("showRules"))
+
+        let importHARButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "session.import" }
+            )
+        )
+        XCTAssertEqual(importHARButton.title, "Import…")
+        XCTAssertEqual(importHARButton.accessibilityLabel(), "Import ProxyLens session or HAR file")
+        XCTAssertEqual(importHARButton.action, NSSelectorFromString("importSession:"))
+        XCTAssertEqual(importHARButton.keyEquivalent, "o")
+        XCTAssertEqual(importHARButton.keyEquivalentModifierMask, [.command])
+
         viewModel.selectFlow(flow.id)
         try await waitUntil {
             viewModel.snapshot.selectedFlowID == flow.id
@@ -1460,6 +3175,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         let pinnedDomainsStore = InMemoryTrafficPinnedDomainsStore(
             domains: ["offline.example.com"]
         )
+        let sourceListVisibilityStore = InMemoryTrafficSourceListVisibilityStore()
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
             eventSource: FinishedEventSource(),
@@ -1478,7 +3194,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
         viewModel.flushPendingEvents()
 
         let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
-        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let controller = TrafficConsoleViewController(
+            viewModel: viewModel,
+            sourceListVisibilityStore: sourceListVisibilityStore
+        )
         let window = NSWindow(
             contentRect: frame,
             styleMask: [.titled, .resizable],
@@ -1558,12 +3277,120 @@ final class ProxyLensIntegrationTests: XCTestCase {
         sourceToggle.performClick(nil)
         controller.view.layoutSubtreeIfNeeded()
         XCTAssertTrue(sourcePane.visibleRect.isEmpty)
+        XCTAssertFalse(sourceListVisibilityStore.isVisible)
         XCTAssertEqual(sourceToggle.accessibilityLabel(), "Show Source List")
 
         sourceToggle.performClick(nil)
         controller.view.layoutSubtreeIfNeeded()
         XCTAssertFalse(sourcePane.visibleRect.isEmpty)
+        XCTAssertTrue(sourceListVisibilityStore.isVisible)
         XCTAssertEqual(sourceToggle.accessibilityLabel(), "Hide Source List")
+    }
+
+    func testTrafficConsoleRendersSavedSessionsWithStateAndProtectedActions() async throws {
+        var stoppedSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        try stoppedSession.rename(to: "Payments investigation")
+        stoppedSession.stop(at: Date(timeIntervalSince1970: 1_100))
+        var recordingSession = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        try recordingSession.rename(to: "Live capture")
+        let stoppedFlow = try Self.makeFlow(
+            index: 17,
+            host: "payments.example.com",
+            statusCode: 200,
+            sessionID: stoppedSession.id
+        )
+        let recordingFlow = try Self.makeFlow(
+            index: 18,
+            host: "live.example.com",
+            statusCode: 202,
+            sessionID: recordingSession.id
+        )
+        let sessionService = RecordingSessionService(
+            flows: [stoppedFlow, recordingFlow],
+            sessions: [stoppedSession, recordingSession]
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            sessionService: sessionService
+        )
+        await viewModel.prepare()
+
+        let controller = SourceListViewController(viewModel: viewModel)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let sourceOutline = try XCTUnwrap(
+            Self.descendant(
+                of: NSOutlineView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.sources" }
+            )
+        )
+        let sourceLabels = (0..<sourceOutline.numberOfRows).compactMap { row in
+            sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                .accessibilityLabel()
+        }
+        XCTAssertTrue(sourceLabels.contains("Sessions, 2 sessions"))
+        XCTAssertTrue(
+            sourceLabels.contains("Live capture, Recording, 1 flow")
+        )
+        XCTAssertTrue(
+            sourceLabels.contains("Payments investigation, Stopped, 1 flow")
+        )
+
+        let stoppedRow = try XCTUnwrap(
+            (0..<sourceOutline.numberOfRows).first { row in
+                sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                    .accessibilityLabel()
+                    == "Payments investigation, Stopped, 1 flow"
+            }
+        )
+        sourceOutline.selectRowIndexes(IndexSet(integer: stoppedRow), byExtendingSelection: false)
+        XCTAssertEqual(viewModel.snapshot.selectedSource, .session(stoppedSession.id))
+        XCTAssertEqual(viewModel.snapshot.visibleRows.map(\.id), [stoppedFlow.id])
+        let sourceMenu = try XCTUnwrap(sourceOutline.menu)
+        controller.menuNeedsUpdate(sourceMenu)
+        XCTAssertEqual(
+            sourceMenu.items.map(\.title),
+            [
+                "Export ProxyLens Session…", "Export Session as HAR…", "",
+                "Rename Session…", "Delete Session…"
+            ]
+        )
+        XCTAssertEqual(
+            sourceMenu.items.first?.action,
+            NSSelectorFromString("exportPortableSession:")
+        )
+        XCTAssertEqual(sourceMenu.items[1].action, NSSelectorFromString("exportSessionHAR:"))
+        XCTAssertTrue(sourceMenu.items[0].isEnabled)
+        XCTAssertTrue(sourceMenu.items[1].isEnabled)
+        XCTAssertTrue(sourceMenu.items[3].isEnabled)
+        XCTAssertTrue(sourceMenu.items[4].isEnabled)
+
+        let recordingRow = try XCTUnwrap(
+            (0..<sourceOutline.numberOfRows).first { row in
+                sourceOutline.view(atColumn: 0, row: row, makeIfNecessary: true)?
+                    .accessibilityLabel()
+                    == "Live capture, Recording, 1 flow"
+            }
+        )
+        sourceOutline.selectRowIndexes(
+            IndexSet(integer: recordingRow),
+            byExtendingSelection: false
+        )
+        controller.menuNeedsUpdate(sourceMenu)
+        XCTAssertTrue(sourceMenu.items[0].isEnabled)
+        XCTAssertTrue(sourceMenu.items[1].isEnabled)
+        XCTAssertFalse(sourceMenu.items[3].isEnabled)
+        XCTAssertFalse(sourceMenu.items[4].isEnabled)
     }
 
     func testTrafficConsoleRendersSplitMessageInspector() async throws {
@@ -1599,7 +3426,12 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 host: "api.example.com",
                 statusCode: 404,
                 requestBody: Data("{\"query\":\"proxylens\"}".utf8),
-                responseBody: Data("{\"error\":\"not found\"}".utf8)
+                responseBody: Data("{\"error\":\"not found\"}".utf8),
+                requestCookieValues: ["session=abc123; theme=dark; token=a=b"],
+                responseSetCookieValues: [
+                    "session=updated; Path=/; HttpOnly; Secure",
+                    "theme=light; Max-Age=3600; SameSite=Lax"
+                ]
             ),
             Self.makeFlow(index: 4, host: "auth.example.net", statusCode: 500)
         ]
@@ -1634,7 +3466,11 @@ final class ProxyLensIntegrationTests: XCTestCase {
         controller.view.displayIfNeeded()
 
         let sourceOutline = try XCTUnwrap(
-            Self.descendant(of: NSOutlineView.self, in: controller.view)
+            Self.descendant(
+                of: NSOutlineView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.sources" }
+            )
         )
         let flowTable = try XCTUnwrap(
             Self.descendant(
@@ -1642,6 +3478,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 in: controller.view,
                 matching: { !($0 is NSOutlineView) }
             )
+        )
+        XCTAssertEqual(
+            flowTable.tableColumns.map(\.title),
+            ["Method", "Host", "Path", "Query", "Status", "Time", "Duration", "Size"]
         )
         let requestInspector = try XCTUnwrap(
             Self.descendant(
@@ -1758,7 +3598,12 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertLessThanOrEqual(requestPaneFrame.maxX, responsePaneFrame.minX)
         XCTAssertEqual(requestPaneFrame.minY, responsePaneFrame.minY, accuracy: 1)
         XCTAssertEqual(requestPaneFrame.height, responsePaneFrame.height, accuracy: 1)
-        XCTAssertEqual(requestPaneFrame.width, responsePaneFrame.width, accuracy: 2)
+        XCTAssertEqual(
+            requestPaneFrame.width,
+            responsePaneFrame.width,
+            accuracy: 2,
+            "request=\(requestPaneFrame) response=\(responsePaneFrame) split=\(messageSplit.bounds) inspector=\(inspectorPane.bounds)"
+        )
 
         let modeSelector = try XCTUnwrap(
             Self.descendant(
@@ -1785,6 +3630,24 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
+        let requestCompactSectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.section.compact"
+                }
+            )
+        )
+        let responseCompactSectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.section.compact"
+                }
+            )
+        )
         let summaryMethod = Self.descendant(
             of: NSTextField.self,
             in: controller.view,
@@ -1801,19 +3664,26 @@ final class ProxyLensIntegrationTests: XCTestCase {
             matching: { $0.accessibilityIdentifier() == "inspector.summary.url" }
         )
         XCTAssertLessThan(modeSelector.frame.width, inspectorPaneFrame.width / 2)
-        XCTAssertLessThan(requestSectionSelector.frame.width, requestPaneFrame.width)
-        XCTAssertLessThan(responseSectionSelector.frame.width, responsePaneFrame.width)
+        XCTAssertTrue(requestSectionSelector.isHidden)
+        XCTAssertFalse(requestCompactSectionSelector.isHidden)
+        XCTAssertEqual(requestCompactSectionSelector.selectedItem?.title, "Headers")
+        XCTAssertTrue(responseSectionSelector.isHidden)
+        XCTAssertFalse(responseCompactSectionSelector.isHidden)
+        XCTAssertEqual(responseCompactSectionSelector.selectedItem?.title, "Headers")
         XCTAssertEqual(
             (0..<requestSectionSelector.segmentCount).map {
                 requestSectionSelector.label(forSegment: $0)
             },
-            ["Headers", "Query", "Body", "JSON", "Raw"]
+            [
+                "Headers", "Query", "Cookies", "Body", "JSON", "JSONPath", "Tree", "XML",
+                "Form", "GraphQL", "Raw"
+            ]
         )
         XCTAssertEqual(
             (0..<responseSectionSelector.segmentCount).map {
                 responseSectionSelector.label(forSegment: $0)
             },
-            ["Headers", "Body", "JSON", "Raw"]
+            ["Headers", "Cookies", "Body", "JSON", "JSONPath", "Tree", "XML", "Form", "Raw"]
         )
         XCTAssertEqual(summaryMethod?.stringValue, "POST")
         XCTAssertEqual(summaryStatus?.stringValue, "404 Result")
@@ -1825,11 +3695,26 @@ final class ProxyLensIntegrationTests: XCTestCase {
             "traffic.filter.method",
             "traffic.filter.status",
             "traffic.filter.contentType",
-            "traffic.filter.source"
+            "traffic.filter.source",
+            "traffic.filter.annotation"
         ] {
             XCTAssertNotNil(
                 Self.descendant(
                     of: NSPopUpButton.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == identifier }
+                )
+            )
+        }
+        for identifier in [
+            "inspector.annotation.comment",
+            "inspector.annotation.highlight",
+            "inspector.annotation.strikethrough",
+            "inspector.annotation.save"
+        ] {
+            XCTAssertNotNil(
+                Self.descendant(
+                    of: NSControl.self,
                     in: controller.view,
                     matching: { $0.accessibilityIdentifier() == identifier }
                 )
@@ -1866,8 +3751,35 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(requestInspector.string, "source=test")
 
-        if requestSectionSelector.segmentCount > 4 {
-            requestSectionSelector.selectedSegment = 4
+        requestSectionSelector.selectedSegment = 2
+        XCTAssertTrue(
+            requestSectionSelector.sendAction(
+                requestSectionSelector.action,
+                to: requestSectionSelector.target
+            )
+        )
+        XCTAssertEqual(
+            requestInspector.string,
+            "session=abc123\ntheme=dark\ntoken=a=b"
+        )
+
+        responseSectionSelector.selectedSegment = 1
+        XCTAssertTrue(
+            responseSectionSelector.sendAction(
+                responseSectionSelector.action,
+                to: responseSectionSelector.target
+            )
+        )
+        XCTAssertEqual(
+            responseInspector.string,
+            "session=updated\n  Path=/\n  HttpOnly\n  Secure\n\n"
+                + "theme=light\n  Max-Age=3600\n  SameSite=Lax"
+        )
+
+        if let rawIndex = (0..<requestSectionSelector.segmentCount).first(where: {
+            requestSectionSelector.label(forSegment: $0) == "Raw"
+        }) {
+            requestSectionSelector.selectedSegment = rawIndex
             XCTAssertTrue(
                 requestSectionSelector.sendAction(
                     requestSectionSelector.action,
@@ -1882,8 +3794,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
             XCTFail("Request inspector is missing its Raw tab")
         }
 
-        if responseSectionSelector.segmentCount > 3 {
-            responseSectionSelector.selectedSegment = 3
+        if let rawIndex = (0..<responseSectionSelector.segmentCount).first(where: {
+            responseSectionSelector.label(forSegment: $0) == "Raw"
+        }) {
+            responseSectionSelector.selectedSegment = rawIndex
             XCTAssertTrue(
                 responseSectionSelector.sendAction(
                     responseSectionSelector.action,
@@ -1960,9 +3874,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         try await Task.sleep(for: .milliseconds(100))
         window.contentView?.layoutSubtreeIfNeeded()
-        XCTAssertLessThanOrEqual(controller.view.fittingSize.width, frame.width)
+        XCTAssertEqual(controller.view.frame.width, frame.width, accuracy: 1)
+        XCTAssertEqual(window.contentView?.frame.width ?? 0, frame.width, accuracy: 1)
 
-        for identifier in [
+        for identifierPrefix in [
             "inspector.request.section",
             "inspector.response.section"
         ] {
@@ -1970,13 +3885,24 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 Self.descendant(
                     of: NSSegmentedControl.self,
                     in: controller.view,
-                    matching: { $0.accessibilityIdentifier() == identifier }
+                    matching: { $0.accessibilityIdentifier() == identifierPrefix }
                 )
             )
-            let selectorFrame = sectionSelector.convert(
-                sectionSelector.bounds,
+            let sectionPopup = try XCTUnwrap(
+                Self.descendant(
+                    of: NSPopUpButton.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == "\(identifierPrefix).compact" }
+                )
+            )
+            let visibleSelector: NSView =
+                sectionSelector.isHiddenOrHasHiddenAncestor ? sectionPopup : sectionSelector
+            XCTAssertFalse(visibleSelector.isHiddenOrHasHiddenAncestor)
+            let selectorFrame = visibleSelector.convert(
+                visibleSelector.bounds,
                 to: controller.view
             )
+            XCTAssertGreaterThanOrEqual(selectorFrame.minX, controller.view.bounds.minX)
             XCTAssertLessThanOrEqual(selectorFrame.maxX, controller.view.bounds.maxX)
         }
 
@@ -2048,6 +3974,186 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertTrue(inspector.string.contains("requestHeaders"))
     }
 
+    func testTimingInspectionBuildsAClampedWaterfallFromCapturedMilestones() throws {
+        var flow = try Self.makeFlow(index: 8, host: "timing.example.com", statusCode: 200)
+        let startedAt = flow.timing.startedAt
+        flow.markRequestHeadersReceived(at: startedAt.addingTimeInterval(0.010))
+        flow.markRequestBodyCompleted(at: startedAt.addingTimeInterval(0.030))
+        flow.markUpstreamConnected(at: startedAt.addingTimeInterval(0.050))
+        flow.markTLSHandshakeCompleted(at: startedAt.addingTimeInterval(0.080))
+        flow.markResponseHeadersReceived(at: startedAt.addingTimeInterval(0.200))
+        flow.markResponseBodyCompleted(at: startedAt.addingTimeInterval(0.240))
+        flow.markCompleted(at: startedAt.addingTimeInterval(0.250))
+
+        let timing = TrafficTimingInspection(flow: flow)
+
+        XCTAssertEqual(timing.elapsedDuration, 0.250, accuracy: 0.000_1)
+        XCTAssertEqual(timing.totalDuration, 0.250, accuracy: 0.000_1)
+        XCTAssertEqual(try XCTUnwrap(timing.timeToFirstByte), 0.200, accuracy: 0.000_1)
+        XCTAssertTrue(timing.isComplete)
+        XCTAssertEqual(
+            timing.phases.map(\.kind),
+            [
+                .requestHeaders, .requestBody, .connection, .tls, .waiting, .responseBody,
+                .finalization
+            ]
+        )
+        XCTAssertEqual(timing.phases[1].startOffset, 0.010, accuracy: 0.000_1)
+        XCTAssertEqual(timing.phases[1].duration, 0.020, accuracy: 0.000_1)
+        XCTAssertEqual(timing.phases[4].startOffset, 0.080, accuracy: 0.000_1)
+        XCTAssertEqual(timing.phases[4].duration, 0.120, accuracy: 0.000_1)
+    }
+
+    func testTimingInspectionKeepsIncompleteFlowsTruthful() throws {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        var headers = HTTPHeaders()
+        try headers.append(name: "Host", value: "pending.example.com")
+        var flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(
+                method: .post,
+                url: try XCTUnwrap(URL(string: "https://pending.example.com/upload")),
+                headers: headers
+            ),
+            startedAt: startedAt
+        )
+        flow.markRequestHeadersReceived(at: startedAt.addingTimeInterval(0.010))
+        flow.markRequestBodyCompleted(at: startedAt.addingTimeInterval(0.020))
+
+        let timing = TrafficTimingInspection(flow: flow)
+
+        XCTAssertFalse(timing.isComplete)
+        XCTAssertNil(timing.timeToFirstByte)
+        XCTAssertEqual(timing.totalDuration, 0.020, accuracy: 0.000_1)
+        XCTAssertEqual(timing.phases.map(\.kind), [.requestHeaders, .requestBody])
+    }
+
+    func testInspectorGivesVerticalSlackToMessagePanes() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(index: 11, host: "layout.example.com", statusCode: 200)
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.appearance = NSAppearance(named: .aqua)
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        controller.view.frame = NSRect(origin: .zero, size: frame.size)
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        window.contentView?.layoutSubtreeIfNeeded()
+        controller.view.displayIfNeeded()
+
+        let inspectorPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "traffic.pane.inspector" }
+            )
+        )
+        let annotationBar = try XCTUnwrap(
+            Self.descendant(of: FlowAnnotationBar.self, in: controller.view)
+        )
+        let messagesSplit = try XCTUnwrap(
+            Self.descendant(
+                of: NSSplitView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.split.messages" }
+            )
+        )
+
+        XCTAssertFalse(annotationBar.isHidden)
+        XCTAssertLessThanOrEqual(
+            annotationBar.frame.height,
+            annotationBar.fittingSize.height + 1
+        )
+        XCTAssertGreaterThan(messagesSplit.frame.height, inspectorPane.frame.height * 0.7)
+    }
+
+    func testInspectorShowsTimingWaterfallForTheSelectedFlow() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        var flow = try Self.makeFlow(index: 9, host: "timing.example.com", statusCode: 200)
+        let startedAt = flow.timing.startedAt
+        flow.markRequestHeadersReceived(at: startedAt.addingTimeInterval(0.010))
+        flow.markRequestBodyCompleted(at: startedAt.addingTimeInterval(0.030))
+        flow.markUpstreamConnected(at: startedAt.addingTimeInterval(0.050))
+        flow.markTLSHandshakeCompleted(at: startedAt.addingTimeInterval(0.080))
+        flow.markResponseHeadersReceived(at: startedAt.addingTimeInterval(0.200))
+        flow.markResponseBodyCompleted(at: startedAt.addingTimeInterval(0.240))
+        flow.markCompleted(at: startedAt.addingTimeInterval(0.250))
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let modeSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.mode" }
+            )
+        )
+        XCTAssertEqual(
+            (0..<modeSelector.segmentCount).map { modeSelector.label(forSegment: $0) },
+            ["Content", "Rules", "Timing", "Frames"]
+        )
+        modeSelector.selectedSegment = 2
+        modeSelector.sendAction(modeSelector.action, to: modeSelector.target)
+
+        let timingView = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.timing" }
+            )
+        )
+        let totalField = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: timingView,
+                matching: { $0.accessibilityIdentifier() == "inspector.timing.total" }
+            )
+        )
+        let waitingField = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: timingView,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.timing.waiting.duration"
+                }
+            )
+        )
+        XCTAssertFalse(timingView.isHidden)
+        XCTAssertEqual(totalField.stringValue, "250 ms")
+        XCTAssertEqual(waitingField.stringValue, "120 ms")
+    }
+
     func testInspectorShowsDerivedJSONWithoutReplacingRawBody() async throws {
         let compact = #"{"z":1,"a":2}"#
         let viewModel = TrafficConsoleViewModel(
@@ -2091,10 +4197,35 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertEqual(sectionSelector.segmentCount, 4)
-        XCTAssertEqual(sectionSelector.label(forSegment: 2), "JSON")
+        XCTAssertEqual(
+            (0..<sectionSelector.segmentCount).map {
+                sectionSelector.label(forSegment: $0) ?? ""
+            },
+            ["Headers", "Cookies", "Body", "JSON", "JSONPath", "Tree", "XML", "Form", "Raw"]
+        )
 
-        sectionSelector.selectedSegment = 1
+        let bodySegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Body"
+            }
+        )
+        let jsonSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "JSON"
+            }
+        )
+        let treeSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Tree"
+            }
+        )
+        let jsonPathSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "JSONPath"
+            }
+        )
+
+        sectionSelector.selectedSegment = bodySegment
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         let inspector = try XCTUnwrap(
             Self.descendant(
@@ -2107,7 +4238,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         XCTAssertTrue(inspector.string.contains(compact))
 
-        sectionSelector.selectedSegment = 2
+        sectionSelector.selectedSegment = jsonSegment
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertTrue(inspector.string.contains(#""a""#))
         XCTAssertTrue(inspector.string.contains(#""z""#))
@@ -2121,6 +4252,761 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 effectiveRange: nil
             ) as? NSColor
         XCTAssertEqual(keyColor, InspectorSyntaxPalette.key)
+
+        sectionSelector.selectedSegment = jsonPathSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        let jsonPathQuery = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.jsonpath.query"
+                }
+            )
+        )
+        let jsonPathRun = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.jsonpath.run"
+                }
+            )
+        )
+        let jsonPathResult = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.jsonpath.result"
+                }
+            )
+        )
+        jsonPathQuery.stringValue = "$.z"
+        jsonPathRun.sendAction(jsonPathRun.action, to: jsonPathRun.target)
+        XCTAssertTrue(jsonPathResult.string.contains("$.z"))
+        XCTAssertTrue(jsonPathResult.string.contains("1"))
+
+        sectionSelector.selectedSegment = treeSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        let tree = try XCTUnwrap(
+            Self.descendant(
+                of: NSOutlineView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.response.tree"
+                }
+            )
+        )
+        XCTAssertFalse(tree.isHiddenOrHasHiddenAncestor)
+        XCTAssertTrue(inspector.enclosingScrollView?.isHidden ?? false)
+        XCTAssertGreaterThanOrEqual(tree.numberOfRows, 3)
+
+        sectionSelector.selectedSegment = bodySegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        XCTAssertTrue(inspector.string.contains(compact))
+        XCTAssertFalse(inspector.enclosingScrollView?.isHidden ?? true)
+        XCTAssertTrue(tree.isHiddenOrHasHiddenAncestor)
+    }
+
+    func testInspectorShowsDerivedXMLAndFormViewsWithoutReplacingRawBodies() async throws {
+        let compactXML = #"<root><item id="1">Ada</item></root>"#
+        let compactForm = "name=ProxyLens+App&tag=one&tag=two"
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 5,
+            host: "api.example.com",
+            statusCode: 200,
+            requestBody: Data(compactXML.utf8),
+            responseBody: Data(compactForm.utf8),
+            responseContentType: "application/x-www-form-urlencoded",
+            requestContentType: "application/xml"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            guard case .content(_, let xml) = viewModel.snapshot.inspection.request?.xml,
+                case .content(_, let form) = viewModel.snapshot.inspection.response?.form,
+                case .content(_, let requestBody) = viewModel.snapshot.inspection.request?.body,
+                case .content(_, let responseBody) = viewModel.snapshot.inspection.response?.body
+            else {
+                return false
+            }
+            return xml.contains("<item id=\"1\">")
+                && form.contains("name=ProxyLens App")
+                && requestBody.contains(compactXML)
+                && responseBody.contains(compactForm)
+        }
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+
+        for (prefix, section, token, expectedColor) in [
+            ("request", "XML", "root", InspectorSyntaxPalette.key),
+            ("response", "Form", "ProxyLens App", InspectorSyntaxPalette.string)
+        ] {
+            let sectionSelector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSSegmentedControl.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "inspector.\(prefix).section"
+                    }
+                )
+            )
+            let segment = try XCTUnwrap(
+                (0..<sectionSelector.segmentCount).first {
+                    sectionSelector.label(forSegment: $0) == section
+                }
+            )
+            sectionSelector.selectedSegment = segment
+            sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+            let inspector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSTextView.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "inspector.\(prefix).content"
+                    }
+                )
+            )
+            XCTAssertFalse(inspector.isEditable)
+            let tokenRange = try XCTUnwrap(inspector.string.range(of: token))
+            let tokenColor =
+                inspector.textStorage?.attribute(
+                    .foregroundColor,
+                    at: NSRange(tokenRange, in: inspector.string).location,
+                    effectiveRange: nil
+                ) as? NSColor
+            XCTAssertEqual(tokenColor, expectedColor)
+
+            if section == "XML" {
+                XCTAssertTrue(inspector.string.contains("\n"))
+            } else {
+                XCTAssertTrue(inspector.string.contains("tag=one\ntag=two"))
+            }
+        }
+    }
+
+    func testWebSocketInspectorLoadsFrameMetadataAndSelectedJSONPayload() async throws {
+        var flow = try Self.makeFlow(
+            index: 9,
+            host: "socket.example.com",
+            statusCode: 101
+        )
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: .secureWebSocket,
+                upstreamHost: "socket.example.com",
+                upstreamPort: 443,
+                tlsIntercepted: true
+            )
+        )
+        let requestPayload = Data(#"{"action":"subscribe","channel":"orders"}"#.utf8)
+        let responsePayload = Data(#"{"event":"ready","ok":true}"#.utf8)
+        let requestFrame = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 1,
+            direction: .clientToServer,
+            opcode: .text,
+            isFinal: true,
+            wasMasked: true,
+            payload: BodyReference(
+                inline: requestPayload,
+                metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+            ),
+            receivedAt: Date(timeIntervalSince1970: 9.1)
+        )
+        let responseFrame = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 2,
+            direction: .serverToClient,
+            opcode: .text,
+            isFinal: true,
+            payload: BodyReference(
+                inline: responsePayload,
+                metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+            ),
+            receivedAt: Date(timeIntervalSince1970: 9.2)
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            webSocketFrameLoader: StaticWebSocketFrameLoader(
+                frames: [requestFrame, responseFrame]
+            )
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        try await waitUntil {
+            guard let webSocket = viewModel.snapshot.inspection.webSocket,
+                webSocket.frames.count == 2,
+                webSocket.selectedFrameID == requestFrame.id,
+                case .content(_, let payload) = webSocket.payload
+            else {
+                return false
+            }
+            return payload.contains(#""action" : "subscribe""#)
+        }
+
+        let webSocket = try XCTUnwrap(viewModel.snapshot.inspection.webSocket)
+        XCTAssertEqual(webSocket.frames.map(\.direction), [.clientToServer, .serverToClient])
+        XCTAssertEqual(webSocket.frames.map(\.opcodeLabel), ["Text", "Text"])
+        XCTAssertEqual(webSocket.payloadSyntax, .json)
+        XCTAssertEqual(webSocket.omittedFrameCount, 0)
+
+        let controller = InspectorViewController(viewModel: viewModel)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let modeSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.mode" }
+            )
+        )
+        XCTAssertTrue(modeSelector.isEnabled(forSegment: 3))
+        modeSelector.selectedSegment = 3
+        modeSelector.sendAction(modeSelector.action, to: modeSelector.target)
+
+        let frameTable = try XCTUnwrap(
+            Self.descendant(
+                of: NSTableView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.websocket.frames"
+                }
+            )
+        )
+        XCTAssertFalse(frameTable.isHidden)
+        XCTAssertEqual(frameTable.numberOfRows, 2)
+        XCTAssertEqual(frameTable.selectedRow, 0)
+
+        let payloadView = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.websocket.payload"
+                }
+            )
+        )
+        XCTAssertTrue(payloadView.string.contains(#""channel" : "orders""#))
+        let keyRange = try XCTUnwrap(payloadView.string.range(of: #""action""#))
+        let keyColor =
+            payloadView.textStorage?.attribute(
+                .foregroundColor,
+                at: NSRange(keyRange, in: payloadView.string).location,
+                effectiveRange: nil
+            ) as? NSColor
+        XCTAssertEqual(keyColor, InspectorSyntaxPalette.key)
+
+        let directionFilter = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.websocket.direction"
+                }
+            )
+        )
+        XCTAssertEqual(directionFilter.segmentCount, 3)
+        XCTAssertEqual(
+            (0..<directionFilter.segmentCount).compactMap {
+                directionFilter.label(forSegment: $0)
+            },
+            ["All", "Sent", "Received"]
+        )
+
+        let searchField = try XCTUnwrap(
+            Self.descendant(
+                of: NSSearchField.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.websocket.search"
+                }
+            )
+        )
+        XCTAssertEqual(searchField.placeholderString, "Search frame payloads")
+
+        directionFilter.selectedSegment = 1
+        directionFilter.sendAction(directionFilter.action, to: directionFilter.target)
+        XCTAssertEqual(
+            viewModel.snapshot.inspection.webSocket?.frames.map(\.id),
+            [requestFrame.id]
+        )
+        searchField.stringValue = "orders"
+        searchField.sendAction(searchField.action, to: searchField.target)
+        try await waitUntil {
+            guard let webSocket = viewModel.snapshot.inspection.webSocket else {
+                return false
+            }
+            return !webSocket.isSearching
+                && webSocket.frames.map(\.id) == [requestFrame.id]
+        }
+
+        let exportButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.websocket.export"
+                }
+            )
+        )
+        XCTAssertTrue(exportButton.isEnabled)
+    }
+
+    func testWebSocketInspectorStreamsFramesAndBoundsVisibleHistory() async throws {
+        var flow = try Self.makeFlow(
+            index: 10,
+            host: "stream.example.com",
+            statusCode: 101
+        )
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: .webSocket,
+                upstreamHost: "stream.example.com",
+                upstreamPort: 80
+            )
+        )
+        let frameEvents = WebSocketFrameEventBus()
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            webSocketFrameLoader: StaticWebSocketFrameLoader(frames: []),
+            webSocketFrameEventSource: frameEvents,
+            maximumVisibleWebSocketFrames: 2
+        )
+        await viewModel.prepare()
+        try await waitUntilAsync {
+            await frameEvents.subscriptionCount() == 1
+        }
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        let frames = (1...3).map { sequenceNumber in
+            CapturedWebSocketFrame(
+                flowID: flow.id,
+                sequenceNumber: Int64(sequenceNumber),
+                direction: sequenceNumber.isMultiple(of: 2)
+                    ? .serverToClient
+                    : .clientToServer,
+                opcode: .text,
+                isFinal: true,
+                payload: BodyReference(
+                    inline: Data(#"{"sequence":\#(sequenceNumber)}"#.utf8),
+                    metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+                ),
+                receivedAt: Date(timeIntervalSince1970: TimeInterval(sequenceNumber))
+            )
+        }
+        for frame in frames {
+            await frameEvents.publish(frame)
+        }
+
+        try await waitUntil {
+            guard let webSocket = viewModel.snapshot.inspection.webSocket else {
+                return false
+            }
+            guard case .content = webSocket.payload else {
+                return false
+            }
+            return webSocket.frames.map(\.sequenceNumber) == [2, 3]
+                && webSocket.omittedFrameCount == 1
+                && webSocket.selectedFrameID == frames[1].id
+        }
+
+        let webSocket = try XCTUnwrap(viewModel.snapshot.inspection.webSocket)
+        XCTAssertEqual(
+            webSocket.statusMessage,
+            "Showing the latest 2 frames; 1 earlier frame is hidden."
+        )
+        guard case .content(_, let payload) = webSocket.payload else {
+            return XCTFail("Expected the newly selected frame payload")
+        }
+        XCTAssertTrue(payload.contains(#""sequence" : 2"#))
+    }
+
+    func testWebSocketInspectorFiltersSentAndReceivedFramesWithoutLosingPayloadSelection()
+        async throws
+    {
+        var flow = try Self.makeFlow(index: 11, host: "filters.example.com", statusCode: 101)
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: .webSocket,
+                upstreamHost: "filters.example.com",
+                upstreamPort: 80
+            )
+        )
+        let sent = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 1,
+            direction: .clientToServer,
+            opcode: .text,
+            isFinal: true,
+            payload: BodyReference(inline: Data(#"{"kind":"sent"}"#.utf8))
+        )
+        let received = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 2,
+            direction: .serverToClient,
+            opcode: .text,
+            isFinal: true,
+            payload: BodyReference(inline: Data(#"{"kind":"received"}"#.utf8))
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            webSocketFrameLoader: StaticWebSocketFrameLoader(frames: [sent, received])
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil { viewModel.snapshot.inspection.webSocket?.frames.count == 2 }
+
+        viewModel.setWebSocketDirectionFilter(.sent)
+        var webSocket = try XCTUnwrap(viewModel.snapshot.inspection.webSocket)
+        XCTAssertEqual(webSocket.frames.map(\.id), [sent.id])
+        XCTAssertEqual(webSocket.selectedFrameID, sent.id)
+        XCTAssertEqual(webSocket.directionFilter, .sent)
+
+        viewModel.setWebSocketDirectionFilter(.received)
+        try await waitUntil {
+            guard let webSocket = viewModel.snapshot.inspection.webSocket,
+                webSocket.frames.map(\.id) == [received.id],
+                webSocket.selectedFrameID == received.id,
+                case .content(_, let payload) = webSocket.payload
+            else {
+                return false
+            }
+            return payload.contains(#""received""#)
+        }
+    }
+
+    func testWebSocketInspectorSearchesPayloadsWithinExplicitByteLimits() async throws {
+        var flow = try Self.makeFlow(index: 12, host: "search.example.com", statusCode: 101)
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: .secureWebSocket,
+                upstreamHost: "search.example.com",
+                upstreamPort: 443,
+                tlsIntercepted: true
+            )
+        )
+        let matchingPayload = Data(#"{"event":"order.ready"}"#.utf8)
+        let matching = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 1,
+            direction: .serverToClient,
+            opcode: .text,
+            isFinal: true,
+            payload: BodyReference(inline: matchingPayload)
+        )
+        let oversizedBodyID = BodyID()
+        let oversizedReference = try BodyReference(
+            externalID: oversizedBodyID,
+            byteCount: 512,
+            metadata: BodyMetadata(contentType: "text/plain")
+        )
+        let oversized = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 2,
+            direction: .clientToServer,
+            opcode: .text,
+            isFinal: true,
+            payload: oversizedReference
+        )
+        let bodyReader = TrackingTrafficBodyReader(
+            externalPayloads: [oversizedBodyID: Data("order.ready".utf8)]
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: bodyReader,
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            webSocketFrameLoader: StaticWebSocketFrameLoader(frames: [matching, oversized]),
+            maximumWebSocketSearchBytes: 64,
+            maximumWebSocketSearchBytesPerFrame: 32
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil { viewModel.snapshot.inspection.webSocket?.frames.count == 2 }
+
+        viewModel.setWebSocketSearchText("ORDER.READY")
+
+        try await waitUntil {
+            guard let webSocket = viewModel.snapshot.inspection.webSocket else {
+                return false
+            }
+            return !webSocket.isSearching
+                && webSocket.frames.map(\.id) == [matching.id]
+                && webSocket.statusMessage
+                    == "1 of 2 captured frames match. 1 large payload skipped."
+        }
+        let readIDs = await bodyReader.readIDs()
+        XCTAssertFalse(readIDs.contains(oversizedBodyID))
+    }
+
+    func testWebSocketExportLoadsTheCompleteFlowHistoryBeyondTheInspectorLimit() async throws {
+        var flow = try Self.makeFlow(index: 13, host: "export.example.com", statusCode: 101)
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: .webSocket,
+                upstreamHost: "export.example.com",
+                upstreamPort: 80
+            )
+        )
+        let frames = (1...2).map { sequenceNumber in
+            CapturedWebSocketFrame(
+                flowID: flow.id,
+                sequenceNumber: Int64(sequenceNumber),
+                direction: .clientToServer,
+                opcode: .text,
+                isFinal: true,
+                payload: BodyReference(
+                    inline: Data(#"{"sequence":\#(sequenceNumber)}"#.utf8)
+                )
+            )
+        }
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            webSocketFrameLoader: StaticWebSocketFrameLoader(frames: frames),
+            maximumVisibleWebSocketFrames: 1,
+            exportService: ExportService(bodyStore: InlineBodyStore())
+        )
+        await viewModel.prepare()
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "proxylens-complete-websocket-export-\(UUID().uuidString).json"
+        )
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        try await viewModel.writeWebSocketFrames(flowID: flow.id, to: destination)
+
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: destination))
+                as? [String: Any]
+        )
+        let exportedFrames = try XCTUnwrap(document["frames"] as? [[String: Any]])
+        XCTAssertEqual(exportedFrames.count, 2)
+    }
+
+    func testInspectorShowsMultipartFieldsInTheExistingFormView() async throws {
+        let boundary = "ProxyLensBoundary"
+        let multipartText = [
+            "--\(boundary)\r\n",
+            "Content-Disposition: form-data; name=\"title\"\r\n\r\n",
+            "ProxyLens\r\n",
+            "--\(boundary)\r\n",
+            "Content-Disposition: form-data; name=\"attachment\"; ",
+            "filename=\"trace.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "captured bytes\r\n",
+            "--\(boundary)--\r\n"
+        ].joined()
+        let multipart = Data(multipartText.utf8)
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 7,
+            host: "upload.example.com",
+            statusCode: 201,
+            requestBody: multipart,
+            requestContentType: "multipart/form-data; boundary=\(boundary)"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            guard case .content(_, let form) = viewModel.snapshot.inspection.request?.form,
+                case .content(_, let body) = viewModel.snapshot.inspection.request?.body
+            else {
+                return false
+            }
+            return form.contains("title=ProxyLens")
+                && form.contains("attachment=[File \"trace.txt\", text/plain, 14 B]")
+                && body.contains("--\(boundary)")
+                && body.contains("captured bytes")
+        }
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.section"
+                }
+            )
+        )
+        let formSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Form"
+            }
+        )
+        sectionSelector.selectedSegment = formSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+        let inspector = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.content"
+                }
+            )
+        )
+        XCTAssertFalse(inspector.isEditable)
+        XCTAssertTrue(inspector.string.contains("title=ProxyLens"))
+        XCTAssertTrue(inspector.string.contains("attachment=[File"))
+        XCTAssertFalse(inspector.string.contains("captured bytes"))
+    }
+
+    func testInspectorShowsFormattedGraphQLWithoutReplacingRawJSON() async throws {
+        let compact =
+            #"{"operationName":"GetUser","query":"query GetUser($id: ID!) { user(id: $id) { id name } }","variables":{"id":"42"}}"#
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 8,
+            host: "graphql.example.com",
+            statusCode: 200,
+            requestBody: Data(compact.utf8),
+            requestContentType: "application/json"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            guard
+                case .content(_, let graphql) =
+                    viewModel.snapshot.inspection.request?.graphql,
+                case .content(_, let body) = viewModel.snapshot.inspection.request?.body
+            else {
+                return false
+            }
+            return graphql.contains("Operation: GetUser")
+                && graphql.contains("    id\n    name")
+                && body.contains(compact)
+        }
+
+        let controller = InspectorViewController()
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.section"
+                }
+            )
+        )
+        let graphqlSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "GraphQL"
+            }
+        )
+        sectionSelector.selectedSegment = graphqlSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+        let inspector = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.content"
+                }
+            )
+        )
+        XCTAssertFalse(inspector.isEditable)
+        XCTAssertTrue(inspector.string.contains("Operation: GetUser"))
+        XCTAssertTrue(inspector.string.contains("Variables:\n"))
+        XCTAssertFalse(inspector.string.contains(compact))
+        let keywordRange = try XCTUnwrap(inspector.string.range(of: "query GetUser"))
+        let keywordColor =
+            inspector.textStorage?.attribute(
+                .foregroundColor,
+                at: NSRange(keywordRange, in: inspector.string).location,
+                effectiveRange: nil
+            ) as? NSColor
+        XCTAssertEqual(keywordColor, InspectorSyntaxPalette.literal)
+    }
+
+    func testJSONTreeBuilderClassifiesValuesAndBoundsTheTree() throws {
+        let presentation = TrafficJSONTreeBuilder.build(
+            #"{"enabled":true,"items":[1,null,"two"]}"#
+        )
+        guard case .content(let root) = presentation else {
+            return XCTFail("Expected a JSON tree")
+        }
+        XCTAssertEqual(root.key, "JSON")
+        XCTAssertEqual(root.value, "{2 keys}")
+        XCTAssertEqual(root.children.map(\.key), ["enabled", "items"])
+        XCTAssertEqual(root.children[0].kind, .literal)
+        XCTAssertEqual(root.children[0].value, "true")
+        XCTAssertEqual(root.children[1].children.map(\.value), ["1", "null", #""two""#])
+
+        let bounded = TrafficJSONTreeBuilder.build(
+            #"{"a":1,"b":2,"c":3}"#,
+            maximumNodeCount: 3
+        )
+        guard case .content(let boundedRoot) = bounded else {
+            return XCTFail("Expected a bounded JSON tree")
+        }
+        XCTAssertEqual(boundedRoot.children.count, 2)
+        XCTAssertEqual(boundedRoot.children.last?.kind, .notice)
+        XCTAssertEqual(boundedRoot.children.last?.value, "More values omitted")
     }
 
     func testInspectorHighlightsBodyFromDeclaredContentTypeWithoutColoringMetadata() throws {
@@ -2272,11 +5158,22 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
 
-        sectionSelector.selectedSegment = 3
+        let bodySegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Body"
+            }
+        )
+        let jsonSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "JSON"
+            }
+        )
+
+        sectionSelector.selectedSegment = jsonSegment
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertTrue(inspector.string.contains(pretty))
 
-        sectionSelector.selectedSegment = 2
+        sectionSelector.selectedSegment = bodySegment
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertEqual(inspector.string, compact)
         XCTAssertFalse(inspector.string.contains(pretty))
@@ -2303,13 +5200,19 @@ final class ProxyLensIntegrationTests: XCTestCase {
         source: FlowSource = .desktopProxy,
         requestHeaderValue: String? = nil,
         requestContentType: String = "text/plain",
-        requestContentEncoding: String? = nil
+        requestContentEncoding: String? = nil,
+        requestCookieValues: [String] = [],
+        responseSetCookieValues: [String] = [],
+        sessionID: SessionID = SessionID()
     ) throws -> Flow {
         var requestHeaders = HTTPHeaders()
         try requestHeaders.append(name: "Host", value: host)
         try requestHeaders.append(name: "Accept", value: "application/json")
         if let requestHeaderValue {
             try requestHeaders.append(name: "X-Debug-Label", value: requestHeaderValue)
+        }
+        for value in requestCookieValues {
+            try requestHeaders.append(name: "Cookie", value: value)
         }
         if let requestBody {
             try requestHeaders.append(name: "Content-Type", value: requestContentType)
@@ -2337,6 +5240,9 @@ final class ProxyLensIntegrationTests: XCTestCase {
 
         var responseHeaders = HTTPHeaders()
         try responseHeaders.append(name: "Content-Type", value: responseContentType)
+        for value in responseSetCookieValues {
+            try responseHeaders.append(name: "Set-Cookie", value: value)
+        }
         var response = try HTTPResponse(
             statusCode: statusCode,
             reasonPhrase: "Result",
@@ -2352,7 +5258,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         }
 
         var flow = Flow(
-            sessionID: SessionID(),
+            sessionID: sessionID,
             source: source,
             request: request,
             connection: ConnectionInfo(
@@ -2513,12 +5419,81 @@ private actor FinishedEventSource: TrafficFlowEventStreaming {
     }
 }
 
+private actor RecordingRuleProfileStore: RuleProfileStoring {
+    private var profiles: [RuleProfile] = []
+
+    func list() -> [RuleProfile] {
+        profiles
+    }
+
+    func save(_ profile: RuleProfile) -> RuleProfile {
+        let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existing = profiles.first {
+            $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive])
+                == .orderedSame
+        }
+        let saved = RuleProfile(
+            id: existing?.id ?? profile.id,
+            name: name,
+            rules: profile.rules,
+            mappedLocals: profile.mappedLocals,
+            createdAt: existing?.createdAt ?? profile.createdAt,
+            updatedAt: profile.updatedAt
+        )
+        profiles.removeAll { $0.id == saved.id }
+        profiles.append(saved)
+        return saved
+    }
+
+    func remove(id: UUID) {
+        profiles.removeAll { $0.id == id }
+    }
+}
+
 private actor InlineBodyReader: TrafficBodyReading {
     func read(_ reference: BodyReference) throws -> Data {
         guard case .inline(let data) = reference.storage else {
             throw CocoaError(.fileReadNoSuchFile)
         }
         return data
+    }
+}
+
+private actor TrackingTrafficBodyReader: TrafficBodyReading {
+    private let externalPayloads: [BodyID: Data]
+    private var recordedReadIDs: [BodyID] = []
+
+    init(externalPayloads: [BodyID: Data]) {
+        self.externalPayloads = externalPayloads
+    }
+
+    func read(_ reference: BodyReference) throws -> Data {
+        recordedReadIDs.append(reference.id)
+        switch reference.storage {
+        case .inline(let data):
+            return data
+        case .external(let id):
+            guard let data = externalPayloads[id] else {
+                throw CocoaError(.fileReadNoSuchFile)
+            }
+            return data
+        }
+    }
+
+    func readIDs() -> [BodyID] {
+        recordedReadIDs
+    }
+}
+
+private actor StaticWebSocketFrameLoader: TrafficWebSocketFrameLoading {
+    private let frames: [CapturedWebSocketFrame]
+
+    init(frames: [CapturedWebSocketFrame]) {
+        self.frames = frames
+    }
+
+    func listWebSocketFrames(for flowID: FlowID) -> [CapturedWebSocketFrame] {
+        frames.filter { $0.flowID == flowID }
     }
 }
 
@@ -2558,19 +5533,70 @@ private actor RecordingRequestReplayer: TrafficRequestReplaying {
     }
 }
 
+private actor RecordingHARImporter: TrafficHARImporting {
+    private let result: HARImportResult
+    private var fileURLs: [URL] = []
+
+    init(result: HARImportResult) {
+        self.result = result
+    }
+
+    func importHAR(from fileURL: URL) -> HARImportResult {
+        fileURLs.append(fileURL)
+        return result
+    }
+
+    func importedURLs() -> [URL] {
+        fileURLs
+    }
+}
+
+private actor RecordingPortableSessionTransfer: TrafficPortableSessionTransferring {
+    struct Calls: Sendable {
+        let importedURLs: [URL]
+        let exports: [(sessionID: SessionID, fileURL: URL)]
+    }
+
+    private let result: PortableSessionImportResult
+    private var importedURLs: [URL] = []
+    private var exports: [(sessionID: SessionID, fileURL: URL)] = []
+
+    init(result: PortableSessionImportResult) {
+        self.result = result
+    }
+
+    func importSession(from fileURL: URL) -> PortableSessionImportResult {
+        importedURLs.append(fileURL)
+        return result
+    }
+
+    func exportSession(sessionID: SessionID, to fileURL: URL) {
+        exports.append((sessionID, fileURL))
+    }
+
+    func calls() -> Calls {
+        Calls(importedURLs: importedURLs, exports: exports)
+    }
+}
+
 private actor RecordingSessionService: TrafficSessionLoading {
     private var flows: [Flow]
+    private var sessions: [Session]
     private var didClear = false
     private let loadError: (any Error)?
     private let composeSessionID: SessionID
     private var composeSessionRequests = 0
+    private var removedSessions: [SessionID] = []
+    private var loadSessionsCalls = 0
 
     init(
         flows: [Flow] = [],
+        sessions: [Session] = [],
         loadError: (any Error)? = nil,
         composeSessionID: SessionID = SessionID()
     ) {
         self.flows = flows
+        self.sessions = sessions
         self.loadError = loadError
         self.composeSessionID = composeSessionID
     }
@@ -2582,8 +5608,37 @@ private actor RecordingSessionService: TrafficSessionLoading {
         return flows
     }
 
+    func loadSessions() throws -> [Session] {
+        loadSessionsCalls += 1
+        if let loadError {
+            throw loadError
+        }
+        return sessions
+    }
+
+    func renameSession(sessionID: SessionID, to name: String?) throws -> Session? {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else {
+            return nil
+        }
+        try sessions[index].rename(to: name)
+        return sessions[index]
+    }
+
+    func removeSession(sessionID: SessionID) throws {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else {
+            return
+        }
+        guard sessions[index].state != .recording else {
+            throw ProxyLensError.cannotRemoveRecordingSession
+        }
+        sessions.remove(at: index)
+        flows.removeAll { $0.sessionID == sessionID }
+        removedSessions.append(sessionID)
+    }
+
     func clearWorkspace() {
         flows = []
+        sessions = []
         didClear = true
     }
 
@@ -2592,12 +5647,28 @@ private actor RecordingSessionService: TrafficSessionLoading {
         return composeSessionID
     }
 
+    func updateAnnotation(_ annotation: FlowAnnotation?, for flowID: FlowID) -> Flow? {
+        guard let index = flows.firstIndex(where: { $0.id == flowID }) else {
+            return nil
+        }
+        flows[index].setAnnotation(annotation)
+        return flows[index]
+    }
+
     func cleared() -> Bool {
         didClear
     }
 
     func composeSessionRequestCount() -> Int {
         composeSessionRequests
+    }
+
+    func removedSessionIDs() -> [SessionID] {
+        removedSessions
+    }
+
+    func loadSessionsCallCount() -> Int {
+        loadSessionsCalls
     }
 }
 

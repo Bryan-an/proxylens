@@ -4,6 +4,92 @@ import XCTest
 @testable import ProxyLensCore
 
 final class ProxyLensCoreTests: XCTestCase {
+    func testSessionNamesNormalizePersistAndRejectOversizedValues() throws {
+        var session = Session(
+            id: SessionID(),
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+
+        try session.rename(to: "  Checkout API debugging  \n")
+
+        XCTAssertEqual(session.name, "Checkout API debugging")
+        let encoded = try JSONEncoder().encode(session)
+        let restored = try JSONDecoder().decode(Session.self, from: encoded)
+        XCTAssertEqual(restored, session)
+
+        try session.rename(to: "   \n")
+        XCTAssertNil(session.name)
+
+        XCTAssertThrowsError(
+            try session.rename(
+                to: String(repeating: "a", count: Session.maximumNameLength + 1)
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .sessionNameTooLong(maximum: Session.maximumNameLength)
+            )
+        }
+    }
+
+    func testFlowAnnotationsNormalizeRoundTripAndClearUserMetadata() throws {
+        var flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://example.test/annotated")!
+            )
+        )
+        let annotation = try FlowAnnotation(
+            comment: "  Investigate the authentication redirect.\n",
+            highlight: .yellow,
+            isStruckThrough: true
+        )
+
+        XCTAssertEqual(annotation.comment, "Investigate the authentication redirect.")
+        XCTAssertEqual(annotation.highlight, .yellow)
+        XCTAssertTrue(annotation.isStruckThrough)
+        XCTAssertFalse(annotation.isEmpty)
+
+        flow.setAnnotation(annotation)
+        let encoded = try JSONEncoder().encode(flow)
+        let restored = try JSONDecoder().decode(Flow.self, from: encoded)
+        XCTAssertEqual(restored.annotation, annotation)
+
+        flow.setAnnotation(nil)
+        XCTAssertNil(flow.annotation)
+    }
+
+    func testFlowAnnotationRejectsCommentsAboveTheLocalStorageLimit() {
+        XCTAssertThrowsError(
+            try FlowAnnotation(
+                comment: String(repeating: "a", count: FlowAnnotation.maximumCommentLength + 1),
+                highlight: .red
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .annotationCommentTooLong(maximum: FlowAnnotation.maximumCommentLength)
+            )
+        }
+    }
+
+    func testFlowAnnotationDecodingEnforcesTheLocalStorageLimit() throws {
+        let oversizedComment = String(
+            repeating: "a",
+            count: FlowAnnotation.maximumCommentLength + 1
+        )
+        let payload = try JSONEncoder().encode(["comment": oversizedComment])
+
+        XCTAssertThrowsError(try JSONDecoder().decode(FlowAnnotation.self, from: payload)) {
+            error in
+            XCTAssertEqual(
+                error as? ProxyLensError,
+                .annotationCommentTooLong(maximum: FlowAnnotation.maximumCommentLength)
+            )
+        }
+    }
+
     func testHTTPHeadersPreserveOrderDuplicatesAndCaseInsensitiveLookup() throws {
         let headers = HTTPHeaders([
             try HTTPHeader(name: "Set-Cookie", value: "a=1"),
@@ -55,6 +141,60 @@ final class ProxyLensCoreTests: XCTestCase {
             try BodyReference(byteCount: -1, storage: .external(BodyID()))
         ) { error in
             XCTAssertEqual(error as? ProxyLensError, .invalidBodySize(-1))
+        }
+    }
+
+    func testCapturedWebSocketFramePreservesWireMetadataAndPayloadReference() throws {
+        let payload = BodyReference(
+            inline: Data(#"{"type":"message","value":42}"#.utf8),
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        let frame = CapturedWebSocketFrame(
+            flowID: FlowID(
+                rawValue: UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!),
+            sequenceNumber: 7,
+            direction: .clientToServer,
+            opcode: .text,
+            isFinal: true,
+            reservedBits: [.rsv1],
+            wasMasked: true,
+            payload: payload,
+            receivedAt: Date(timeIntervalSince1970: 1_234)
+        )
+
+        XCTAssertEqual(frame.sequenceNumber, 7)
+        XCTAssertEqual(frame.direction, .clientToServer)
+        XCTAssertEqual(frame.opcode, .text)
+        XCTAssertEqual(frame.payloadByteCount, Int64(payload.inlineData?.count ?? 0))
+        XCTAssertEqual(frame.reservedBits, [.rsv1])
+        XCTAssertTrue(frame.wasMasked)
+
+        let encoded = try JSONEncoder().encode(frame)
+        XCTAssertEqual(try JSONDecoder().decode(CapturedWebSocketFrame.self, from: encoded), frame)
+    }
+
+    func testCapturedWebSocketFrameSupportsControlContinuationAndUnknownOpcodes() throws {
+        let flowID = FlowID()
+        let payload = BodyReference(inline: Data())
+        let opcodes: [WebSocketFrameOpcode] = [
+            .continuation, .binary, .close, .ping, .pong, .unknown(0xB)
+        ]
+
+        for (index, opcode) in opcodes.enumerated() {
+            let frame = CapturedWebSocketFrame(
+                flowID: flowID,
+                sequenceNumber: Int64(index),
+                direction: .serverToClient,
+                opcode: opcode,
+                isFinal: true,
+                payload: payload,
+                receivedAt: Date(timeIntervalSince1970: Double(index))
+            )
+            let encoded = try JSONEncoder().encode(frame)
+            XCTAssertEqual(
+                try JSONDecoder().decode(CapturedWebSocketFrame.self, from: encoded).opcode,
+                opcode
+            )
         }
     }
 
@@ -219,6 +359,34 @@ final class ProxyLensCoreTests: XCTestCase {
         ])
         XCTAssertTrue(composed.matches(context))
         XCTAssertFalse(Matcher.anyOf([.status(400), .status(500)]).matches(context))
+    }
+
+    func testGraphQLOperationMatcherSupportsNamesKindsAndCodableRoundTrips() throws {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            graphqlOperation: GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+        let context = RuleMatchContext(request: request)
+        let matcher = Matcher.graphqlOperation(
+            name: .exact("saveprofile"),
+            kind: .mutation
+        )
+
+        XCTAssertTrue(matcher.matches(context))
+        XCTAssertTrue(
+            Matcher.graphqlOperation(name: nil, kind: .mutation).matches(context)
+        )
+        XCTAssertFalse(
+            Matcher.graphqlOperation(name: .exact("LoadProfile"), kind: nil).matches(context)
+        )
+        XCTAssertFalse(
+            Matcher.graphqlOperation(name: nil, kind: .query).matches(context)
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(Matcher.self, from: JSONEncoder().encode(matcher)),
+            matcher
+        )
     }
 
     func testRuleSetFiltersDisabledRulesAndOrdersByPriority() throws {
@@ -723,7 +891,7 @@ final class ProxyLensCoreTests: XCTestCase {
         )
     }
 
-    func testRulePlannerSkipsMapRemoteOutsideRequestHeaders() throws {
+    func testRulePlannerSkipsMapRemoteOutsideRequestPhases() throws {
         let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/users")!)
         let response = try HTTPResponse(statusCode: 200)
         let plan = RulePlanner.plan(
@@ -742,6 +910,142 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertEqual(
             plan.traces.map(\.outcome),
             [.skipped(reason: RulePlanner.Decision.mapRemotePhaseReason)]
+        )
+    }
+
+    func testRulePlannerAppliesFirstRedirectDuringRequestHeaders() throws {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/v1/users")!
+        )
+        let first = URL(string: "https://login.example.com/continue")!
+        let second = URL(string: "https://other.example.com/")!
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Redirect users",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .redirect(url: first)
+                ),
+                Rule(
+                    name: "Redirect fallback",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .redirect(url: second)
+                ),
+                Rule(
+                    name: "Block fallback",
+                    priority: 30,
+                    phase: .requestHeaders,
+                    action: .block(reason: "blocked")
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertEqual(plan.redirectURL, first)
+        XCTAssertFalse(plan.shouldBlock)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyRedirectedReason),
+                .skipped(reason: RulePlanner.Decision.alreadyDecidedReason)
+            ]
+        )
+    }
+
+    func testRedirectedHTTPResponsePreservesMethodWithTemporaryRedirect() throws {
+        let destination = URL(string: "https://login.example.com/continue?from=proxy")!
+
+        let response = try RedirectedHTTPResponse.make(destination: destination)
+
+        XCTAssertEqual(response.statusCode, 307)
+        XCTAssertEqual(response.reasonPhrase, "Temporary Redirect")
+        XCTAssertEqual(response.headers.firstValue(for: "Location"), destination.absoluteString)
+        XCTAssertEqual(response.headers.firstValue(for: "Content-Length"), "0")
+        XCTAssertEqual(response.headers.firstValue(for: "Connection"), "close")
+        XCTAssertNil(response.body)
+    }
+
+    func testRulePlannerAppliesFirstThrottleDuringRequestHeaders() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/v1/users")!
+        )
+        let first = ThrottleProfile(latency: 0.2)
+        let second = ThrottleProfile(latency: 1)
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Slow API",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    action: .throttle(first)
+                ),
+                Rule(
+                    name: "Slower API",
+                    priority: 20,
+                    phase: .requestHeaders,
+                    action: .throttle(second)
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+
+        XCTAssertEqual(plan.throttleProfile, first)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyThrottledReason)
+            ]
+        )
+    }
+
+    func testThrottleProfileDefaultsLegacyPacketLossAndSamplesRequestsDeterministically() throws {
+        let legacy = try JSONDecoder().decode(
+            ThrottleProfile.self,
+            from: Data(#"{"latency":0.2}"#.utf8)
+        )
+        XCTAssertEqual(legacy, ThrottleProfile(latency: 0.2))
+
+        let lowSample = FlowID(
+            rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+        )
+        let highSample = FlowID(
+            rawValue: UUID(uuidString: "ffffffff-ffff-ffff-ffff-ffffffffffff")!
+        )
+        let profile = ThrottleProfile(packetLossPercentage: 50)
+
+        XCTAssertTrue(profile.dropsRequest(flowID: lowSample))
+        XCTAssertFalse(profile.dropsRequest(flowID: highSample))
+        XCTAssertFalse(ThrottleProfile().dropsRequest(flowID: lowSample))
+        XCTAssertTrue(ThrottleProfile(packetLossPercentage: 100).dropsRequest(flowID: highSample))
+    }
+
+    func testRulePlannerSkipsThrottleOutsideRequestHeaders() throws {
+        let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
+        let response = try HTTPResponse(statusCode: 200)
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Late throttle",
+                    phase: .responseHeaders,
+                    action: .throttle(ThrottleProfile(latency: 0.2))
+                )
+            ]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseHeaders
+        )
+
+        XCTAssertNil(plan.throttleProfile)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [.skipped(reason: RulePlanner.Decision.throttlePhaseReason)]
         )
     }
 
@@ -970,6 +1274,182 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertEqual(responsePlan.traces.map(\.outcome), [.applied])
     }
 
+    func testRulePlannerAppliesBreakpointDuringRequestBodyPhase() {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            graphqlOperation: GraphQLOperationMetadata(kind: .query, name: "Catalog")
+        )
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Breakpoint GraphQL Catalog",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(name: .exact("Catalog"), kind: .query),
+                    action: .breakpoint
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertTrue(plan.shouldBreakpoint)
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied])
+    }
+
+    func testRulePlannerAppliesBlockDuringRequestBodyPhase() {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            graphqlOperation: GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block GraphQL mutation SaveProfile",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(name: .exact("SaveProfile"), kind: .mutation),
+                    action: .block(reason: "Blocked GraphQL operation")
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertTrue(plan.shouldBlock)
+        XCTAssertEqual(plan.blockReason, "Blocked GraphQL operation")
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied])
+    }
+
+    func testRulePlannerAppliesMapLocalDuringRequestBodyPhase() {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            graphqlOperation: GraphQLOperationMetadata(kind: .query, name: "Catalog")
+        )
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map local GraphQL query Catalog",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(name: .exact("Catalog"), kind: .query),
+                    action: .mapLocal(resourceID: "catalog.json")
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertEqual(plan.mapLocalResourceID, "catalog.json")
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied])
+    }
+
+    func testRulePlannerAppliesMapRemoteDuringRequestBodyPhase() {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            graphqlOperation: GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+        let destination = URL(string: "http://127.0.0.1:9000")!
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Map remote GraphQL mutation SaveProfile",
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(name: .exact("SaveProfile"), kind: .mutation),
+                    action: .mapRemote(url: destination)
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertEqual(plan.mapRemoteURL, destination)
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied])
+    }
+
+    func testRulePlannerAppliesFirstBodyReplacementDuringRequestBodyPhase() {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            graphqlOperation: GraphQLOperationMetadata(kind: .mutation, name: "SaveProfile")
+        )
+        let firstBody = BodyReference(
+            inline: Data(#"{"name":"Ada"}"#.utf8),
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        let secondBody = BodyReference(inline: Data("ignored".utf8))
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Replace body GraphQL mutation SaveProfile",
+                    priority: 16,
+                    phase: .requestBody,
+                    matcher: .graphqlOperation(name: .exact("SaveProfile"), kind: .mutation),
+                    action: .replaceBody(body: firstBody)
+                ),
+                Rule(
+                    name: "Replace body again",
+                    priority: 17,
+                    phase: .requestBody,
+                    action: .replaceBody(body: secondBody)
+                )
+            ]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertEqual(plan.replacementBody, firstBody)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyReplacedBodyReason)
+            ]
+        )
+    }
+
+    func testRulePlannerAppliesFirstBodyReplacementDuringResponseBodyPhase() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let response = try HTTPResponse(statusCode: 200)
+        let firstBody = BodyReference(
+            inline: Data(#"{"users":[]}"#.utf8),
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        let secondBody = BodyReference(inline: Data("ignored".utf8))
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Replace users response",
+                    priority: 16,
+                    phase: .responseBody,
+                    matcher: .status(200),
+                    action: .replaceBody(body: firstBody)
+                ),
+                Rule(
+                    name: "Replace response again",
+                    priority: 17,
+                    phase: .responseBody,
+                    action: .replaceBody(body: secondBody)
+                )
+            ]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseBody
+        )
+
+        XCTAssertEqual(plan.replacementBody, firstBody)
+        XCTAssertEqual(
+            plan.traces.map(\.outcome),
+            [
+                .applied,
+                .skipped(reason: RulePlanner.Decision.alreadyReplacedBodyReason)
+            ]
+        )
+    }
+
     func testRulePlannerSkipsBreakpointAfterBlockOrMapLocal() throws {
         let request = HTTPRequest(
             method: .get,
@@ -1101,18 +1581,18 @@ final class ProxyLensCoreTests: XCTestCase {
         )
     }
 
-    func testRulePlannerSkipsBreakpointOutsideHeaderPhases() throws {
+    func testRulePlannerSkipsBreakpointOutsideSupportedPhases() throws {
         let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
         let plan = RulePlanner.plan(
             rules: RuleSet(rules: [
                 Rule(
                     name: "Late breakpoint",
-                    phase: .requestBody,
+                    phase: .responseBody,
                     action: .breakpoint
                 )
             ]),
             context: RuleMatchContext(request: request),
-            phase: .requestBody
+            phase: .responseBody
         )
 
         XCTAssertFalse(plan.shouldBreakpoint)
@@ -1125,9 +1605,9 @@ final class ProxyLensCoreTests: XCTestCase {
     func testRulePlannerSkipsUnimplementedActions() throws {
         let request = HTTPRequest(method: .get, url: URL(string: "https://example.com/")!)
         let rule = Rule(
-            name: "Throttle",
+            name: "Annotate",
             phase: .requestHeaders,
-            action: .throttle(ThrottleProfile(latency: 0.2))
+            action: .annotate(message: "Review later")
         )
         let plan = RulePlanner.plan(
             rules: RuleSet(rules: [rule]),
@@ -1308,6 +1788,76 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertTrue(arrayText.contains("2"))
     }
 
+    func testJSONPathBodyViewResolvesKeysIndexesAndWildcards() {
+        let json =
+            #"{"users":[{"name":"Ada","roles":["admin","owner"]},{"name":"Lin","roles":["reader"]}],"meta":{"count":2}}"#
+
+        XCTAssertEqual(
+            JSONPathBodyView.evaluate(json: json, query: "$.users[0].name"),
+            .matches([.init(path: "$.users[0].name", value: #""Ada""#)])
+        )
+        XCTAssertEqual(
+            JSONPathBodyView.evaluate(json: json, query: "$.users[*].name"),
+            .matches([
+                .init(path: "$.users[0].name", value: #""Ada""#),
+                .init(path: "$.users[1].name", value: #""Lin""#)
+            ])
+        )
+        XCTAssertEqual(
+            JSONPathBodyView.evaluate(json: json, query: "$['meta']['count']"),
+            .matches([.init(path: "$.meta.count", value: "2")])
+        )
+        XCTAssertEqual(
+            JSONPathBodyView.evaluate(json: json, query: "$.users[0].roles[*]"),
+            .matches([
+                .init(path: "$.users[0].roles[0]", value: #""admin""#),
+                .init(path: "$.users[0].roles[1]", value: #""owner""#)
+            ])
+        )
+    }
+
+    func testJSONPathBodyViewReportsInvalidQueriesAndBounds() {
+        XCTAssertEqual(
+            JSONPathBodyView.evaluate(json: "{}", query: ""),
+            .unavailable(reason: JSONPathBodyView.emptyQueryReason)
+        )
+        guard
+            case .unavailable(let reason) = JSONPathBodyView.evaluate(
+                json: "{}",
+                query: "users"
+            )
+        else {
+            return XCTFail("expected invalid JSONPath")
+        }
+        XCTAssertTrue(reason.contains("must start with '$'"))
+
+        guard
+            case .unavailable(let unsupported) = JSONPathBodyView.evaluate(
+                json: "{}",
+                query: "$..users"
+            )
+        else {
+            return XCTFail("expected unsupported recursive descent")
+        }
+        XCTAssertTrue(unsupported.contains("recursive descent"))
+
+        let oversized = String(repeating: "x", count: JSONPathBodyView.maximumInputByteCount + 1)
+        XCTAssertEqual(
+            JSONPathBodyView.evaluate(json: oversized, query: "$"),
+            .unavailable(reason: JSONPathBodyView.exceedsDisplayLimitReason)
+        )
+
+        let tooDeepQuery =
+            "$" + String(repeating: ".value", count: JSONPathBodyView.maximumDepth + 1)
+        if case .unavailable(let reason) = JSONPathBodyView.evaluate(
+            json: "{}", query: tooDeepQuery)
+        {
+            XCTAssertTrue(reason.contains("maximum depth"))
+        } else {
+            XCTFail("expected an explicit depth bound")
+        }
+    }
+
     func testJSONBodyViewAcceptsSuffixJSONTypesAndSniffsCompactPayloads() {
         let problem = JSONBodyView.render(
             data: Data(#"{"title":"gone"}"#.utf8),
@@ -1461,6 +2011,280 @@ final class ProxyLensCoreTests: XCTestCase {
             contentEncoding: "gzip"
         )
         XCTAssertEqual(exploded, .unavailable(reason: JSONBodyView.exceedsDisplayLimitReason))
+    }
+
+    func testXMLBodyViewPrettyPrintsDeclaredAndSniffedDocumentsWithoutExternalEntities() {
+        let declared = XMLBodyView.render(
+            data: Data(#"<?xml version="1.0"?><root><item id="1">Ada</item><empty/></root>"#.utf8),
+            contentType: "application/problem+xml; charset=utf-8",
+            contentEncoding: nil
+        )
+        guard case .prettyPrinted(let declaredText) = declared else {
+            return XCTFail("expected pretty-printed XML, got \(declared)")
+        }
+        XCTAssertTrue(declaredText.contains("<root>\n"))
+        XCTAssertTrue(declaredText.contains("  <item id=\"1\">Ada</item>"))
+
+        let sniffed = XMLBodyView.render(
+            data: Data("<status><ok>true</ok></status>".utf8),
+            contentType: "text/plain",
+            contentEncoding: nil
+        )
+        guard case .prettyPrinted(let sniffedText) = sniffed else {
+            return XCTFail("expected sniffed XML, got \(sniffed)")
+        }
+        XCTAssertTrue(sniffedText.contains("<ok>true</ok>"))
+
+        let externalEntity = XMLBodyView.render(
+            data: Data(
+                #"<!DOCTYPE root [<!ENTITY local SYSTEM "file:///etc/hosts">]><root>&local;</root>"#
+                    .utf8
+            ),
+            contentType: "application/xml",
+            contentEncoding: nil
+        )
+        switch externalEntity {
+        case .prettyPrinted(let safeText):
+            XCTAssertFalse(safeText.contains("localhost"))
+        case .unavailable(let reason):
+            XCTAssertEqual(reason, XMLBodyView.documentTypeReason)
+        }
+    }
+
+    func testXMLBodyViewAndFormBodyViewReportInvalidTruncatedAndDecodedContent() {
+        let invalidXML = XMLBodyView.render(
+            data: Data("<root>".utf8),
+            contentType: "application/xml",
+            contentEncoding: nil
+        )
+        guard case .unavailable(let invalidReason) = invalidXML else {
+            return XCTFail("expected invalid XML, got \(invalidXML)")
+        }
+        XCTAssertTrue(invalidReason.hasPrefix("Invalid XML:"))
+
+        XCTAssertEqual(
+            XMLBodyView.render(
+                data: Data("<root>".utf8),
+                contentType: "application/xml",
+                contentEncoding: nil,
+                isTruncated: true
+            ),
+            .unavailable(reason: XMLBodyView.truncatedReason)
+        )
+
+        let form = FormBodyView.render(
+            data: Data("name=ProxyLens+App&tag=one&tag=two&empty=&flag".utf8),
+            contentType: "application/x-www-form-urlencoded; charset=utf-8",
+            contentEncoding: nil
+        )
+        XCTAssertEqual(
+            form,
+            .decoded("name=ProxyLens App\ntag=one\ntag=two\nempty=\nflag=")
+        )
+        XCTAssertEqual(
+            FormBodyView.render(
+                data: Data("name=ProxyLens".utf8),
+                contentType: "text/plain",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: FormBodyView.notFormReason)
+        )
+    }
+
+    func testFormBodyViewDecodesBoundedMultipartFieldsAndSummarizesFiles() {
+        let boundary = "ProxyLensBoundary"
+        let prefix = "--\(boundary)\r\n"
+        let body =
+            Data(
+                (prefix
+                    + "Content-Disposition: form-data; name=\"name\"\r\n\r\n"
+                    + "ProxyLens App\r\n"
+                    + prefix
+                    + "Content-Disposition: form-data; name=\"tag\"\r\n\r\n"
+                    + "one\r\n"
+                    + prefix
+                    + "Content-Disposition: form-data; name=\"tag\"\r\n\r\n"
+                    + "two\r\n"
+                    + prefix
+                    + "Content-Disposition: form-data; name=\"avatar\"; filename=\"icon.png\"\r\n"
+                    + "Content-Type: image/png\r\n\r\n").utf8
+            )
+            + Data([0x89, 0x50, 0x4E, 0x47])
+            + Data("\r\n--\(boundary)--\r\n".utf8)
+
+        XCTAssertEqual(
+            FormBodyView.render(
+                data: body,
+                contentType: "multipart/form-data; boundary=\"\(boundary)\"",
+                contentEncoding: nil
+            ),
+            .decoded(
+                "name=ProxyLens App\ntag=one\ntag=two\navatar=[File \"icon.png\", image/png, 4 B]"
+            )
+        )
+    }
+
+    func testFormBodyViewRejectsMalformedMultipartAndReportsTruncatedCapture() {
+        XCTAssertEqual(
+            FormBodyView.render(
+                data: Data("ignored".utf8),
+                contentType: "multipart/form-data",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: FormBodyView.missingMultipartBoundaryReason)
+        )
+
+        let incomplete = Data(
+            "--test\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nvalue".utf8
+        )
+        let malformed = FormBodyView.render(
+            data: incomplete,
+            contentType: "multipart/form-data; boundary=test",
+            contentEncoding: nil
+        )
+        guard case .unavailable(let reason) = malformed else {
+            return XCTFail("expected invalid multipart data, got \(malformed)")
+        }
+        XCTAssertTrue(reason.hasPrefix("Invalid multipart form:"))
+        XCTAssertEqual(
+            FormBodyView.render(
+                data: incomplete,
+                contentType: "multipart/form-data; boundary=test",
+                contentEncoding: nil,
+                isTruncated: true
+            ),
+            .unavailable(reason: FormBodyView.truncatedReason)
+        )
+    }
+
+    func testGraphQLBodyViewFormatsJSONEnvelopeAndVariables() {
+        let envelope = Data(
+            #"{"operationName":"GetUser","query":"query GetUser($id: ID!) { user(id: $id) { id name } }","variables":{"id":"42"}}"#
+                .utf8
+        )
+
+        let result = GraphQLBodyView.render(
+            data: envelope,
+            contentType: "application/json; charset=utf-8",
+            contentEncoding: nil
+        )
+        guard case .formatted(let text) = result else {
+            return XCTFail("expected formatted GraphQL, got \(result)")
+        }
+        XCTAssertTrue(text.hasPrefix("Operation: GetUser\n\n"))
+        XCTAssertTrue(text.contains("query GetUser($id: ID!) {\n"))
+        XCTAssertTrue(text.contains("  user(id: $id) {\n"))
+        XCTAssertTrue(text.contains("    id\n    name\n"))
+        XCTAssertTrue(text.contains("\nVariables:\n"))
+        XCTAssertTrue(text.contains(#""id" : "42""#))
+    }
+
+    func testGraphQLBodyViewFormatsDeclaredSourceWithoutChangingStringValues() {
+        let source =
+            #"query Search { search(text: "a { brace }") { ...ResultFields } } fragment ResultFields on Result { id title }"#
+        let result = GraphQLBodyView.render(
+            data: Data(source.utf8),
+            contentType: "application/graphql",
+            contentEncoding: nil
+        )
+        guard case .formatted(let text) = result else {
+            return XCTFail("expected formatted GraphQL, got \(result)")
+        }
+        XCTAssertTrue(text.hasPrefix("Operation: Search\n\n"))
+        XCTAssertTrue(text.contains(#"search(text: "a { brace }") {"#))
+        XCTAssertTrue(text.contains("...ResultFields"))
+        XCTAssertTrue(text.contains("fragment ResultFields on Result {\n"))
+    }
+
+    func testGraphQLBodyViewRejectsUnrelatedInvalidAndTruncatedPayloads() {
+        XCTAssertEqual(
+            GraphQLBodyView.render(
+                data: Data(#"{"status":"ok"}"#.utf8),
+                contentType: "application/json",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: GraphQLBodyView.notGraphQLReason)
+        )
+
+        let invalid = GraphQLBodyView.render(
+            data: Data(#"{"query":42}"#.utf8),
+            contentType: "application/json",
+            contentEncoding: nil
+        )
+        guard case .unavailable(let invalidReason) = invalid else {
+            return XCTFail("expected invalid GraphQL envelope, got \(invalid)")
+        }
+        XCTAssertTrue(invalidReason.hasPrefix("Invalid GraphQL request:"))
+
+        XCTAssertEqual(
+            GraphQLBodyView.render(
+                data: Data("query Viewer { viewer { id".utf8),
+                contentType: "application/graphql",
+                contentEncoding: nil,
+                isTruncated: true
+            ),
+            .unavailable(reason: GraphQLBodyView.truncatedReason)
+        )
+    }
+
+    func testGraphQLBodyViewExtractsNamedAndAnonymousOperationMetadata() {
+        let namedEnvelope = Data(
+            #"{"operationName":"UpdateProfile","query":"mutation UpdateProfile($name: String!) { updateProfile(name: $name) { id } }","variables":{"name":"Ada"}}"#
+                .utf8
+        )
+
+        XCTAssertEqual(
+            GraphQLBodyView.operationMetadata(
+                data: namedEnvelope,
+                contentType: "application/json",
+                contentEncoding: nil
+            ),
+            GraphQLOperationMetadata(kind: .mutation, name: "UpdateProfile")
+        )
+        XCTAssertEqual(
+            GraphQLBodyView.operationMetadata(
+                data: Data("{ viewer { id } }".utf8),
+                contentType: "application/graphql",
+                contentEncoding: nil
+            ),
+            GraphQLOperationMetadata(kind: .query, name: nil)
+        )
+        XCTAssertNil(
+            GraphQLBodyView.operationMetadata(
+                data: Data(#"{"status":"ok"}"#.utf8),
+                contentType: "application/json",
+                contentEncoding: nil
+            )
+        )
+    }
+
+    func testHTTPRequestTracksGraphQLOperationAndDecodesOlderSnapshots() throws {
+        let body = BodyReference(
+            inline: Data(#"{"query":"subscription Activity { activity { id } }"}"#.utf8),
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/graphql")!,
+            body: body
+        )
+
+        XCTAssertEqual(
+            request.graphqlOperation,
+            GraphQLOperationMetadata(kind: .subscription, name: "Activity")
+        )
+        XCTAssertEqual(
+            request.replacingHeaders(HTTPHeaders()).graphqlOperation, request.graphqlOperation)
+        XCTAssertNil(request.replacingBody(nil).graphqlOperation)
+
+        let encoded = try JSONEncoder().encode(request)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "graphqlOperation")
+        let olderSnapshot = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(HTTPRequest.self, from: olderSnapshot)
+        XCTAssertNil(decoded.graphqlOperation)
     }
 
     func testHTTPContentCodingRoundTripsGzipAndBoundsDecodedOutput() throws {

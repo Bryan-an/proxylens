@@ -39,13 +39,17 @@ actor FlowTransaction {
         }
     }
 
-    func finishRequestBody(_ body: BodyReference?, at date: Date) async {
+    func finishRequestBody(
+        _ body: BodyReference?,
+        graphqlOperation: GraphQLOperationMetadata? = nil,
+        at date: Date
+    ) async {
         guard !isFinished else {
             return
         }
 
         if let body {
-            flow.attachRequestBody(body)
+            flow.attachRequestBody(body, graphqlOperation: graphqlOperation)
         }
         flow.markRequestBodyCompleted(at: date)
         requestBodyIsComplete = true
@@ -72,6 +76,22 @@ actor FlowTransaction {
         }
 
         flow.replaceRequest(request)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func replaceUpstreamConnection(host: String, port: UInt16, usesTLS: Bool) async {
+        guard !isFinished else {
+            return
+        }
+
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: usesTLS ? .https : .http,
+                upstreamHost: host,
+                upstreamPort: port,
+                tlsIntercepted: flow.connection?.tlsIntercepted ?? false
+            )
+        )
         await eventSink.publish(.updated(flow))
     }
 
@@ -160,6 +180,33 @@ actor FlowTransaction {
         } else {
             await eventSink.publish(.updated(flow))
         }
+    }
+
+    func beginWebSocket(secure: Bool, at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+
+        if let connection = flow.connection {
+            flow.replaceConnection(
+                ConnectionInfo(
+                    protocolKind: secure ? .secureWebSocket : .webSocket,
+                    upstreamHost: connection.upstreamHost,
+                    upstreamPort: connection.upstreamPort,
+                    tlsIntercepted: connection.tlsIntercepted
+                )
+            )
+        }
+        flow.markResponseBodyCompleted(at: date)
+        responseBodyIsComplete = true
+        await eventSink.publish(.updated(flow))
+    }
+
+    func finishWebSocket(at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+        await complete(at: date)
     }
 
     func completePausedResponse(at date: Date) async {

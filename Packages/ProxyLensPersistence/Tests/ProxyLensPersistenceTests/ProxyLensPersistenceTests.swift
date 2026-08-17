@@ -5,6 +5,51 @@ import XCTest
 @testable import ProxyLensPersistence
 
 final class ProxyLensPersistenceTests: XCTestCase {
+    func testFileRuleProfileStoreUpsertsListsAndRemovesDurableProfiles() async throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ProxyLensRuleProfiles-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let store = FileRuleProfileStore(directoryURL: rootURL)
+        let original = RuleProfile(
+            name: "Daily debugging",
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Block tracker",
+                    phase: .requestHeaders,
+                    matcher: .host(.exact("tracker.example.com")),
+                    action: .block(reason: "Noise")
+                )
+            ])
+        )
+
+        let saved = try await store.save(original)
+        let updated = try await store.save(
+            RuleProfile(
+                name: " daily debugging ",
+                rules: RuleSet(rules: [
+                    Rule(
+                        name: "Allow API",
+                        phase: .requestHeaders,
+                        matcher: .host(.exact("api.example.com")),
+                        action: .allow
+                    )
+                ])
+            )
+        )
+
+        XCTAssertEqual(updated.id, saved.id)
+        XCTAssertEqual(updated.name, "daily debugging")
+        XCTAssertEqual(updated.rules.rules.map(\.name), ["Allow API"])
+
+        let reopened = FileRuleProfileStore(directoryURL: rootURL)
+        let reopenedProfiles = try await reopened.list()
+        XCTAssertEqual(reopenedProfiles, [updated])
+
+        try await reopened.remove(id: updated.id)
+        let remainingProfiles = try await reopened.list()
+        XCTAssertTrue(remainingProfiles.isEmpty)
+    }
+
     func testFreshDatabaseEnablesWALAndForeignKeys() async throws {
         let fixture = try PersistenceFixture()
         defer { fixture.remove() }
@@ -53,6 +98,77 @@ final class ProxyLensPersistenceTests: XCTestCase {
         }
     }
 
+    func testWebSocketFramesPersistInSequenceAndDeleteTheirPayloadsWithTheFlow() async throws {
+        let fixture = try PersistenceFixture(inlineBodyThreshold: 1)
+        defer { fixture.remove() }
+        let sessionID = SessionID()
+        let flow = Flow(
+            sessionID: sessionID,
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "ws://example.test/socket")!
+            ),
+            connection: ConnectionInfo(
+                protocolKind: .webSocket,
+                upstreamHost: "example.test",
+                upstreamPort: 80
+            )
+        )
+        try await fixture.sessionStore.save(flow)
+
+        let laterPayload = try await fixture.bodyStore.put(
+            Data("later".utf8),
+            metadata: BodyMetadata(contentType: "text/plain")
+        )
+        let earlierPayload = try await fixture.bodyStore.put(
+            Data([0x01, 0x02, 0x03]),
+            metadata: BodyMetadata(contentType: "application/octet-stream")
+        )
+        let later = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 2,
+            direction: .serverToClient,
+            opcode: .text,
+            isFinal: true,
+            payload: laterPayload,
+            receivedAt: Date(timeIntervalSince1970: 20)
+        )
+        let earlier = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 1,
+            direction: .clientToServer,
+            opcode: .binary,
+            isFinal: true,
+            wasMasked: true,
+            payload: earlierPayload,
+            receivedAt: Date(timeIntervalSince1970: 10)
+        )
+
+        try await fixture.sessionStore.saveWebSocketFrame(later)
+        try await fixture.sessionStore.saveWebSocketFrame(earlier)
+
+        let reopenedDatabase = try DatabaseController(configuration: fixture.configuration)
+        let reopenedBodyStore = FileBodyStore(database: reopenedDatabase)
+        let reopened = GRDBSessionStore(
+            database: reopenedDatabase,
+            bodyStore: reopenedBodyStore
+        )
+        let restored = try await reopened.listWebSocketFrames(for: flow.id)
+        XCTAssertEqual(restored, [earlier, later])
+        let restoredPayload = try await reopenedBodyStore.read(restored[0].payload)
+        XCTAssertEqual(restoredPayload, Data([1, 2, 3]))
+
+        try await reopened.remove(flowID: flow.id)
+        let remainingFrames = try await reopened.listWebSocketFrames(for: flow.id)
+        XCTAssertTrue(remainingFrames.isEmpty)
+        await assertThrowsErrorAsync(try await reopenedBodyStore.read(earlierPayload)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(earlierPayload.id))
+        }
+        await assertThrowsErrorAsync(try await reopenedBodyStore.read(laterPayload)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(laterPayload.id))
+        }
+    }
+
     func testOrphanCleanupPreservesReferencedBodies() async throws {
         let fixture = try PersistenceFixture(inlineBodyThreshold: 1)
         defer { fixture.remove() }
@@ -94,7 +210,8 @@ final class ProxyLensPersistenceTests: XCTestCase {
         let fixture = try PersistenceFixture(inlineBodyThreshold: 4)
         defer { fixture.remove() }
 
-        let session = Session(startedAt: Date(timeIntervalSince1970: 1_000))
+        var session = Session(startedAt: Date(timeIntervalSince1970: 1_000))
+        try session.rename(to: "Payments investigation")
         try await fixture.sessionStore.saveSession(session)
         let requestBody = try await fixture.bodyStore.put(
             Data("request bytes".utf8),
@@ -139,8 +256,44 @@ final class ProxyLensPersistenceTests: XCTestCase {
         XCTAssertEqual(restoredSummaries, [flow.summary])
         XCTAssertEqual(restoredRequestBytes, Data("request bytes".utf8))
         XCTAssertEqual(restoredResponseBytes, Data("response bytes".utf8))
+        XCTAssertEqual(restoredSession.name, "Payments investigation")
         XCTAssertEqual(restoredSession.flowCount, 1)
         XCTAssertEqual(restoredSession.state, .recording)
+    }
+
+    func testFlowAnnotationsPersistAcrossRestartAndSurviveStaleCaptureSnapshots() async throws {
+        let fixture = try PersistenceFixture()
+        defer { fixture.remove() }
+
+        let session = Session(startedAt: Date(timeIntervalSince1970: 1_500))
+        try await fixture.sessionStore.saveSession(session)
+        let originalFlow = try Self.makeCompletedFlow(sessionID: session.id, index: 7)
+        try await fixture.sessionStore.save(originalFlow)
+        let annotation = try FlowAnnotation(
+            comment: "Compare this redirect with the login flow.",
+            highlight: .purple,
+            isStruckThrough: true
+        )
+
+        let annotatedFlow = try await fixture.sessionStore.updateAnnotation(
+            annotation,
+            for: originalFlow.id
+        )
+        XCTAssertEqual(annotatedFlow?.annotation, annotation)
+
+        try await fixture.sessionStore.save(originalFlow)
+        let loadedAfterStaleSave = try await fixture.sessionStore.load(flowID: originalFlow.id)
+        XCTAssertEqual(loadedAfterStaleSave?.annotation, annotation)
+
+        let reopenedDatabase = try DatabaseController(configuration: fixture.configuration)
+        let reopenedStore = GRDBSessionStore(database: reopenedDatabase)
+        let reopenedFlow = try await reopenedStore.load(flowID: originalFlow.id)
+        XCTAssertEqual(reopenedFlow?.annotation, annotation)
+
+        let clearedFlow = try await reopenedStore.updateAnnotation(nil, for: originalFlow.id)
+        XCTAssertNil(clearedFlow?.annotation)
+        let loadedAfterClear = try await reopenedStore.load(flowID: originalFlow.id)
+        XCTAssertNil(loadedAfterClear?.annotation)
     }
 
     func testListSessionsAndAllFlowsReturnPersistedWorkspaceInStableOrder() async throws {
@@ -369,6 +522,41 @@ final class ProxyLensPersistenceTests: XCTestCase {
         XCTAssertEqual(retainedFailures.map(\.flowID), [flow.id])
     }
 
+    func testPersistingWebSocketFrameSinkSavesBeforeForwarding() async throws {
+        let fixture = try PersistenceFixture()
+        defer { fixture.remove() }
+        let flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "ws://example.test/socket")!
+            )
+        )
+        try await fixture.sessionStore.save(flow)
+        let frame = CapturedWebSocketFrame(
+            flowID: flow.id,
+            sequenceNumber: 1,
+            direction: .serverToClient,
+            opcode: .text,
+            isFinal: true,
+            payload: BodyReference(inline: Data("hello".utf8))
+        )
+        let downstream = RecordingWebSocketFrameEventSink()
+        let sink = PersistingWebSocketFrameEventSink(
+            frameStore: fixture.sessionStore,
+            downstream: downstream
+        )
+
+        await sink.publish(frame)
+
+        let persisted = try await fixture.sessionStore.listWebSocketFrames(for: flow.id)
+        let forwarded = await downstream.frames()
+        let failures = await sink.failures()
+        XCTAssertEqual(persisted, [frame])
+        XCTAssertEqual(forwarded, [frame])
+        XCTAssertTrue(failures.isEmpty)
+    }
+
     private static func makeCompletedFlow(
         sessionID: SessionID,
         index: Int,
@@ -507,6 +695,18 @@ private actor OrderedFlowEventSink: FlowEventSink {
 
     func events() -> [FlowEvent] {
         recordedEvents
+    }
+}
+
+private actor RecordingWebSocketFrameEventSink: WebSocketFrameEventSink {
+    private var recordedFrames: [CapturedWebSocketFrame] = []
+
+    func publish(_ frame: CapturedWebSocketFrame) {
+        recordedFrames.append(frame)
+    }
+
+    func frames() -> [CapturedWebSocketFrame] {
+        recordedFrames
     }
 }
 

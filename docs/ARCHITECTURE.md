@@ -1,7 +1,7 @@
 # ProxyLens architecture
 
 **Status:** Recommended architecture
-**Scope:** macOS-only native application; desktop proxying first
+**Scope:** macOS-first native desktop application; complete staged P0/P1/P2 roadmap
 **Date:** 2026-08-02
 
 ## Architectural decision
@@ -342,7 +342,15 @@ Important rules:
 - `Flow` contains metadata and references, not necessarily all body bytes in memory.
 - `BodyReference` identifies raw data, its size, encoding, hash, and storage location.
 - A body can be inline for small payloads or file-backed for large payloads.
-- Decoded JSON, XML, form, GraphQL, or Protobuf views are derived values.
+- Decoded JSON, XML, form, and GraphQL views are bounded derived values; Protobuf remains a
+  future derived decoder.
+- GraphQL inspection accepts JSON request envelopes and `application/graphql` source, formats
+  operations and variables for display, and never replaces the authoritative request body.
+- Capture derives only the bounded GraphQL operation kind/name into `HTTPRequest` metadata. This
+  keeps operation discovery available for external bodies, persistence, search, filtering, and the
+  flow-table Query column without loading file-backed payloads. The same metadata powers
+  deterministic operation kind/name matching in request-body rules. Malformed, truncated, or
+  oversized bodies simply omit the metadata and retain their raw bytes.
 - A decoder failure must never make the raw body unavailable.
 - A partially captured flow is a valid persisted state with an explicit completion/error status.
 
@@ -422,9 +430,10 @@ Use AppKit for the traffic workspace:
 - `NSTextView` for raw request/response editing and replay.
 - Native responder-chain commands and keyboard shortcuts.
 
-Source List visibility is owned by the AppKit split-view controller. Pinned domain identifiers are
-local UI preferences stored in `UserDefaults`; the traffic view model projects them into every
-snapshot so a pin remains visible with a zero-flow count after the current session is cleared.
+Source List visibility is owned by the AppKit split-view controller and restored from a local
+`UserDefaults` preference at launch. Pinned domain identifiers use the same local-preference
+boundary; the traffic view model projects them into every snapshot so a pin remains visible with a
+zero-flow count after the current session is cleared.
 
 The main traffic window should be managed by `MainWindowController`. SwiftUI views can be hosted inside auxiliary windows or panels without making the traffic table depend on SwiftUI rendering behavior.
 
@@ -442,6 +451,39 @@ AppKit views
 
 The view model may maintain a display projection for sorting and grouping. It hydrates that projection from `SessionService` on launch and retains the body store for inspection and export.
 
+The flow table uses native multiple selection. The store keeps the complete selected-ID set in the current visible order plus one primary flow for the inspector. Sorting preserves the selection; source or filter changes drop only selections that are no longer visible and promote the first remaining row when the primary flow disappears. Context-clicking outside the current selection selects only that row, while context-clicking within the selection keeps the batch intact.
+
+The single-flow context menu groups clipboard actions under **Copy**: URL, request/response
+headers, request/response bodies, request/response cookies, and cURL. Items whose source data is
+absent are disabled. Body copying reads the authoritative body reference through
+`TrafficBodyReading`, applies supported bounded content decoding for text, and falls back to base64
+for binary bytes; it never copies potentially stale inspector text.
+
+A captured row can open a native request-code sheet. `ExportService` loads the authoritative
+request body once, caps interactive generation at 8 MiB, and derives cURL, HTTPie, JavaScript
+`fetch`, Axios, Python `requests`, Swift `URLSession`, Go `net/http`, and Java `HttpClient`
+representations without mutating the flow.
+Text bodies use escaped language literals; binary bodies use base64 reconstruction. Generated
+clients omit hop-by-hop and automatically recalculated length headers. The AppKit sheet owns only
+language selection, syntax presentation, and clipboard copying.
+
+Exactly two selected rows can open a native side-by-side comparison sheet. The view model loads
+the immutable flow snapshots and their bodies through `TrafficBodyReading`; it never reads a body
+from an inspector view. Text decoding and body reads are limited to 1 MiB per message, and the
+line-alignment algorithm caps its LCS matrix before falling back to positional comparison. The UI
+uses aligned line numbers, synchronized scrolling, and distinct removal/addition backgrounds while
+leaving the captured request and response bytes unchanged.
+
+The bottom inspector exposes Content, Rules, and Timing modes. Request and response section
+selectors retain complete labels at usable widths and independently switch to compact native menus
+when their pane cannot fit the full segmented control; the selector never widens one message pane
+or truncates every label to fragments. Timing is a derived native
+waterfall built only from persisted `FlowTiming` milestones: request headers/body, upstream
+connect, TLS handshake, first-byte waiting, response body, and finalization. Its scale uses the
+latest captured milestone for live or incomplete flows, and it omits phases whose endpoints were
+not captured instead of estimating them. DNS timing, socket reuse, and a zoomable cross-flow chart
+require additional capture instrumentation and remain separate increments.
+
 Compose Request, Repeat Request, and Edit & Repeat are explicit control-plane actions.
 `ReplayService` sends the composed, captured, or edited request through the core
 `RequestReplayClient` port, persists the returned flow in the current workspace session, and
@@ -451,12 +493,24 @@ When the workspace is empty, `SessionService` creates a stopped local session to
 The editor accepts a request line, headers, and UTF-8 body text. Captured gzip, x-gzip, and
 deflate text bodies are decoded for editing and re-encoded before replay; unsupported captured
 encodings remain unchanged. A composed body may use identity, gzip, x-gzip, or deflate encoding.
+Compose Request can also import a cURL command from the clipboard. The bounded application-layer
+parser accepts common browser and API-client exports, including request method, URL, repeated
+headers, cookies, user agent, referer, HTTP/1.x selection, and text/JSON data. It tokenizes quotes
+and line continuations locally; it never invokes a shell or reads referenced files. File-backed
+data, cookie/header files, uploads, multipart forms, URL-encoded data helpers, binary escapes, and
+unknown behavior-changing options are rejected with an editable error instead of being guessed.
 Both stored and decoded body loading are capped at 1 MiB, and edits are checked against the same
 limit before sending. Binary and larger bodies remain unchanged. The SwiftNIO adapter connects
 directly to the selected HTTP or HTTPS upstream, verifies TLS, strips hop-by-hop headers,
 recomputes `Host` and `Content-Length`, does not follow redirects, rejects truncated or oversized
 request bodies, bounds captured response bytes, and fails idle responses after 30 seconds. Active
 rules are not re-evaluated for replays.
+
+The compose sheet also exposes local presets and recent history. `TrafficRequestComposerStoring`
+persists only bounded UTF-8 request text in UserDefaults, caps history and preset counts, updates
+presets by case-insensitive name, and records history only after a composed request succeeds. Raw
+captured bodies and session data remain in the authoritative session store; composer history is a
+convenience cache and can be cleared independently.
 
 ## Persistence architecture
 
@@ -471,6 +525,18 @@ Recommended responsibilities:
 - `SessionStore` actor serializes storage commands and coordinates database/file operations.
 
 SQLite should store searchable metadata, headers, timing, body references, rule traces, annotations, and indexes. Large request/response bodies and WebSocket frames should be stored as managed files. GRDB is the persistence adapter; domain code should depend on `FlowStore` and `BodyStore` protocols instead.
+
+WebSocket capture follows the same metadata/payload split. The NIO upgrade bridge relays frames on
+their channel event loops, emits immutable frame snapshots through `WebSocketFrameEventSink`, and
+serializes persistence without blocking those loops. GRDB stores frame direction, opcode, flags,
+sequence, time, and payload references while `FileBodyStore` owns larger payload bytes. The AppKit
+inspector subscribes through an application-layer event bus, keeps only the latest 500 frame rows
+in its live presentation, and loads the selected payload lazily for derived JSON, text, or hex
+display. Direction filtering remains metadata-only. Payload search reads at most 8 MiB per query
+and skips individual payloads above 256 KiB, reporting skipped frames instead of allowing an
+unbounded inspector task. Export loads the complete persisted flow history and streams a versioned
+JSON document through an atomic staging file; text payloads use UTF-8 and binary or invalid UTF-8
+payloads use base64. Captured bytes and stored payload references remain authoritative.
 
 The database should use migrations from the first schema and support recovery from interrupted sessions. A flow that ends during a crash or disconnect should remain inspectable with an explicit incomplete state.
 
@@ -491,14 +557,69 @@ Keep matching and rule planning in `ProxyLensCore`. Keep file reads, breakpoint 
 
 P0 rules currently implemented in the shared pipeline:
 
-- Block and Allow, evaluated during request headers. The first matching allow or block terminates later block/allow rules in that phase.
+- Block and Allow at request headers, plus operation-aware Block at request body after bounded
+  GraphQL discovery. The first matching allow or block terminates later block/allow rules in that
+  phase. A request-body block returns the same local 403 response without opening the upstream
+  connection.
 - No-cache request and response header rewriting.
-- Map Local, evaluated during request headers. The first matching map-local rule serves a preloaded local response and skips the upstream connection. File bytes are loaded in `RuleEngine` and published through `MutableRuleSnapshot`; NIO handlers only read the snapshot.
-- Map Remote, evaluated during request headers. The first matching map-remote rule rewrites the upstream scheme, host, port, and path, then connects to that destination. An origin-only destination (`http://host` or `http://host/`) keeps the original path and query; a destination with a path or query replaces them. The captured request URL stays client-facing; `ConnectionInfo` records the mapped upstream. Map Local and Map Remote are mutually exclusive: the first matching mapping rule wins.
-- Breakpoint, evaluated during request or response headers. The first matching breakpoint pauses the flow until the user continues or aborts. Request breakpoints wait until the request is complete, then hold the upstream connect; response breakpoints buffer the upstream response and hold the client write. Continue can apply edited start-line, headers, and body text. Abort cancels the flow and returns 403 to the client. Matching stays in `RulePlanner`; `BreakpointCoordinator` owns the wait. NIO handlers hop off the event loop, await the decision, then hop back. Block and Map Local skip request breakpoints; Map Remote can still pause.
+- Map Local, evaluated during request headers or after bounded request-body discovery. The first
+  matching map-local rule serves a preloaded local response and skips the upstream connection.
+  Operation-aware GraphQL rules use the request-body phase so a shared endpoint can return a
+  fixture selected by operation kind/name. File bytes are loaded in `RuleEngine` and published
+  through `MutableRuleSnapshot`; NIO handlers only read the snapshot.
+- Map Remote, evaluated during request headers or after bounded request-body discovery. The first
+  matching map-remote rule rewrites the upstream scheme, host, port, and path, then connects to that
+  destination. Operation-aware GraphQL rules use the request-body phase so different operations on
+  one endpoint can map to different upstreams before a connection opens. An origin-only destination
+  (`http://host` or `http://host/`) keeps the original path and query; a destination with a path or
+  query replaces them. The captured request URL stays client-facing; `ConnectionInfo` is replaced
+  with the actual mapped upstream before the request is forwarded. Map Local and Map Remote are
+  mutually exclusive: the first matching mapping rule wins.
+- Redirect, evaluated during request headers. The first matching rule returns a client-visible
+  `307 Temporary Redirect` with an absolute HTTP or HTTPS `Location`, records the local response,
+  and skips the upstream connection. Using 307 preserves the original method and body if the client
+  follows the redirect. Redirect is mutually exclusive with Block, Map Local, and Map Remote; the
+  first terminal rule wins. The flow-table action matches the selected request's host and path.
+- Throttle, initially evaluated during request headers. The first matching profile can add bounded
+  latency before the upstream connection is opened. The delay is scheduled on the channel event
+  loop and never sleeps or blocks that event-loop thread. Upload and download bytes are paced with
+  cumulative event-loop deadlines; high/low queue watermarks toggle channel `autoRead` so slow
+  profiles cannot grow memory without bound. Flow-table Network Conditions provides removable,
+  host-scoped latency-only rules plus Slow 3G, Fast 3G, and Wi-Fi latency/bandwidth presets. A
+  native Custom editor accepts bounded latency, download, upload, and request-loss values for
+  one-off host profiles. An optional name persists a reusable profile in local preferences; saved
+  profiles can be applied to any selected host or removed without affecting existing runtime
+  rules. Request loss is sampled deterministically from `FlowID`. A sampled request becomes a
+  `.simulatedNetworkFailure` before any upstream connection, preserving HTTP framing and producing
+  a truthful failed-flow snapshot and rule trace.
+- Replace Body, evaluated during request or response body phases. The first matching replacement
+  supplies complete inline bytes. Request replacement forwards those bytes upstream while the
+  captured client body stays authoritative. Response replacement suppresses the upstream body sent
+  to the client while the original upstream bytes remain authoritative in capture. `RuleEngine`
+  preloads selected files with the same 10 MiB rule-file limit used by Map Local. Capture removes
+  stale transfer, encoding, range, trailer, and integrity headers, then writes exact
+  `Content-Length` and inferred `Content-Type` headers. Bodyless HEAD, informational, 204, and 304
+  responses are never replaced. Flow-table actions can match the selected request's host/path or
+  its discovered GraphQL kind/name and can coexist with Map Remote and Breakpoint; an edited
+  breakpoint response takes precedence over a configured response replacement. Block and Map Local
+  still prevent an upstream request.
+- Breakpoint, evaluated during request headers, request bodies, or response headers. The first matching breakpoint pauses the flow until the user continues or aborts. Request-header breakpoints wait until the request is complete, then hold the upstream connect. Activating a request-body rule deliberately buffers bounded requests instead of opening the upstream connection, allowing GraphQL operation discovery and operation-scoped Block or Breakpoint actions before any bytes are forwarded. Response breakpoints buffer the upstream response and hold the client write. Continue can apply edited start-line, headers, and body text. Abort cancels the flow and returns 403 to the client. Matching stays in `RulePlanner`; `BreakpointCoordinator` owns the wait. NIO handlers hop off the event loop, await the decision, then hop back. Block and Map Local skip request breakpoints; Map Remote can still pause.
 - Display/filter matching.
 
-Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`.
+Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`. The native Rules sheet projects the ordered live set and can enable, disable, remove, or safely edit representable rules without changing stable rule identity. Its validated rule form creates and edits Block, Allow, Breakpoint, and No Cache rules with action-compatible phases and bounded matcher inputs. Unsupported composite, case-sensitive, or file-backed shapes stay read-only instead of losing data. File-backed mapping and replacement actions remain contextual so resources are validated and preloaded before publication.
+
+`RuleProfile` is a versioned, durable snapshot of the complete live `RuleSet` plus every referenced
+`MapLocalSpec`. `FileRuleProfileStore` writes bounded JSON archives atomically under Application
+Support, limits storage to 50 profiles and 64 MiB per archive, and updates same-name profiles while
+preserving their stable identity and creation date. The Rules sheet can save, apply, and remove
+named profiles. Applying validates the schema and all Map Local references before atomically
+replacing the published rule set; deleting a profile does not mutate the active rules.
+`RuleProfileArchiveService` exports the same complete snapshot as a versioned `.proxylensrules`
+JSON document using an atomic file replacement. Import treats the file as untrusted input: it must
+be a regular file, remain within the 64 MiB limit, decode as the current schema, contain a bounded
+profile name, and provide exactly one embedded resource for every referenced Map Local action
+before `FileRuleProfileStore` persists it. Importing the same identity or name updates that local
+profile without applying it to live traffic.
 
 P0 application source attribution currently implemented:
 
@@ -511,20 +632,51 @@ P0 body inspection currently implemented:
 
 - `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
 - `HTTPContentCoding` unwraps gzip, x-gzip, and deflate with a bounded decoded size for the derived JSON view and Edit & Repeat. Edited compressed text is re-encoded before replay. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
-- The inspector adds a read-only JSON segment next to Headers and Body. It applies native, presentation-only syntax colors to JSON tokens, HTTP header names/values, XML in the raw Body tab, and URL-encoded form keys/values. The Compose Request and Edit & Repeat windows reuse the same palette, initially pretty-print valid JSON, and refresh body highlighting when either headers or body text changes. Opening and sending an untouched formatted captured body still replays the authoritative captured bytes. Raw Body highlighting uses the declared content type; `application/xml`, `text/xml`, and `+xml` types are treated as XML, and `application/x-www-form-urlencoded` is treated as form data. A decoder failure leaves the raw body available and shows a reason on the JSON tab. Tree view, decoded XML/form tabs, multipart parsing, Protobuf, and JSONPath remain out of scope.
+- The inspector adds read-only JSON, Tree, XML, Form, and request-only GraphQL segments next to Headers and Body. JSON applies native, presentation-only syntax colors; Tree presents the same derived JSON as an expandable native outline with key/value columns. Tree construction runs away from the main actor and is bounded to 10,000 nodes, 64 levels, and the inspector's existing 1 MiB decoded-body limit; truncation is explicit. XML is pretty-printed only after bounded decoding and parsing with external entities disabled; document type declarations are rejected. Form decoding supports declared URL-encoded and multipart form-data, preserves field order, duplicates, and empty values, and summarizes file parts without rendering their untrusted binary bytes. Multipart boundaries, decoded bodies, and rendered output are bounded; nested multiparts and transfer encodings are not interpreted. GraphQL accepts JSON envelopes and `application/graphql`, formats operations and variables, and exposes operation discovery in the flow list and filters. The inspector also colors HTTP header names/values and all supported structured text. Its Timing mode presents total and first-byte duration plus the captured phase waterfall. The Compose Request and Edit & Repeat windows reuse the same palette, initially pretty-print valid JSON, and refresh body highlighting when either headers or body text changes. Opening and sending an untouched formatted captured body still replays the authoritative captured bytes. A decoder failure leaves the raw body available and shows a reason on the relevant derived view. JSONPath queries the derived JSON with root, object-key, array-index, quoted-key, and wildcard selectors; input, match count, depth, and rendered match size are bounded. Protobuf remains a future increment.
+- Request and response Cookies segments derive readable cookie pairs and `Set-Cookie` attributes from the captured headers. Multiple header fields remain ordered, cookie values keep embedded equals signs, and the raw headers remain authoritative for export, replay, and breakpoint editing.
 
-P0 export currently implemented:
+P0 HAR interchange and export currently implemented:
 
-- Copy as cURL from a single captured flow. Hop-by-hop and auto-set headers (`Content-Length`, `Transfer-Encoding`, `Connection`, and related) are omitted. The request body is the captured raw bytes from `BodyStore`.
-- Export HAR 1.2 for a single flow. Incomplete flows emit `status` 0. Truncation, cancellation, and failure are recorded in `comment`. `ExportService` reads in-memory `Flow` snapshots and body bytes; it does not import HAR, export a session, or talk to NIO.
+- Copy URL, request/response headers, request/response bodies, request/response cookies, or cURL
+  from a single captured flow. Missing values are disabled in the native submenu. Hop-by-hop and
+  auto-set headers (`Content-Length`, `Transfer-Encoding`, `Connection`, and related) are omitted
+  from cURL. Request body generation uses captured raw bytes from `BodyStore`; direct body copying
+  is bounded and uses text when decodable or base64 for binary payloads.
+- Export HAR 1.2 for one flow, the current multi-row selection, or every flow in a selected session. Selected-row export follows the visible table order. Session export preserves capture order and includes the complete session even when the table has active filters. Incomplete flows emit `status` 0. Truncation, cancellation, and failure are recorded in `comment`. `ExportService` reads immutable `Flow` snapshots and authoritative body bytes; it does not talk to NIO.
+- Whole-session export writes one entry at a time to a sibling staging file, then atomically replaces the destination after the document is complete. This avoids retaining every body in memory and preserves an existing destination when body loading, serialization, cancellation, or file writing fails.
+- Import a HAR 1.2 file as a stopped, named offline session from the native **Import…** action. `HARImportService` accepts HTTP and HTTPS entries, preserves ordered duplicate headers, status, timing, HTTP version, UTF-8 text bodies, and base64 bodies, and maps entries without a response to failed flows. The newly imported session and first flow are selected for immediate inspection.
+- HAR input is untrusted and bounded before persistence: files are limited to 100 MiB, logs to 10,000 entries, and each represented body to the configured capture-body limit (50 MiB by default). Unsupported versions, URL schemes, header fields, encodings, and invalid base64 fail the import. A partially persisted import is rolled back with its body references.
 
-The traffic console exposes both actions on the flow-table context menu. Inspector text is not the export source.
+The traffic console exposes selected-flow export actions on the flow-table context menu, whole-session HAR export on each session's source-list context menu, and HAR or ProxyLens-session import in the workspace header with the Command-O shortcut. Inspector text is never the export source; the selected-flow action follows the current projection, while whole-session export intentionally ignores it.
+
+P1 OpenAPI export currently implemented:
+
+- The flow-table context menu exports one or more selected flows as OpenAPI 3.0 YAML. The
+  deterministic document aggregates servers, paths, methods, query parameter names, response
+  statuses, and request/response media types across the selection.
+- JSON request and response bodies contribute bounded, inferred schemas only; header values and
+  body examples are never copied. Body reads are capped at 1 MiB and preserve the raw flow bytes
+  as the authoritative source. Empty selections and unsupported methods fail without writing a
+  partial destination.
 
 P0 session persistence currently implemented:
 
 - Capture upserts every flow snapshot into `GRDBSessionStore` before the UI sees it. Bodies stay in `FileBodyStore`.
-- On launch, `SessionService.loadWorkspace()` hydrates the traffic console with every persisted flow, oldest first, after capture recovery. Inspection and HAR/cURL work with capture stopped because they read `BodyStore` from those restored `Flow` snapshots.
-- Clear Session stops capture if it is running, empties the console, and deletes every session plus body files. Pending live events are discarded so cleared flows cannot reappear. A new capture can append afterward. Restore failures are shown in the status bar. There is no session picker or portable session file; HAR remains the interchange format.
+- On launch, `SessionService` hydrates the traffic console with persisted sessions and every persisted flow, oldest first, after capture recovery. Inspection and HAR/cURL work with capture stopped because they read `BodyStore` from those restored `Flow` snapshots.
+- The source sidebar presents saved sessions newest first with their recording, stopped, or interrupted state. Selecting a session projects only its flows while preserving the global search and filter controls. Inactive sessions can be renamed or deleted from the native context menu; the active recording session is protected. Capture start and stop refresh the session projection without requiring a relaunch.
+- Clear Session stops capture if it is running, empties the console, and deletes every session plus body files. Pending live events are discarded so cleared flows cannot reappear. A new capture can append afterward. Restore failures are shown in the status bar.
+- A portable session is a Finder package with the `.proxylens` extension. Version 1 contains `manifest.json`, one bounded metadata record per flow under `flows/`, and separate authoritative request and response bytes under `bodies/`. Export streams flows into a sibling staging package and replaces the destination only after the complete package is durable, so a failed export preserves an existing destination.
+- Import treats the package as untrusted input: the root and fixed subdirectories must be real directories rather than symbolic links, metadata and body sizes are bounded, body digests are verified while streaming into `BodyStore`, and any partial import is rolled back. Imported sessions receive fresh session, flow, and body identities, are marked stopped for offline inspection, and can safely be imported more than once. A live snapshot that has not reached a terminal state is exported as an explicit failed offline flow rather than as a permanently recording session.
+- Native packages preserve headers, response metadata, timing, annotations, applied rule traces, and raw request/response bytes. They do not yet contain global rule definitions because durable rule profiles are application-owned rather than session-owned; adding profiles to portable package interchange remains separate work.
+
+P1 flow organization currently implemented:
+
+- Local flow annotations persist a normalized comment, one of six highlight colors, and a strikethrough flag in indexed flow columns as well as the encoded snapshot. Annotation updates use a dedicated store operation, and ordinary capture upserts deliberately preserve those columns so a later stale network event cannot erase user metadata. The console can search comments and filter by annotation kind or color.
+- Two-flow comparison is derived from immutable snapshots and bounded body reads. The AppKit sheet
+  offers synchronized side-by-side panes and a standard unified representation for the selected
+  request or response. Copy uses the generated unified text, while export performs one atomic write
+  to a user-selected `.diff` destination. Binary, oversized, and unavailable bodies remain explicit
+  placeholders rather than being coerced or omitted silently.
 
 P0 HTTPS certificate trust currently implemented:
 

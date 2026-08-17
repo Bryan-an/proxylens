@@ -10,6 +10,10 @@ public enum ProxyLensError: Error, Equatable, LocalizedError, Sendable {
     case invalidPattern(String)
     case invalidURL(String)
     case invalidHTTPMessage(String)
+    case annotationCommentTooLong(maximum: Int)
+    case sessionNameTooLong(maximum: Int)
+    case cannotRenameRecordingSession
+    case cannotRemoveRecordingSession
     case unsupportedOperation(String)
 
     public var errorDescription: String? {
@@ -30,6 +34,14 @@ public enum ProxyLensError: Error, Equatable, LocalizedError, Sendable {
             "Invalid URL: \(url)"
         case .invalidHTTPMessage(let message):
             "Invalid HTTP message: \(message)"
+        case .annotationCommentTooLong(let maximum):
+            "Flow comments cannot exceed \(maximum) characters"
+        case .sessionNameTooLong(let maximum):
+            "Session names cannot exceed \(maximum) characters"
+        case .cannotRenameRecordingSession:
+            "Stop capture before renaming its session"
+        case .cannotRemoveRecordingSession:
+            "Stop capture before deleting its session"
         case .unsupportedOperation(let operation):
             "Unsupported operation: \(operation)"
         }

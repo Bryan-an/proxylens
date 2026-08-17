@@ -6,5 +6,19 @@ public protocol FlowStore: Sendable {
     func load(flowID: FlowID) async throws -> Flow?
     func listFlows(in sessionID: SessionID) async throws -> [Flow]
     func listSummaries(in sessionID: SessionID) async throws -> [FlowSummary]
+    func updateAnnotation(_ annotation: FlowAnnotation?, for flowID: FlowID) async throws -> Flow?
     func remove(flowID: FlowID) async throws
+}
+
+extension FlowStore {
+    public func updateAnnotation(_ annotation: FlowAnnotation?, for flowID: FlowID) async throws
+        -> Flow?
+    {
+        guard var flow = try await load(flowID: flowID) else {
+            return nil
+        }
+        flow.setAnnotation(annotation)
+        try await save(flow)
+        return flow
+    }
 }

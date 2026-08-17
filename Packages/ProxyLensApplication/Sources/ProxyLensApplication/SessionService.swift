@@ -15,6 +15,38 @@ public struct SessionService: Sendable {
         }
     }
 
+    public func loadSessions() async throws -> [Session] {
+        try await sessionStore.listSessions().sorted { lhs, rhs in
+            if lhs.startedAt != rhs.startedAt {
+                return lhs.startedAt > rhs.startedAt
+            }
+            return lhs.id.description < rhs.id.description
+        }
+    }
+
+    @discardableResult
+    public func renameSession(sessionID: SessionID, to name: String?) async throws -> Session? {
+        guard var session = try await sessionStore.loadSession(sessionID: sessionID) else {
+            return nil
+        }
+        guard session.state != .recording else {
+            throw ProxyLensError.cannotRenameRecordingSession
+        }
+        try session.rename(to: name)
+        try await sessionStore.saveSession(session)
+        return session
+    }
+
+    public func removeSession(sessionID: SessionID) async throws {
+        guard let session = try await sessionStore.loadSession(sessionID: sessionID) else {
+            return
+        }
+        guard session.state != .recording else {
+            throw ProxyLensError.cannotRemoveRecordingSession
+        }
+        try await sessionStore.removeSession(sessionID: sessionID)
+    }
+
     public func clearWorkspace() async throws {
         let sessions = try await sessionStore.listSessions()
         for session in sessions {
@@ -33,5 +65,14 @@ public struct SessionService: Sendable {
         let session = try await sessionStore.createSession()
         try await sessionStore.stopSession(sessionID: session.id)
         return session.id
+    }
+
+    /// Persists local user metadata without coupling the UI to a concrete store.
+    @discardableResult
+    public func updateAnnotation(
+        _ annotation: FlowAnnotation?,
+        for flowID: FlowID
+    ) async throws -> Flow? {
+        try await sessionStore.updateAnnotation(annotation, for: flowID)
     }
 }

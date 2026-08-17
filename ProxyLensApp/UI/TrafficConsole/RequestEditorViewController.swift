@@ -1,18 +1,31 @@
 import AppKit
+import ProxyLensApplication
 import ProxyLensCore
 
 @MainActor
 final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
     private let draft: TrafficRequestEditDraft
+    private let allowsCURLImport: Bool
+    private let composerStore: (any TrafficRequestComposerStoring)?
     private let initialBodyText: String
     private var bodyLanguage: InspectorSyntaxHighlighter.Language
     private let headersTextView = NSTextView()
     private let bodyTextView = NSTextView()
     private let bodyMessageField = NSTextField(wrappingLabelWithString: "")
+    private let importCURLButton = NSButton()
+    private let historyButton = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let presetsButton = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let savePresetButton = NSButton()
     private var bodyHighlightTask: Task<Void, Never>?
 
-    init(draft: TrafficRequestEditDraft) {
+    init(
+        draft: TrafficRequestEditDraft,
+        allowsCURLImport: Bool = false,
+        composerStore: (any TrafficRequestComposerStoring)? = nil
+    ) {
         self.draft = draft
+        self.allowsCURLImport = allowsCURLImport
+        self.composerStore = composerStore
         let contentType = Self.contentType(in: draft.headersText)
         bodyLanguage = Self.bodyLanguage(
             contentType: contentType,
@@ -72,6 +85,13 @@ final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
         let headersLabel = NSTextField(labelWithString: "Request line and headers")
         headersLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         headersLabel.setAccessibilityIdentifier("requestEditor.headers.label")
+        importCURLButton.title = "Import cURL from Clipboard"
+        importCURLButton.bezelStyle = .rounded
+        importCURLButton.target = self
+        importCURLButton.action = #selector(importCURLFromPasteboard(_:))
+        importCURLButton.isHidden = !allowsCURLImport
+        importCURLButton.setAccessibilityIdentifier("requestEditor.importCURL")
+        importCURLButton.setAccessibilityLabel("Import cURL from Clipboard")
         let bodyLabel = NSTextField(labelWithString: "Body")
         bodyLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         bodyLabel.setAccessibilityIdentifier("requestEditor.body.label")
@@ -82,22 +102,44 @@ final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
         bodyMessageField.isHidden = draft.bodyMessage == nil
         bodyMessageField.setAccessibilityIdentifier("requestEditor.body.message")
 
+        configureComposerControls()
+
         let headersScrollView = makeScrollView(documentView: headersTextView)
         let bodyScrollView = makeScrollView(documentView: bodyTextView)
-        for child in [headersLabel, headersScrollView, bodyLabel, bodyMessageField, bodyScrollView]
-        {
+        for child in [
+            headersLabel,
+            importCURLButton,
+            headersScrollView,
+            bodyLabel,
+            bodyMessageField,
+            bodyScrollView
+        ] {
             child.translatesAutoresizingMaskIntoConstraints = false
         }
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 720, height: 460))
+        let composerControls: NSStackView?
+        if composerStore != nil {
+            let controls = NSStackView(views: [historyButton, presetsButton, savePresetButton])
+            controls.orientation = .horizontal
+            controls.alignment = .centerY
+            controls.spacing = 8
+            controls.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(controls)
+            composerControls = controls
+        } else {
+            composerControls = nil
+        }
         container.addSubview(headersLabel)
+        container.addSubview(importCURLButton)
         container.addSubview(headersScrollView)
         container.addSubview(bodyLabel)
         container.addSubview(bodyMessageField)
         container.addSubview(bodyScrollView)
         NSLayoutConstraint.activate([
             headersLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            headersLabel.topAnchor.constraint(equalTo: container.topAnchor),
+            importCURLButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            importCURLButton.centerYAnchor.constraint(equalTo: headersLabel.centerYAnchor),
             headersScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             headersScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             headersScrollView.topAnchor.constraint(equalTo: headersLabel.bottomAnchor, constant: 6),
@@ -115,7 +157,45 @@ final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
             bodyScrollView.topAnchor.constraint(equalTo: bodyLabel.bottomAnchor, constant: 6),
             bodyScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
+        if let composerControls {
+            NSLayoutConstraint.activate([
+                composerControls.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                composerControls.topAnchor.constraint(equalTo: container.topAnchor),
+                composerControls.heightAnchor.constraint(equalToConstant: 28),
+                headersLabel.topAnchor.constraint(
+                    equalTo: composerControls.bottomAnchor,
+                    constant: 8
+                )
+            ])
+        } else {
+            headersLabel.topAnchor.constraint(equalTo: container.topAnchor).isActive = true
+        }
         view = container
+    }
+
+    func importCURLCommand(_ command: String) throws {
+        let request = try CURLRequestImporter.parse(command)
+        let importedBody: String
+        if let data = request.body?.inlineData {
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw ProxyLensError.unsupportedOperation(
+                    "Binary cURL bodies cannot be edited as text"
+                )
+            }
+            importedBody = text
+        } else {
+            importedBody = ""
+        }
+
+        headersText = HTTPMessageText.requestHeaders(request)
+        bodyLanguage = Self.bodyLanguage(
+            contentType: Self.contentType(in: headersText),
+            bodyText: importedBody
+        )
+        bodyText = Self.formattedBodyText(importedBody, language: bodyLanguage)
+        bodyMessageField.stringValue = ""
+        bodyMessageField.textColor = .secondaryLabelColor
+        bodyMessageField.isHidden = true
     }
 
     func textDidChange(_ notification: Notification) {
@@ -128,6 +208,166 @@ final class RequestEditorViewController: NSViewController, NSTextViewDelegate {
             return
         }
         refreshBodyHighlighting()
+    }
+
+    @objc private func importCURLFromPasteboard(_ sender: NSButton) {
+        guard
+            let command = NSPasteboard.general.string(forType: .string),
+            !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            showImportMessage("Copy a cURL command to the clipboard, then try again.")
+            return
+        }
+
+        do {
+            try importCURLCommand(command)
+        } catch {
+            showImportMessage(error.localizedDescription)
+        }
+    }
+
+    private func showImportMessage(_ message: String) {
+        bodyMessageField.stringValue = message
+        bodyMessageField.textColor = .systemRed
+        bodyMessageField.isHidden = false
+    }
+
+    private func configureComposerControls() {
+        guard composerStore != nil else {
+            return
+        }
+
+        for popup in [historyButton, presetsButton] {
+            popup.autoenablesItems = false
+            popup.bezelStyle = .rounded
+            popup.setContentHuggingPriority(.required, for: .horizontal)
+            popup.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+        historyButton.setAccessibilityIdentifier("requestEditor.history")
+        historyButton.setAccessibilityLabel("Request composer history")
+        presetsButton.setAccessibilityIdentifier("requestEditor.presets")
+        presetsButton.setAccessibilityLabel("Request composer presets")
+
+        savePresetButton.title = "Save Preset…"
+        savePresetButton.bezelStyle = .rounded
+        savePresetButton.target = self
+        savePresetButton.action = #selector(savePreset(_:))
+        savePresetButton.setAccessibilityIdentifier("requestEditor.savePreset")
+        savePresetButton.setAccessibilityLabel("Save current request as a preset")
+        reloadComposerMenus()
+    }
+
+    private func reloadComposerMenus() {
+        guard let composerStore else {
+            return
+        }
+        populateComposerMenu(
+            historyButton,
+            title: "History",
+            emptyTitle: "No recent requests",
+            entries: composerStore.history,
+            action: #selector(selectHistory(_:))
+        )
+        populateComposerMenu(
+            presetsButton,
+            title: "Presets",
+            emptyTitle: "No saved presets",
+            entries: composerStore.presets,
+            action: #selector(selectPreset(_:))
+        )
+    }
+
+    private func populateComposerMenu(
+        _ popup: NSPopUpButton,
+        title: String,
+        emptyTitle: String,
+        entries: [TrafficRequestComposerEntry],
+        action: Selector
+    ) {
+        popup.removeAllItems()
+        popup.addItem(withTitle: title)
+        popup.item(at: 0)?.isEnabled = false
+        if entries.isEmpty {
+            popup.addItem(withTitle: emptyTitle)
+            popup.item(at: 1)?.isEnabled = false
+            return
+        }
+        for entry in entries {
+            let item = NSMenuItem(title: entry.name, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry
+            popup.menu?.addItem(item)
+        }
+    }
+
+    @objc private func selectHistory(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? TrafficRequestComposerEntry else {
+            return
+        }
+        loadComposerEntry(entry)
+    }
+
+    @objc private func selectPreset(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? TrafficRequestComposerEntry else {
+            return
+        }
+        loadComposerEntry(entry)
+    }
+
+    private func loadComposerEntry(_ entry: TrafficRequestComposerEntry) {
+        headersText = entry.headersText
+        bodyLanguage = Self.bodyLanguage(
+            contentType: Self.contentType(in: entry.headersText),
+            bodyText: entry.bodyText
+        )
+        bodyText = Self.formattedBodyText(entry.bodyText, language: bodyLanguage)
+        bodyMessageField.stringValue = ""
+        bodyMessageField.textColor = .secondaryLabelColor
+        bodyMessageField.isHidden = true
+    }
+
+    @objc private func savePreset(_: NSButton) {
+        Task { @MainActor [weak self] in
+            await self?.presentSavePreset()
+        }
+    }
+
+    private func presentSavePreset() async {
+        guard let composerStore else {
+            return
+        }
+        let nameField = NSTextField(string: "")
+        nameField.placeholderString = "Preset name"
+        nameField.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+
+        let alert = NSAlert()
+        alert.messageText = "Save Request Preset"
+        alert.informativeText = "Give this request a reusable local name."
+        alert.accessoryView = nameField
+        alert.addButton(withTitle: "Save")
+        let cancelButton = alert.addButton(withTitle: "Cancel")
+        cancelButton.keyEquivalent = "\u{1b}"
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        do {
+            _ = try composerStore.savePreset(
+                name: nameField.stringValue,
+                headersText: headersText,
+                bodyText: bodyText
+            )
+            reloadComposerMenus()
+        } catch {
+            showImportMessage(error.localizedDescription)
+        }
     }
 
     private func refreshBodyHighlighting() {

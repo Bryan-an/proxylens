@@ -43,6 +43,7 @@ enum InspectorSyntaxHighlighter {
         case json
         case urlEncodedForm
         case xml
+        case graphql
     }
 
     static func language(forContentType contentType: String?) -> Language {
@@ -63,6 +64,9 @@ enum InspectorSyntaxHighlighter {
             || mediaType.hasSuffix("+xml")
         {
             return .xml
+        }
+        if mediaType == "application/graphql" {
+            return .graphql
         }
         return .plainText
     }
@@ -167,6 +171,43 @@ enum InspectorSyntaxHighlighter {
                     range: match.range
                 )
             }
+        case .graphql:
+            graphqlKeywordPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.literal,
+                    range: match.range
+                )
+            }
+            graphqlVariablePattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.number,
+                    range: match.range
+                )
+            }
+            graphqlCommentPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: NSColor.secondaryLabelColor,
+                    range: match.range
+                )
+            }
+            graphqlStringPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.string,
+                    range: match.range
+                )
+            }
         }
 
         return result
@@ -205,5 +246,21 @@ enum InspectorSyntaxHighlighter {
     private static let xmlMarkupPattern = try! NSRegularExpression(
         pattern: #"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>"#,
         options: [.dotMatchesLineSeparators]
+    )
+
+    private static let graphqlKeywordPattern = try! NSRegularExpression(
+        pattern: #"\b(?:query|mutation|subscription|fragment|on|true|false|null)\b"#
+    )
+
+    private static let graphqlVariablePattern = try! NSRegularExpression(
+        pattern: #"\$[A-Za-z_][A-Za-z0-9_]*"#
+    )
+
+    private static let graphqlCommentPattern = try! NSRegularExpression(
+        pattern: #"(?m)#.*$"#
+    )
+
+    private static let graphqlStringPattern = try! NSRegularExpression(
+        pattern: #"\"(?:\\.|[^\"\\])*\""#
     )
 }

@@ -4,6 +4,10 @@
 **Product version used as the current reference:** Proxyman macOS 6.14.0, released 2026-07-23  
 **Purpose:** establish the product context and a practical parity target for ProxyLens.
 
+**Roadmap scope:** P0, P1, and P2 are authorized product targets. Delivery remains staged: the
+macOS desktop data plane comes first, followed by richer protocols/tools and then companion,
+automation, and collaboration surfaces.
+
 This is a public-surface investigation based on Proxyman's official website, user manual, pricing page, and changelog. It describes what the product exposes to users; it does not claim to reproduce Proxyman's private implementation.
 
 ## Executive summary
@@ -358,13 +362,16 @@ The most important boundary is between raw bytes and decoded views. The raw mess
 
 ## Free clone strategy for ProxyLens
 
-The commercial product has a large surface area. A good free implementation should prioritize the workflow that creates daily value rather than reproducing licensing, cloud, or every platform immediately.
+The commercial product has a large surface area. ProxyLens targets the complete staged roadmap
+below while prioritizing the workflow that creates daily value. “P0,” “P1,” and “P2” describe
+dependency order, not excluded scope or paid feature tiers.
 
 ### P0: useful local desktop proxy
 
 - Local HTTP/HTTPS MITM proxy with explicit start/stop/recording state.
 - Generated root CA, install/export instructions, and per-domain SSL Proxying rules.
-- Three-pane flow workspace with app/domain grouping.
+- Three-pane flow workspace with app/domain grouping, a persistent Source List visibility toggle,
+  and persistent pinned domains.
 - Request/response headers, query, cookies, raw message, body, JSON pretty/tree view, and search.
 - Primary URL/status/content-type filters plus full-text search.
 - HAR import/export and a native local session format.
@@ -374,11 +381,57 @@ The commercial product has a large surface area. A good free implementation shou
 
 ### P1: differentiated debugger
 
-- Compose tool with cURL import, JSON/form/multipart/raw editing, history, and WebSocket compose.
-- WebSocket frames and SSE streaming.
+- Compose tool with cURL import, JSON/form/multipart/raw editing, reusable local presets, bounded recent history, and WebSocket compose. ProxyLens now provides the HTTP/HTTPS portion with native local preset/history controls; WebSocket compose remains future work.
+- WebSocket frame capture and inspection now covers HTTP and intercepted HTTPS upgrades, live
+  sent/received frame metadata, bounded latest-frame presentation, and lazy formatted JSON, text,
+  or hex payload display. The Frames view now filters All/Sent/Received traffic, searches bounded
+  text payloads, and exports the complete persisted flow history in versioned local JSON. Frame
+  replay/compose and SSE streaming remain future increments.
 - GraphQL operation-name matching.
-- Network throttling and request timing breakdown.
-- Diff, code generation, OpenAPI export, custom filters, JSONPath, and `jq`.
+- Network throttling and request timing breakdown. ProxyLens currently provides removable,
+  host-scoped latency-only presets plus Lost Connection, Very Bad Network, Slow 3G, Fast 3G, and
+  Wi-Fi presets. Profiles can shape upload/download throughput with bounded backpressure and can
+  deterministically fail a percentage of whole requests without corrupting HTTP framing. A native
+  Custom editor creates one-off bounded host profiles for latency, bandwidth, and request loss; an
+  optional profile name persists the settings locally for reuse from any flow, and saved profiles
+  can be removed from the same menu. The bottom inspector now has a native
+  Timing waterfall for request, connection, TLS, waiting, response, and finalization milestones,
+  including truthful partial views for incomplete flows. Lower-level packet/segment loss is
+  intentionally deferred because dropping arbitrary bytes would corrupt HTTP framing; DNS and
+  socket-reuse instrumentation plus the zoomable cross-flow Chart View remain staged increments.
+- Rule management. A compact header action opens a native table of the ordered live rule set with
+  enabled state, action, phase, priority, and matcher scope. Any rule can be toggled without losing
+  its identity or removed immediately. A native New Rule form creates Block, Allow, Breakpoint, and
+  No Cache rules with compatible phases and all-traffic, host, path, method, content-type, or source
+  matching using exact, wildcard, or regular-expression comparisons. Those native rule shapes can
+  also be edited in place without changing stable rule identity or action-specific data. Rule shapes
+  the form cannot represent remain visible but deliberately non-editable to prevent lossy rewrites.
+  File-backed rule actions stay in contextual flow menus so their resources are validated and
+  preloaded. The Rules sheet can save the complete active set as a durable named profile, apply a
+  profile later, or delete it without changing the active rules. Profile archives include embedded
+  Map Local resources, use stable identities for same-name updates, and are bounded to 50 local
+  profiles and 64 MiB each. Portable `.proxylensrules` import and export use native file panels;
+  imports validate schema and bounds and update local storage without silently applying live rules.
+- Diff is available from a two-row traffic selection. The native comparison sheet aligns request
+  or response start lines, headers, and decoded UTF-8 bodies side by side, keeps both panes scrolled
+  together, and marks removals/changes in red and additions/changes in green. Body loading and the
+  line-alignment matrix are bounded; oversized, binary, or unreadable payloads remain explicit
+  metadata placeholders. The same sheet can switch to a syntax-colored unified diff, copy it, or
+  atomically export the selected request/response comparison as a standard `.diff` file. External
+  diff-tool handoff remains a future increment.
+- Request code generation is available from a captured flow for cURL, HTTPie, JavaScript `fetch`,
+  Axios, Python `requests`, Swift `URLSession`, Go `net/http`, and Java `HttpClient`. The native sheet switches among syntax-highlighted,
+  copy-ready snippets while preserving text or binary request bodies and omitting transport-owned
+  headers. Selected flows can also be exported as bounded, deterministic OpenAPI 3.0 YAML. The
+  export describes observed paths, methods, query names, response statuses, media types, and
+  inferred JSON shapes without copying header values or body examples. The inspector now includes
+  a bounded JSONPath query for the derived JSON view; remaining Proxyman generator targets, custom
+  filters, and `jq` remain staged increments.
+- The captured-flow context menu provides a Proxyman-style Copy submenu for URL, request/response
+  headers, bodies, cookies, and cURL. Unavailable values are disabled, body reads are bounded, and
+  binary bodies copy as base64 instead of lossy text. The bottom request/response selectors also
+  preserve full tab names, independently falling back to a compact native menu when a split pane is
+  too narrow.
 - Reverse proxy, SOCKS listener, external upstream proxy, and DNS Spoofing.
 - Protobuf/MessagePack decoding.
 - A constrained JavaScript scripting engine with safe local file access and shared state.
@@ -408,9 +461,11 @@ The commercial product has a large surface area. A good free implementation shou
 
 These decisions will materially affect implementation:
 
-1. **First desktop target:** macOS-only native experience or a cross-platform desktop app.
+1. **First desktop target:** decided — macOS-first native experience; additional platforms remain
+   separate follow-on products rather than a reason to weaken the native console.
 2. **Core engine language:** choose based on TLS interception, async I/O, certificate tooling, and binary protocol libraries—not only UI convenience.
-3. **Mobile scope:** desktop proxying first, or local-VPN apps from the beginning.
+3. **Mobile scope:** decided — reliable desktop proxying first, then the P2 local-VPN companion
+   apps and device onboarding.
 4. **Scripting trust model:** no scripting initially, sandboxed JavaScript, or a fully extensible local runtime.
 5. **Native session format:** use HAR as the first interchange format and add a richer local format only when annotations, rules, raw bytes, and streaming frames require it.
 6. **Privacy posture:** define redaction, secret handling, retention, and export behavior before adding cloud or MCP features.

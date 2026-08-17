@@ -115,6 +115,32 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
         )
     }
 
+    func testHighlightsGraphQLKeywordsVariablesStringsAndComments() {
+        let graphql = #"""
+            query Viewer($id: ID!) { viewer(id: $id) { name # selected field
+            } label(value: "query $ignored") }
+            """#
+        let highlighted = InspectorSyntaxHighlighter.highlight(graphql, as: .graphql)
+
+        XCTAssertEqual(highlighted.string, graphql)
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: "query")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: "$id")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: #""query $ignored""#)!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: "# selected field")!, in: highlighted),
+            .secondaryLabelColor
+        )
+    }
+
     func testSelectsBodyLanguageFromContentType() {
         XCTAssertEqual(
             InspectorSyntaxHighlighter.language(forContentType: "application/xml; charset=utf-8"),
@@ -138,6 +164,10 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
             InspectorSyntaxHighlighter.language(
                 forContentType: "multipart/form-data; boundary=test"),
             .plainText
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(forContentType: "application/graphql"),
+            .graphql
         )
         XCTAssertEqual(
             InspectorSyntaxHighlighter.language(forContentType: "text/plain"),

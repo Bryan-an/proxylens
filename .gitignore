@@ -67,3 +67,6 @@ Pods/
 fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/
+
+# Claude Code local overrides (shared config lives in .claude/settings.json)
+.claude/settings.local.json

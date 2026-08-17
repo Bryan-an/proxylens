@@ -8,6 +8,7 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
     private let statusPopup = NSPopUpButton()
     private let contentTypePopup = NSPopUpButton()
     private let originPopup = NSPopUpButton()
+    private let annotationPopup = NSPopUpButton()
     private let countField = NSTextField(labelWithString: "0 flows")
     private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
     private var isEditingSearch = false
@@ -33,6 +34,7 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
         select(filter.status, in: statusPopup, cases: TrafficStatusFilter.allCases)
         select(filter.contentType, in: contentTypePopup, cases: TrafficContentTypeFilter.allCases)
         select(filter.origin, in: originPopup, cases: TrafficOriginFilter.allCases)
+        select(filter.annotation, in: annotationPopup, cases: TrafficAnnotationFilter.allCases)
 
         let visibleCount = snapshot.visibleRows.count
         countField.stringValue =
@@ -80,6 +82,13 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
             accessibilityLabel: "Filter by traffic source",
             action: #selector(originChanged)
         )
+        configure(
+            annotationPopup,
+            titles: TrafficAnnotationFilter.allCases.map(\.title),
+            accessibilityIdentifier: "traffic.filter.annotation",
+            accessibilityLabel: "Filter by comment or highlight",
+            action: #selector(annotationChanged)
+        )
 
         countField.textColor = .secondaryLabelColor
         countField.alignment = .right
@@ -101,6 +110,7 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
             statusPopup,
             contentTypePopup,
             originPopup,
+            annotationPopup,
             NSView(),
             countField,
             clearButton
@@ -116,11 +126,12 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor),
-            searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
             methodPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 106),
             statusPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 112),
             contentTypePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
-            originPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 118)
+            originPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 108),
+            annotationPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 112)
         ])
     }
 
@@ -208,6 +219,19 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
         viewModel.setOriginFilter(TrafficOriginFilter.allCases[originPopup.indexOfSelectedItem])
     }
 
+    @objc private func annotationChanged() {
+        guard
+            TrafficAnnotationFilter.allCases.indices.contains(
+                annotationPopup.indexOfSelectedItem
+            )
+        else {
+            return
+        }
+        viewModel.setAnnotationFilter(
+            TrafficAnnotationFilter.allCases[annotationPopup.indexOfSelectedItem]
+        )
+    }
+
     @objc private func clearFilters() {
         NSObject.cancelPreviousPerformRequests(
             withTarget: self,
@@ -259,6 +283,7 @@ extension TrafficContentTypeFilter {
     fileprivate var title: String {
         switch self {
         case .all: "All Types"
+        case .graphql: "GraphQL"
         case .json: "JSON"
         case .html: "HTML"
         case .xml: "XML"
@@ -278,6 +303,23 @@ extension TrafficOriginFilter {
         case .desktopProxy: "Desktop Proxy"
         case .importedSession: "Imported"
         case .replay: "Replay"
+        }
+    }
+}
+
+extension TrafficAnnotationFilter {
+    fileprivate var title: String {
+        switch self {
+        case .all: "All Marks"
+        case .commented: "Comments"
+        case .highlighted: "Highlighted"
+        case .struckThrough: "Struck Through"
+        case .red: "Red"
+        case .yellow: "Yellow"
+        case .green: "Green"
+        case .blue: "Blue"
+        case .purple: "Purple"
+        case .gray: "Gray"
         }
     }
 }

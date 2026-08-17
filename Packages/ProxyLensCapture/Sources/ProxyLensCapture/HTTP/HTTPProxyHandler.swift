@@ -12,9 +12,11 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
     private let sessionID: SessionID
     private let eventSink: any FlowEventSink
+    private let webSocketFrameEventSink: any WebSocketFrameEventSink
     private let maxPendingRequestBytes: Int
     private let bodyStore: (any BodyStore)?
     private let maximumCapturedBodyBytes: Int64
+    private let maximumWebSocketFrameBytes: Int
     private let interceptHTTPS: Bool
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSContext: NIOSSLContext?
@@ -41,15 +43,23 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private var pendingTarget: ProxyTarget?
     private var pendingForwardedHead: HTTPRequestHead?
     private var pendingRequest: HTTPRequest?
+    private var pendingThrottleProfile: ThrottleProfile?
+    private var uploadPacer = BandwidthPacer()
+    private var scheduledUploadBytes = 0
+    private var isUploadThrottleReadPaused = false
+    private var isWaitingForThrottleLatency = false
     private var pendingRequestBreakpoint = false
+    private var pendingRequestBodyRuleSet: RuleSet?
     fileprivate var breakpointTask: Task<Void, Never>?
 
     init(
         sessionID: SessionID,
         eventSink: any FlowEventSink,
+        webSocketFrameEventSink: any WebSocketFrameEventSink = NoOpWebSocketFrameEventSink(),
         maxPendingRequestBytes: Int,
         bodyStore: (any BodyStore)? = nil,
         maximumCapturedBodyBytes: Int64 = 50 * 1_024 * 1_024,
+        maximumWebSocketFrameBytes: Int = 16 * 1_024 * 1_024,
         interceptHTTPS: Bool = false,
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSContext: NIOSSLContext? = nil,
@@ -60,9 +70,11 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     ) {
         self.sessionID = sessionID
         self.eventSink = eventSink
+        self.webSocketFrameEventSink = webSocketFrameEventSink
         self.maxPendingRequestBytes = max(1, maxPendingRequestBytes)
         self.bodyStore = bodyStore
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
+        self.maximumWebSocketFrameBytes = min(max(1, maximumWebSocketFrameBytes), Int(UInt32.max))
         self.interceptHTTPS = interceptHTTPS
         self.certificateProvider = certificateProvider
         self.upstreamTLSContext = upstreamTLSContext
@@ -187,11 +199,15 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             version: coreVersion,
             rawTarget: head.uri
         )
+        let ruleSet = ruleSnapshot?.currentRules() ?? RuleSet()
         let requestPlan = RulePlanner.plan(
-            rules: ruleSnapshot?.currentRules() ?? RuleSet(),
+            rules: ruleSet,
             context: RuleMatchContext(request: request, source: flowSource),
             phase: .requestHeaders
         )
+        if ruleSet.hasEnabledRules(for: .requestBody) {
+            pendingRequestBodyRuleSet = ruleSet
+        }
         if requestPlan.applyNoCache {
             do {
                 request = request.replacingHeaders(
@@ -252,7 +268,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     contentType: request.headers.firstValue(for: "Content-Type"),
                     contentEncoding: request.headers.firstValue(for: "Content-Encoding")
                 ),
-                maximumByteCount: maximumCapturedBodyBytes
+                maximumByteCount: maximumCapturedBodyBytes,
+                discoversGraphQLOperation: true
             )
         }
 
@@ -260,6 +277,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.transaction = transaction
         self.pendingTarget = target
         self.pendingRequest = request
+        self.pendingThrottleProfile = requestPlan.throttleProfile
+        uploadPacer.reset()
+        scheduledUploadBytes = 0
+        isUploadThrottleReadPaused = false
 
         if requestPlan.shouldBlock {
             let blockedResponse: HTTPResponse
@@ -280,6 +301,38 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
             finishWithLocalResponse(
                 blockedResponse,
+                traces: requestPlan.traces,
+                transaction: transaction,
+                channel: context.channel
+            )
+            return
+        }
+
+        if let destination = requestPlan.redirectURL {
+            let redirectedResponse: HTTPResponse
+            do {
+                var response = try RedirectedHTTPResponse.make(
+                    destination: destination,
+                    version: coreVersion
+                )
+                if requestPlan.applyNoCache {
+                    response = response.replacingHeaders(
+                        try NoCacheHeaders.applyingToResponse(response.headers)
+                    )
+                }
+                redirectedResponse = response
+            } catch {
+                sendError(
+                    statusCode: 500,
+                    reason: "Internal Server Error",
+                    message: error.localizedDescription,
+                    context: context
+                )
+                return
+            }
+
+            finishWithLocalResponse(
+                redirectedResponse,
                 traces: requestPlan.traces,
                 transaction: transaction,
                 channel: context.channel
@@ -317,18 +370,34 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             return
         }
 
+        if let profile = requestPlan.throttleProfile,
+            profile.dropsRequest(flowID: flow.id)
+        {
+            finishWithSimulatedNetworkFailure(
+                traces: requestPlan.traces,
+                transaction: transaction,
+                channel: context.channel
+            )
+            return
+        }
+
         Task {
             await transaction.start(at: Date())
             await transaction.appendRuleTraces(requestPlan.traces)
         }
 
         var forwardedHeaders: NIOHTTP1.HTTPHeaders
+        let preservesWebSocketUpgrade = HTTPConversion.isWebSocketUpgradeRequest(head)
         if requestPlan.applyNoCache {
             forwardedHeaders = HTTPConversion.sanitizedRequestHeaders(
-                HTTPConversion.nioHeaders(from: request.headers)
+                HTTPConversion.nioHeaders(from: request.headers),
+                preservingWebSocketUpgrade: preservesWebSocketUpgrade
             )
         } else {
-            forwardedHeaders = HTTPConversion.sanitizedRequestHeaders(head.headers)
+            forwardedHeaders = HTTPConversion.sanitizedRequestHeaders(
+                head.headers,
+                preservingWebSocketUpgrade: preservesWebSocketUpgrade
+            )
         }
         if let mappedHostHeader {
             forwardedHeaders.remove(name: "Host")
@@ -344,6 +413,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
         if requestPlan.shouldBreakpoint {
             pendingRequestBreakpoint = true
+            return
+        }
+
+        if pendingRequestBodyRuleSet != nil {
             return
         }
 
@@ -440,23 +513,21 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         upstreamTLSContext: NIOSSLContext,
         channel: Channel
     ) {
-        let response = HTTPResponseHead(
-            version: .http1_1,
-            status: .ok,
-            headers: NIOHTTP1.HTTPHeaders()
-        )
-        channel.write(HTTPServerResponsePart.head(response), promise: nil)
         let sessionID = self.sessionID
         let eventSink = self.eventSink
         let maxPendingRequestBytes = self.maxPendingRequestBytes
         let bodyStore = self.bodyStore
         let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
+        let webSocketFrameEventSink = self.webSocketFrameEventSink
+        let maximumWebSocketFrameBytes = self.maximumWebSocketFrameBytes
         let certificateProvider = self.certificateProvider
         let ruleSnapshot = self.ruleSnapshot
         let breakpointGate = self.breakpointGate
         let flowSource = self.flowSource
-        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).flatMap {
-            HTTPServerPipeline.removePlaintextHTTPHandlers(from: channel)
+        HTTPServerPipeline.removePlaintextHTTPHandlers(from: channel).flatMap {
+            var response = channel.allocator.buffer(capacity: 39)
+            response.writeString("HTTP/1.1 200 Connection Established\r\n\r\n")
+            return channel.writeAndFlush(response)
         }.flatMapThrowing {
             let tlsHandler = NIOSSLServerHandler(context: serverTLSContext)
             try channel.pipeline.syncOperations.addHandler(
@@ -468,9 +539,11 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 handler: HTTPProxyHandler(
                     sessionID: sessionID,
                     eventSink: eventSink,
+                    webSocketFrameEventSink: webSocketFrameEventSink,
                     maxPendingRequestBytes: maxPendingRequestBytes,
                     bodyStore: bodyStore,
                     maximumCapturedBodyBytes: maximumCapturedBodyBytes,
+                    maximumWebSocketFrameBytes: maximumWebSocketFrameBytes,
                     interceptHTTPS: false,
                     certificateProvider: certificateProvider,
                     upstreamTLSContext: upstreamTLSContext,
@@ -517,9 +590,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         recordRequestBody(buffer, context: context)
 
         if let upstreamChannel {
-            upstreamChannel.write(
-                HTTPClientRequestPart.body(.byteBuffer(buffer)),
-                promise: nil
+            forwardRequestBody(
+                buffer,
+                to: upstreamChannel,
+                clientChannel: context.channel
             )
             return
         }
@@ -557,12 +631,20 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             beginRequestBreakpoint(channel: context.channel)
             return
         }
+        if pendingRequestBodyRuleSet != nil {
+            pendingRequestParts.append(HTTPClientRequestPart.end(trailers))
+            beginRequestBodyRuleEvaluation(channel: context.channel)
+            return
+        }
 
         finishRequestBodyCapture(context: context)
 
         let endPart = HTTPClientRequestPart.end(trailers)
         if let upstreamChannel {
-            upstreamChannel.writeAndFlush(endPart, promise: nil)
+            forwardRequestEnd(
+                endPart,
+                to: upstreamChannel
+            )
         } else {
             pendingRequestParts.append(endPart)
         }
@@ -587,11 +669,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         captureWritesInFlight += 1
 
         let channel = context.channel
-        if captureWritesInFlight == 1 {
-            channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
-                channel.close(promise: nil)
-            }
-        }
+        updateClientAutoRead(channel)
 
         let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
         Task {
@@ -621,11 +699,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             return
         }
 
-        if captureWritesInFlight == 0, !captureFailureHandled {
-            channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { _ in
-                channel.close(promise: nil)
-            }
-        }
+        updateClientAutoRead(channel)
     }
 
     private func finishRequestBodyCapture(context: ChannelHandlerContext) {
@@ -642,7 +716,17 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             do {
                 try await writeTask?.value
                 let reference = try await recorder?.finalize()
-                await transaction.finishRequestBody(reference, at: completedAt)
+                let graphqlOperation: GraphQLOperationMetadata? =
+                    if let recorder, let reference {
+                        await recorder.graphqlOperation(for: reference)
+                    } else {
+                        nil
+                    }
+                await transaction.finishRequestBody(
+                    reference,
+                    graphqlOperation: graphqlOperation,
+                    at: completedAt
+                )
             } catch {
                 await recorder?.cancel()
                 await transaction.fail(.persistenceError(error.localizedDescription))
@@ -666,11 +750,24 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             do {
                 try await writeTask?.value
                 let reference = try await recorder?.finalize()
+                let graphqlOperation: GraphQLOperationMetadata? =
+                    if let recorder, let reference {
+                        await recorder.graphqlOperation(for: reference)
+                    } else {
+                        nil
+                    }
                 var pausedRequest = originalRequest
                 if let reference {
-                    pausedRequest = pausedRequest.replacingBody(reference)
+                    pausedRequest = pausedRequest.replacingBody(
+                        reference,
+                        graphqlOperation: graphqlOperation
+                    )
                 }
-                await transaction.finishRequestBody(reference, at: completedAt)
+                await transaction.finishRequestBody(
+                    reference,
+                    graphqlOperation: graphqlOperation,
+                    at: completedAt
+                )
                 await transaction.replaceRequest(pausedRequest)
                 await transaction.pause(.request)
                 let hit = BreakpointHit(
@@ -695,6 +792,277 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
     }
 
+    private func beginRequestBodyRuleEvaluation(channel: Channel) {
+        guard let transaction, let originalRequest = pendingRequest,
+            let rules = pendingRequestBodyRuleSet
+        else {
+            return
+        }
+
+        let writeTask = requestBodyWriteTask
+        let recorder = requestBodyRecorder
+        let gate = breakpointGate
+        let source = flowSource
+        let ruleResources = ruleSnapshot
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        let completedAt = Date()
+        breakpointTask = Task {
+            do {
+                try await writeTask?.value
+                let reference = try await recorder?.finalize()
+                let graphqlOperation: GraphQLOperationMetadata? =
+                    if let recorder, let reference {
+                        await recorder.graphqlOperation(for: reference)
+                    } else {
+                        nil
+                    }
+                let capturedRequest =
+                    if let reference {
+                        originalRequest.replacingBody(
+                            reference,
+                            graphqlOperation: graphqlOperation
+                        )
+                    } else {
+                        originalRequest
+                    }
+                await transaction.finishRequestBody(
+                    reference,
+                    graphqlOperation: graphqlOperation,
+                    at: completedAt
+                )
+                let plan = RulePlanner.plan(
+                    rules: rules,
+                    context: RuleMatchContext(request: capturedRequest, source: source),
+                    phase: .requestBody
+                )
+                await transaction.appendRuleTraces(plan.traces)
+
+                let mappedRemoteTarget: MappedRemoteTarget?
+                if let destination = plan.mapRemoteURL {
+                    let mapped = try MappedRemoteHTTPRequest.make(
+                        originalURL: capturedRequest.url,
+                        destination: destination
+                    )
+                    await transaction.replaceUpstreamConnection(
+                        host: mapped.host,
+                        port: UInt16(mapped.port),
+                        usesTLS: mapped.usesTLS
+                    )
+                    mappedRemoteTarget = mapped
+                } else {
+                    mappedRemoteTarget = nil
+                }
+
+                let replacementBody: BodyReference?
+                if let body = plan.replacementBody {
+                    guard body.inlineData != nil, !body.isTruncated else {
+                        throw ProxyLensError.unsupportedOperation(
+                            "Request-body replacement requires complete inline bytes"
+                        )
+                    }
+                    replacementBody = body
+                } else {
+                    replacementBody = nil
+                }
+
+                if plan.shouldBlock {
+                    let response = try BlockedHTTPResponse.make(
+                        reason: plan.blockReason,
+                        version: capturedRequest.version
+                    )
+                    channel.eventLoop.execute {
+                        loopBoundSelf.value.finishRequestBodyWithLocalResponse(
+                            response,
+                            capturedRequest: capturedRequest,
+                            channel: channel
+                        )
+                    }
+                } else if let resourceID = plan.mapLocalResourceID {
+                    guard let spec = ruleResources?.mappedLocal(for: resourceID) else {
+                        throw ProxyLensError.unsupportedOperation(
+                            "Mapped local resource is unavailable: \(resourceID)"
+                        )
+                    }
+                    let response = try MappedLocalHTTPResponse.make(
+                        spec: spec,
+                        version: capturedRequest.version
+                    )
+                    channel.eventLoop.execute {
+                        loopBoundSelf.value.finishRequestBodyWithLocalResponse(
+                            response,
+                            capturedRequest: capturedRequest,
+                            channel: channel
+                        )
+                    }
+                } else if plan.shouldBreakpoint {
+                    if mappedRemoteTarget != nil || replacementBody != nil {
+                        channel.eventLoop.execute {
+                            if let mappedRemoteTarget {
+                                loopBoundSelf.value.applyRequestBodyMapRemote(
+                                    mappedRemoteTarget,
+                                    channel: channel
+                                )
+                            }
+                            if let replacementBody {
+                                loopBoundSelf.value.applyRequestBodyReplacement(
+                                    replacementBody,
+                                    channel: channel
+                                )
+                            }
+                        }
+                    }
+                    await transaction.pause(.request)
+                    let hit = BreakpointHit(
+                        flowID: await transaction.flowID(),
+                        phase: .request,
+                        request: capturedRequest
+                    )
+                    let decision = await gate.pause(hit)
+                    channel.eventLoop.execute {
+                        loopBoundSelf.value.applyRequestBreakpointDecision(
+                            decision,
+                            capturedRequest: capturedRequest,
+                            channel: channel
+                        )
+                    }
+                } else {
+                    channel.eventLoop.execute {
+                        loopBoundSelf.value.continueAfterRequestBodyRules(
+                            capturedRequest: capturedRequest,
+                            mappedRemoteTarget: mappedRemoteTarget,
+                            replacementBody: replacementBody,
+                            channel: channel
+                        )
+                    }
+                }
+            } catch {
+                await recorder?.cancel()
+                await transaction.fail(.persistenceError(error.localizedDescription))
+                channel.close(promise: nil)
+            }
+        }
+    }
+
+    private func finishRequestBodyWithLocalResponse(
+        _ response: HTTPResponse,
+        capturedRequest: HTTPRequest,
+        channel: Channel
+    ) {
+        guard channel.isActive, let transaction else {
+            return
+        }
+        pendingRequestBodyRuleSet = nil
+        breakpointTask = nil
+        pendingRequest = capturedRequest
+        finishWithLocalResponse(
+            response,
+            traces: [],
+            transaction: transaction,
+            channel: channel
+        )
+    }
+
+    private func continueAfterRequestBodyRules(
+        capturedRequest: HTTPRequest,
+        mappedRemoteTarget: MappedRemoteTarget? = nil,
+        replacementBody: BodyReference? = nil,
+        channel: Channel
+    ) {
+        guard channel.isActive else {
+            return
+        }
+        if let mappedRemoteTarget {
+            applyRequestBodyMapRemote(mappedRemoteTarget, channel: channel)
+        }
+        if let replacementBody {
+            applyRequestBodyReplacement(replacementBody, channel: channel)
+        }
+        pendingRequestBodyRuleSet = nil
+        breakpointTask = nil
+        pendingRequest = capturedRequest
+        guard let target = pendingTarget,
+            let requestHead = pendingForwardedHead,
+            let transaction
+        else {
+            abortBreakpoint(channel: channel)
+            return
+        }
+        connectUpstream(
+            target: target,
+            requestHead: requestHead,
+            request: capturedRequest,
+            clientChannel: channel,
+            transaction: transaction
+        )
+    }
+
+    private func applyRequestBodyMapRemote(
+        _ mapped: MappedRemoteTarget,
+        channel: Channel
+    ) {
+        guard channel.isActive, let forwardedHead = pendingForwardedHead else {
+            return
+        }
+
+        let target = ProxyTarget(mapped)
+        var headers = forwardedHead.headers
+        headers.remove(name: "Host")
+        headers.add(name: "Host", value: mapped.hostHeader)
+        pendingTarget = target
+        pendingForwardedHead = HTTPRequestHead(
+            version: forwardedHead.version,
+            method: forwardedHead.method,
+            uri: mapped.originForm,
+            headers: headers
+        )
+    }
+
+    private func applyRequestBodyReplacement(
+        _ replacement: BodyReference,
+        channel: Channel
+    ) {
+        guard channel.isActive, let data = replacement.inlineData,
+            let forwardedHead = pendingForwardedHead
+        else {
+            return
+        }
+
+        var endPart = HTTPClientRequestPart.end(nil)
+        for part in pendingRequestParts {
+            if case .end(let trailers) = part {
+                endPart = .end(trailers)
+            }
+        }
+
+        pendingRequestParts.removeAll(keepingCapacity: true)
+        pendingRequestBytes = data.count
+        if !data.isEmpty {
+            var buffer = channel.allocator.buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            pendingRequestParts.append(.body(.byteBuffer(buffer)))
+        }
+        pendingRequestParts.append(endPart)
+
+        var headers = forwardedHead.headers
+        headers.remove(name: "Content-Length")
+        headers.remove(name: "Transfer-Encoding")
+        headers.remove(name: "Content-Encoding")
+        headers.add(name: "Content-Length", value: "\(data.count)")
+        if let contentType = replacement.contentType {
+            headers.remove(name: "Content-Type")
+            headers.add(name: "Content-Type", value: contentType)
+        }
+        if let contentEncoding = replacement.contentEncoding {
+            headers.add(name: "Content-Encoding", value: contentEncoding)
+        }
+        pendingForwardedHead = HTTPRequestHead(
+            version: forwardedHead.version,
+            method: forwardedHead.method,
+            uri: forwardedHead.uri,
+            headers: headers
+        )
+    }
+
     private func applyRequestBreakpointDecision(
         _ decision: BreakpointDecision,
         capturedRequest: HTTPRequest,
@@ -709,6 +1077,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             abortBreakpoint(channel: channel)
         case .continue(let hit):
             pendingRequestBreakpoint = false
+            pendingRequestBodyRuleSet = nil
+            breakpointTask = nil
             pendingRequest = capturedRequest
             let continued = hit.request
             if continued != capturedRequest {
@@ -761,8 +1131,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         if request.url != captured.url {
             let target = try ProxyTarget(url: request.url)
             pendingTarget = target
+            let editedHeaders = HTTPConversion.nioHeaders(from: request.headers)
             var headers = HTTPConversion.sanitizedRequestHeaders(
-                HTTPConversion.nioHeaders(from: request.headers)
+                editedHeaders,
+                preservingWebSocketUpgrade: HTTPConversion.isWebSocketUpgradeHeaders(
+                    editedHeaders
+                )
             )
             headers.remove(name: "Host")
             headers.add(name: "Host", value: target.hostHeader)
@@ -775,8 +1149,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         } else if request.method != captured.method
             || request.headers != captured.headers
         {
+            let editedHeaders = HTTPConversion.nioHeaders(from: request.headers)
             var headers = HTTPConversion.sanitizedRequestHeaders(
-                HTTPConversion.nioHeaders(from: request.headers)
+                editedHeaders,
+                preservingWebSocketUpgrade: HTTPConversion.isWebSocketUpgradeHeaders(
+                    editedHeaders
+                )
             )
             if let target = pendingTarget {
                 headers.remove(name: "Host")
@@ -832,17 +1210,62 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         clientChannel: Channel,
         transaction: FlowTransaction
     ) {
+        let profile = pendingThrottleProfile
+        guard let latency = profile?.latency,
+            latency.isFinite,
+            latency > 0
+        else {
+            connectUpstreamNow(
+                target: target,
+                requestHead: requestHead,
+                request: request,
+                clientChannel: clientChannel,
+                transaction: transaction
+            )
+            return
+        }
+
+        let boundedLatency = min(latency, 60)
+        let nanoseconds = Int64((boundedLatency * 1_000_000_000).rounded())
+        isWaitingForThrottleLatency = true
+        updateClientAutoRead(clientChannel)
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
+        clientChannel.eventLoop.scheduleTask(in: .nanoseconds(nanoseconds)) {
+            guard clientChannel.isActive else {
+                return
+            }
+            loopBoundSelf.value.connectUpstreamNow(
+                target: target,
+                requestHead: requestHead,
+                request: request,
+                clientChannel: clientChannel,
+                transaction: transaction
+            )
+        }
+    }
+
+    private func connectUpstreamNow(
+        target: ProxyTarget,
+        requestHead: HTTPRequestHead,
+        request: HTTPRequest,
+        clientChannel: Channel,
+        transaction: FlowTransaction
+    ) {
         let bodyStore = self.bodyStore
         let maximumCapturedBodyBytes = self.maximumCapturedBodyBytes
+        let webSocketFrameEventSink = self.webSocketFrameEventSink
+        let maximumWebSocketFrameBytes = self.maximumWebSocketFrameBytes
         let ruleSnapshot = self.ruleSnapshot
         let breakpointGate = self.breakpointGate
         let flowSource = self.flowSource
+        let throttleProfile = pendingThrottleProfile
         let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
         let bootstrap = ClientBootstrap(group: clientChannel.eventLoop)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelInitializer {
                 [
-                    upstreamTLSContext, bodyStore, maximumCapturedBodyBytes, loopBoundSelf,
+                    upstreamTLSContext, bodyStore, maximumCapturedBodyBytes,
+                    webSocketFrameEventSink, maximumWebSocketFrameBytes, loopBoundSelf,
                     request, ruleSnapshot, breakpointGate, flowSource
                 ] channel in
                 let tlsFuture: EventLoopFuture<Void>
@@ -864,11 +1287,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     tlsFuture = channel.eventLoop.makeSucceededVoidFuture()
                 }
 
-                return tlsFuture.flatMap {
-                    channel.pipeline.addHTTPClientHandlers()
-                }.flatMapThrowing {
-                    try channel.pipeline.syncOperations.addHandler(
-                        UpstreamResponseHandler(
+                return tlsFuture.flatMapThrowing {
+                    try HTTPClientPipeline.install(
+                        on: channel,
+                        responseHandler: UpstreamResponseHandler(
                             clientChannel: clientChannel,
                             clientHandler: loopBoundSelf,
                             transaction: transaction,
@@ -876,9 +1298,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                             usesTLS: target.usesTLS,
                             bodyStore: bodyStore,
                             maximumCapturedBodyBytes: maximumCapturedBodyBytes,
+                            webSocketFrameEventSink: webSocketFrameEventSink,
+                            maximumWebSocketFrameBytes: maximumWebSocketFrameBytes,
                             ruleSnapshot: ruleSnapshot,
                             breakpointGate: breakpointGate,
-                            flowSource: flowSource
+                            flowSource: flowSource,
+                            throttleProfile: throttleProfile
                         )
                     )
                 }
@@ -892,6 +1317,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 switch result {
                 case .success(let channel):
                     handler.upstreamChannel = channel
+                    handler.isWaitingForThrottleLatency = false
+                    handler.updateClientAutoRead(clientChannel)
                     if let transaction = handler.transaction {
                         Task { [transaction] in
                             await transaction.markUpstreamConnected(at: Date())
@@ -899,13 +1326,30 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                     }
 
                     channel.write(HTTPClientRequestPart.head(requestHead), promise: nil)
+                    var forwardedEnd = false
                     for part in handler.pendingRequestParts {
-                        channel.write(part, promise: nil)
+                        switch part {
+                        case .body(let body):
+                            if case .byteBuffer(let buffer) = body {
+                                handler.forwardRequestBody(
+                                    buffer,
+                                    to: channel,
+                                    clientChannel: clientChannel
+                                )
+                            } else {
+                                channel.write(part, promise: nil)
+                            }
+                        case .end:
+                            forwardedEnd = true
+                            handler.forwardRequestEnd(part, to: channel)
+                        case .head:
+                            channel.write(part, promise: nil)
+                        }
                     }
                     handler.pendingRequestParts.removeAll(keepingCapacity: false)
                     handler.pendingRequestBytes = 0
 
-                    if handler.requestEnded {
+                    if handler.requestEnded, !forwardedEnd {
                         channel.flush()
                     }
                 case .failure(let error):
@@ -914,6 +1358,84 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             }
         }
     }
+
+    private func forwardRequestBody(
+        _ buffer: ByteBuffer,
+        to upstreamChannel: Channel,
+        clientChannel: Channel
+    ) {
+        guard let rate = pendingThrottleProfile?.uploadBytesPerSecond, rate > 0,
+            buffer.readableBytes > 0
+        else {
+            upstreamChannel.write(
+                HTTPClientRequestPart.body(.byteBuffer(buffer)),
+                promise: nil
+            )
+            return
+        }
+
+        let byteCount = buffer.readableBytes
+        let deadline = uploadPacer.deadline(
+            forByteCount: byteCount,
+            bytesPerSecond: rate,
+            now: upstreamChannel.eventLoop.now
+        )
+        scheduledUploadBytes += byteCount
+        if scheduledUploadBytes >= Self.throttleQueueHighWatermark {
+            isUploadThrottleReadPaused = true
+            updateClientAutoRead(clientChannel)
+        }
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: upstreamChannel.eventLoop)
+        upstreamChannel.eventLoop.scheduleTask(deadline: deadline) {
+            upstreamChannel.write(
+                HTTPClientRequestPart.body(.byteBuffer(buffer)),
+                promise: nil
+            )
+            loopBoundSelf.value.completeScheduledUpload(
+                byteCount: byteCount,
+                clientChannel: clientChannel
+            )
+        }
+    }
+
+    private func forwardRequestEnd(
+        _ endPart: HTTPClientRequestPart,
+        to upstreamChannel: Channel
+    ) {
+        guard pendingThrottleProfile?.uploadBytesPerSecond != nil,
+            let deadline = uploadPacer.completionDeadline
+        else {
+            upstreamChannel.writeAndFlush(endPart, promise: nil)
+            return
+        }
+
+        upstreamChannel.eventLoop.scheduleTask(deadline: deadline) {
+            upstreamChannel.writeAndFlush(endPart, promise: nil)
+        }
+    }
+
+    private func completeScheduledUpload(byteCount: Int, clientChannel: Channel) {
+        scheduledUploadBytes = max(0, scheduledUploadBytes - byteCount)
+        if scheduledUploadBytes <= Self.throttleQueueLowWatermark {
+            isUploadThrottleReadPaused = false
+            updateClientAutoRead(clientChannel)
+        }
+    }
+
+    private func updateClientAutoRead(_ channel: Channel) {
+        let shouldRead =
+            captureWritesInFlight == 0
+            && !captureFailureHandled
+            && !isWaitingForThrottleLatency
+            && !isUploadThrottleReadPaused
+        channel.setOption(ChannelOptions.autoRead, value: shouldRead).whenFailure { _ in
+            channel.close(promise: nil)
+        }
+    }
+
+    private static let throttleQueueHighWatermark = 256 * 1_024
+    private static let throttleQueueLowWatermark = 128 * 1_024
 
     private func handleUpstreamFailure(_ error: Error, clientChannel: Channel) {
         if let transaction {
@@ -944,6 +1466,22 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             await transaction.serveLocalResponse(response, at: Date())
         }
         sendLocalResponse(response, channel: channel)
+    }
+
+    private func finishWithSimulatedNetworkFailure(
+        traces: [RuleTrace],
+        transaction: FlowTransaction,
+        channel: Channel
+    ) {
+        didFinishLocally = true
+        let requestBodyRecorder = self.requestBodyRecorder
+        Task {
+            await requestBodyRecorder?.cancel()
+            await transaction.start(at: Date())
+            await transaction.appendRuleTraces(traces)
+            await transaction.fail(.simulatedNetworkFailure)
+            channel.close(promise: nil)
+        }
     }
 
     private func unwrapMappedLocalSpec(_ resourceID: String) throws -> MapLocalSpec {
@@ -1011,7 +1549,37 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     }
 }
 
-final class UpstreamResponseHandler: ChannelInboundHandler {
+private struct BandwidthPacer {
+    private(set) var completionDeadline: NIODeadline?
+
+    mutating func reset() {
+        completionDeadline = nil
+    }
+
+    mutating func deadline(
+        forByteCount byteCount: Int,
+        bytesPerSecond: Int64,
+        now: NIODeadline
+    ) -> NIODeadline {
+        guard byteCount > 0, bytesPerSecond > 0 else {
+            return completionDeadline ?? now
+        }
+
+        let base = max(completionDeadline ?? now, now)
+        let transferNanoseconds = Int64(
+            ceil(Double(byteCount) / Double(bytesPerSecond) * 1_000_000_000)
+        )
+        let deadline = base + .nanoseconds(max(1, transferNanoseconds))
+        completionDeadline = deadline
+        return deadline
+    }
+}
+
+final class UpstreamResponseHandler:
+    ChannelInboundHandler,
+    RemovableChannelHandler,
+    @unchecked Sendable
+{
     typealias InboundIn = HTTPClientResponsePart
     typealias OutboundOut = HTTPClientRequestPart
 
@@ -1022,23 +1590,31 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
     private let usesTLS: Bool
     private let bodyStore: (any BodyStore)?
     private let maximumCapturedBodyBytes: Int64
+    private let webSocketFrameEventSink: any WebSocketFrameEventSink
+    private let maximumWebSocketFrameBytes: Int
     private let ruleSnapshot: (any RuleSnapshotSource)?
     private let breakpointGate: any BreakpointGate
     private let flowSource: FlowSource
+    private let throttleProfile: ThrottleProfile?
     private var responseStarted = false
     private var responseBodyRecorder: StreamingBodyRecorder?
     private var responseHeadTask: Task<Void, Never>?
     private var responseBodyWriteTask: Task<Void, Error>?
     private var captureWritesInFlight = 0
     private var captureFailureHandled = false
+    private var downloadPacer = BandwidthPacer()
+    private var scheduledDownloadBytes = 0
+    private var isDownloadThrottleReadPaused = false
     private var pendingResponseBreakpoint = false
     private var pendingResponse: HTTPResponse?
     private var pendingResponseHead: HTTPResponseHead?
     private var pendingResponseBuffers: [ByteBuffer] = []
     private var pendingResponseBytes = 0
     private var pendingResponseTrailers: NIOHTTP1.HTTPHeaders?
+    private var pendingResponseReplacement: BodyReference?
     private var breakpointTask: Task<Void, Never>?
     private var didHandleUpstreamFailure = false
+    private var isWebSocketUpgrade = false
 
     private var isWaitingOnCompleteResponseBreakpoint: Bool {
         pendingResponseBreakpoint && breakpointTask != nil
@@ -1052,9 +1628,12 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         usesTLS: Bool,
         bodyStore: (any BodyStore)?,
         maximumCapturedBodyBytes: Int64,
+        webSocketFrameEventSink: any WebSocketFrameEventSink,
+        maximumWebSocketFrameBytes: Int,
         ruleSnapshot: (any RuleSnapshotSource)?,
         breakpointGate: any BreakpointGate,
-        flowSource: FlowSource
+        flowSource: FlowSource,
+        throttleProfile: ThrottleProfile?
     ) {
         self.clientChannel = clientChannel
         self.clientHandler = clientHandler
@@ -1063,9 +1642,12 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         self.usesTLS = usesTLS
         self.bodyStore = bodyStore
         self.maximumCapturedBodyBytes = max(0, maximumCapturedBodyBytes)
+        self.webSocketFrameEventSink = webSocketFrameEventSink
+        self.maximumWebSocketFrameBytes = min(max(1, maximumWebSocketFrameBytes), Int(UInt32.max))
         self.ruleSnapshot = ruleSnapshot
         self.breakpointGate = breakpointGate
         self.flowSource = flowSource
+        self.throttleProfile = throttleProfile
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -1082,8 +1664,9 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                     headers: coreHeaders,
                     version: HTTPConversion.coreVersion(from: head.version)
                 )
+                let rules = ruleSnapshot?.currentRules() ?? RuleSet()
                 let responsePlan = RulePlanner.plan(
-                    rules: ruleSnapshot?.currentRules() ?? RuleSet(),
+                    rules: rules,
                     context: RuleMatchContext(
                         request: request,
                         response: response,
@@ -1096,7 +1679,35 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                         try NoCacheHeaders.applyingToResponse(response.headers)
                     )
                 }
-                if let bodyStore {
+                let responseBodyPlan =
+                    if Self.responseMayCarryBody(request: request, response: response) {
+                        RulePlanner.plan(
+                            rules: rules,
+                            context: RuleMatchContext(
+                                request: request,
+                                response: response,
+                                source: flowSource
+                            ),
+                            phase: .responseBody
+                        )
+                    } else {
+                        RulePlan(phase: .responseBody)
+                    }
+                isWebSocketUpgrade = Self.isWebSocketUpgrade(
+                    request: request,
+                    responseHead: head
+                )
+                if let replacement = responseBodyPlan.replacementBody {
+                    guard replacement.inlineData != nil, !replacement.isTruncated else {
+                        throw ProxyLensError.unsupportedOperation(
+                            "Response-body replacement requires complete inline bytes"
+                        )
+                    }
+                    pendingResponseReplacement = replacement
+                }
+                if let bodyStore,
+                    Self.responseMayCarryBody(request: request, response: response)
+                {
                     responseBodyRecorder = StreamingBodyRecorder(
                         bodyStore: bodyStore,
                         metadata: BodyMetadata(
@@ -1108,7 +1719,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                 }
                 let transaction = self.transaction
                 let receivedAt = Date()
-                let traces = responsePlan.traces
+                let traces = responsePlan.traces + responseBodyPlan.traces
                 let capturedResponse = response
                 responseHeadTask = Task { [transaction] in
                     await transaction.appendRuleTraces(traces)
@@ -1118,14 +1729,26 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                 if responsePlan.applyNoCache {
                     forwardedHead.headers = HTTPConversion.nioHeaders(from: response.headers)
                 }
-                if responsePlan.shouldBreakpoint {
+                if let pendingResponseReplacement {
+                    forwardedHead = Self.replacingBody(
+                        in: forwardedHead,
+                        with: pendingResponseReplacement
+                    )
+                }
+                if responsePlan.shouldBreakpoint, !isWebSocketUpgrade {
                     pendingResponseBreakpoint = true
                     pendingResponse = capturedResponse
-                    pendingResponseHead = HTTPConversion.sanitizedResponseHead(forwardedHead)
+                    pendingResponseHead = HTTPConversion.sanitizedResponseHead(
+                        forwardedHead,
+                        preservingWebSocketUpgrade: isWebSocketUpgrade
+                    )
                 } else {
                     clientChannel.write(
                         HTTPServerResponsePart.head(
-                            HTTPConversion.sanitizedResponseHead(forwardedHead)),
+                            HTTPConversion.sanitizedResponseHead(
+                                forwardedHead,
+                                preservingWebSocketUpgrade: isWebSocketUpgrade
+                            )),
                         promise: nil
                     )
                 }
@@ -1157,13 +1780,14 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
                 }
                 pendingResponseBytes += byteCount
                 pendingResponseBuffers.append(buffer)
-            } else {
-                clientChannel.write(
-                    HTTPServerResponsePart.body(.byteBuffer(buffer)),
-                    promise: nil
-                )
+            } else if pendingResponseReplacement == nil {
+                forwardResponseBody(buffer, upstreamChannel: context.channel)
             }
         case .end(let trailers):
+            if isWebSocketUpgrade {
+                beginWebSocketBridge(trailers: trailers, context: context)
+                return
+            }
             if pendingResponseBreakpoint {
                 pendingResponseTrailers = trailers
                 beginResponseBreakpoint(context: context)
@@ -1171,13 +1795,70 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             }
             clientHandler.value.markResponseEnded()
             finishResponseBodyCapture(context: context)
-            let forwardedTrailers = HTTPConversion.sanitizedTrailers(trailers)
-            clientChannel.writeAndFlush(HTTPServerResponsePart.end(forwardedTrailers)).whenComplete
-            {
-                [clientChannel] _ in
-                clientChannel.close(promise: nil)
+            if let replacement = pendingResponseReplacement {
+                writeReplacementBody(replacement, upstreamChannel: context.channel)
             }
+            let forwardedTrailers =
+                pendingResponseReplacement == nil
+                ? HTTPConversion.sanitizedTrailers(trailers)
+                : nil
+            finishForwardedResponse(
+                trailers: forwardedTrailers,
+                upstreamChannel: context.channel
+            )
             context.close(promise: nil)
+        }
+    }
+
+    private func beginWebSocketBridge(
+        trailers: NIOHTTP1.HTTPHeaders?,
+        context: ChannelHandlerContext
+    ) {
+        guard trailers == nil else {
+            failUpstream(
+                error: ProxyLensError.unsupportedOperation(
+                    "WebSocket upgrade responses cannot contain trailers"
+                ),
+                context: context
+            )
+            return
+        }
+
+        clientHandler.value.markResponseEnded()
+        let transaction = self.transaction
+        let headTask = responseHeadTask
+        let flowIDFuture = context.eventLoop.makeFutureWithTask {
+            await headTask?.value
+            await transaction.beginWebSocket(secure: self.usesTLS, at: Date())
+            return await transaction.flowID()
+        }
+        let upstreamChannel = context.channel
+        let bodyStore = self.bodyStore
+        let maximumCapturedFrameBytes = min(
+            maximumCapturedBodyBytes,
+            Int64(maximumWebSocketFrameBytes)
+        )
+        let maximumFrameBytes = maximumWebSocketFrameBytes
+        let frameEventSink = webSocketFrameEventSink
+        clientChannel.writeAndFlush(HTTPServerResponsePart.end(nil)).flatMap {
+            flowIDFuture
+        }.flatMap { flowID in
+            WebSocketBridge.install(
+                clientChannel: self.clientChannel,
+                upstreamChannel: upstreamChannel,
+                transaction: transaction,
+                flowID: flowID,
+                bodyStore: bodyStore,
+                maximumCapturedFrameBytes: maximumCapturedFrameBytes,
+                maximumFrameBytes: maximumFrameBytes,
+                eventSink: frameEventSink
+            )
+        }.whenFailure { error in
+            Task { [transaction] in
+                await transaction.fail(.protocolError(error.localizedDescription))
+            }
+            self.clientChannel.close(promise: nil)
+            upstreamChannel.close(promise: nil)
         }
     }
 
@@ -1287,19 +1968,166 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         if let head = pendingResponseHead {
             clientChannel.write(HTTPServerResponsePart.head(head), promise: nil)
         }
-        for buffer in pendingResponseBuffers {
-            clientChannel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+        if let replacement = pendingResponseReplacement {
+            writeReplacementBody(replacement, upstreamChannel: upstreamChannel)
+        } else {
+            for buffer in pendingResponseBuffers {
+                forwardResponseBody(buffer, upstreamChannel: upstreamChannel)
+            }
         }
-        let trailers = HTTPConversion.sanitizedTrailers(pendingResponseTrailers)
-        clientChannel.writeAndFlush(HTTPServerResponsePart.end(trailers)).whenComplete {
-            [clientChannel] _ in
-            clientChannel.close(promise: nil)
-        }
+        let trailers =
+            pendingResponseReplacement == nil
+            ? HTTPConversion.sanitizedTrailers(pendingResponseTrailers)
+            : nil
+        finishForwardedResponse(trailers: trailers, upstreamChannel: upstreamChannel)
         let transaction = self.transaction
         Task { [transaction] in
             await transaction.completePausedResponse(at: Date())
         }
         upstreamChannel.close(promise: nil)
+    }
+
+    private func writeReplacementBody(
+        _ replacement: BodyReference,
+        upstreamChannel: Channel
+    ) {
+        guard let data = replacement.inlineData, !data.isEmpty else {
+            return
+        }
+        var buffer = clientChannel.allocator.buffer(capacity: data.count)
+        buffer.writeBytes(data)
+        forwardResponseBody(buffer, upstreamChannel: upstreamChannel)
+    }
+
+    private func forwardResponseBody(_ buffer: ByteBuffer, upstreamChannel: Channel) {
+        guard let rate = throttleProfile?.downloadBytesPerSecond, rate > 0,
+            buffer.readableBytes > 0
+        else {
+            clientChannel.write(
+                HTTPServerResponsePart.body(.byteBuffer(buffer)),
+                promise: nil
+            )
+            return
+        }
+
+        let byteCount = buffer.readableBytes
+        let deadline = downloadPacer.deadline(
+            forByteCount: byteCount,
+            bytesPerSecond: rate,
+            now: clientChannel.eventLoop.now
+        )
+        scheduledDownloadBytes += byteCount
+        if scheduledDownloadBytes >= Self.throttleQueueHighWatermark {
+            isDownloadThrottleReadPaused = true
+            updateUpstreamAutoRead(upstreamChannel)
+        }
+
+        let clientChannel = self.clientChannel
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
+        clientChannel.eventLoop.scheduleTask(deadline: deadline) {
+            clientChannel.write(
+                HTTPServerResponsePart.body(.byteBuffer(buffer)),
+                promise: nil
+            )
+            loopBoundSelf.value.completeScheduledDownload(
+                byteCount: byteCount,
+                upstreamChannel: upstreamChannel
+            )
+        }
+    }
+
+    private func finishForwardedResponse(
+        trailers: NIOHTTP1.HTTPHeaders?,
+        upstreamChannel: Channel
+    ) {
+        if throttleProfile?.downloadBytesPerSecond != nil,
+            let deadline = downloadPacer.completionDeadline
+        {
+            let loopBoundSelf = NIOLoopBound(self, eventLoop: clientChannel.eventLoop)
+            clientChannel.eventLoop.scheduleTask(deadline: deadline) {
+                loopBoundSelf.value.writeResponseEnd(trailers)
+            }
+        } else {
+            writeResponseEnd(trailers)
+        }
+    }
+
+    private func writeResponseEnd(_ trailers: NIOHTTP1.HTTPHeaders?) {
+        clientChannel.writeAndFlush(HTTPServerResponsePart.end(trailers)).whenComplete {
+            [clientChannel] _ in
+            clientChannel.close(promise: nil)
+        }
+    }
+
+    private func completeScheduledDownload(byteCount: Int, upstreamChannel: Channel) {
+        scheduledDownloadBytes = max(0, scheduledDownloadBytes - byteCount)
+        if scheduledDownloadBytes <= Self.throttleQueueLowWatermark {
+            isDownloadThrottleReadPaused = false
+            updateUpstreamAutoRead(upstreamChannel)
+        }
+    }
+
+    private static func replacingBody(
+        in head: HTTPResponseHead,
+        with replacement: BodyReference
+    ) -> HTTPResponseHead {
+        var headers = head.headers
+        headers.remove(name: "Content-Length")
+        headers.remove(name: "Transfer-Encoding")
+        headers.remove(name: "Trailer")
+        headers.remove(name: "Content-Encoding")
+        headers.remove(name: "Content-Range")
+        headers.remove(name: "Content-MD5")
+        headers.remove(name: "Digest")
+        headers.remove(name: "ETag")
+        headers.add(name: "Content-Length", value: "\(replacement.inlineData?.count ?? 0)")
+        if let contentType = replacement.contentType {
+            headers.remove(name: "Content-Type")
+            headers.add(name: "Content-Type", value: contentType)
+        }
+        if let contentEncoding = replacement.contentEncoding {
+            headers.add(name: "Content-Encoding", value: contentEncoding)
+        }
+        return HTTPResponseHead(
+            version: head.version,
+            status: head.status,
+            headers: headers
+        )
+    }
+
+    private static func responseMayCarryBody(
+        request: HTTPRequest,
+        response: HTTPResponse
+    ) -> Bool {
+        request.method != .head
+            && !(100..<200).contains(response.statusCode)
+            && response.statusCode != 204
+            && response.statusCode != 304
+    }
+
+    private static func isWebSocketUpgrade(
+        request: HTTPRequest,
+        responseHead: HTTPResponseHead
+    ) -> Bool {
+        responseHead.status == .switchingProtocols
+            && headerContainsToken(request.headers.values(for: "Connection"), token: "upgrade")
+            && headerContainsToken(request.headers.values(for: "Upgrade"), token: "websocket")
+            && headerContainsToken(
+                responseHead.headers[canonicalForm: "Connection"], token: "upgrade")
+            && headerContainsToken(
+                responseHead.headers[canonicalForm: "Upgrade"], token: "websocket")
+    }
+
+    private static func headerContainsToken<Values: Sequence>(
+        _ values: Values,
+        token: String
+    ) -> Bool where Values.Element: StringProtocol {
+        values.contains { value in
+            value.split(separator: ",").contains {
+                String($0).trimmingCharacters(in: .whitespaces)
+                    .caseInsensitiveCompare(token) == .orderedSame
+            }
+        }
     }
 
     private func recordResponseBody(_ buffer: ByteBuffer, context: ChannelHandlerContext) {
@@ -1317,11 +2145,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
         captureWritesInFlight += 1
 
         let channel = context.channel
-        if captureWritesInFlight == 1 {
-            channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
-                channel.close(promise: nil)
-            }
-        }
+        updateUpstreamAutoRead(channel)
 
         let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
         Task {
@@ -1350,12 +2174,21 @@ final class UpstreamResponseHandler: ChannelInboundHandler {
             return
         }
 
-        if captureWritesInFlight == 0, !captureFailureHandled {
-            channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { _ in
-                channel.close(promise: nil)
-            }
+        updateUpstreamAutoRead(channel)
+    }
+
+    private func updateUpstreamAutoRead(_ channel: Channel) {
+        let shouldRead =
+            captureWritesInFlight == 0
+            && !captureFailureHandled
+            && !isDownloadThrottleReadPaused
+        channel.setOption(ChannelOptions.autoRead, value: shouldRead).whenFailure { _ in
+            channel.close(promise: nil)
         }
     }
+
+    private static let throttleQueueHighWatermark = 256 * 1_024
+    private static let throttleQueueLowWatermark = 128 * 1_024
 
     private func finishResponseBodyCapture(context: ChannelHandlerContext) {
         let writeTask = responseBodyWriteTask

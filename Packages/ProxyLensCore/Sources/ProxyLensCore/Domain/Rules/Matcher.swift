@@ -75,6 +75,7 @@ public indirect enum Matcher: Codable, Equatable, Hashable, Sendable {
     case source(StringPattern)
     case status(Int)
     case contentType(StringPattern)
+    case graphqlOperation(name: StringPattern?, kind: GraphQLOperationMetadata.Kind?)
     case allOf([Matcher])
     case anyOf([Matcher])
     case not(Matcher)
@@ -113,6 +114,14 @@ public indirect enum Matcher: Codable, Equatable, Hashable, Sendable {
             return context.response?.statusCode == statusCode
         case .contentType(let pattern):
             return context.contentType.map(pattern.matches) ?? false
+        case .graphqlOperation(let name, let kind):
+            guard let operation = context.request?.graphqlOperation else {
+                return false
+            }
+            if let kind, operation.kind != kind {
+                return false
+            }
+            return name?.matches(operation.displayName) ?? true
         case .allOf(let matchers):
             return matchers.allSatisfy { $0.matches(context) }
         case .anyOf(let matchers):

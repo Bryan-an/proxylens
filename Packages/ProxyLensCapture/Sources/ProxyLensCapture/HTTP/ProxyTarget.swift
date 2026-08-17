@@ -32,7 +32,8 @@ struct ProxyTarget: Sendable {
         let originForm: String
 
         if let absoluteURL = URL(string: uri), let scheme = absoluteURL.scheme {
-            guard scheme.caseInsensitiveCompare("http") == .orderedSame else {
+            let normalizedScheme = scheme.lowercased()
+            guard ["http", "https", "ws", "wss"].contains(normalizedScheme) else {
                 throw ProxyTargetError.unsupportedScheme(scheme)
             }
 
@@ -61,7 +62,10 @@ struct ProxyTarget: Sendable {
             throw ProxyTargetError.invalidURI(uri)
         }
 
-        let port = parsedURL.port ?? 80
+        let usesTLS =
+            parsedURL.scheme?.lowercased() == "https"
+            || parsedURL.scheme?.lowercased() == "wss"
+        let port = parsedURL.port ?? (usesTLS ? 443 : 80)
         guard (1...65_535).contains(port) else {
             throw ProxyTargetError.invalidPort(port)
         }
@@ -71,7 +75,7 @@ struct ProxyTarget: Sendable {
             host: host,
             port: port,
             originForm: originForm.isEmpty ? "/" : originForm,
-            usesTLS: false
+            usesTLS: usesTLS
         )
     }
 
@@ -86,7 +90,9 @@ struct ProxyTarget: Sendable {
     }
 
     init(url: URL) throws {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        guard let scheme = url.scheme?.lowercased(),
+            ["http", "https", "ws", "wss"].contains(scheme)
+        else {
             throw ProxyTargetError.unsupportedScheme(url.scheme ?? "")
         }
         guard let host = url.host, !host.isEmpty else {
@@ -96,7 +102,7 @@ struct ProxyTarget: Sendable {
             throw ProxyTargetError.invalidURI(url.absoluteString)
         }
 
-        let usesTLS = scheme == "https"
+        let usesTLS = scheme == "https" || scheme == "wss"
         let port = url.port ?? (usesTLS ? 443 : 80)
         guard (1...65_535).contains(port) else {
             throw ProxyTargetError.invalidPort(port)
