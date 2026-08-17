@@ -325,7 +325,7 @@ public actor NIOWebSocketConnectionClient: WebSocketConnectionClient {
                         try channel.pipeline.syncOperations.addHandler(
                             NIOSSLClientHandler(
                                 context: tlsContext,
-                                serverHostname: target.host
+                                serverHostname: target.tlsServerName
                             )
                         )
                     }

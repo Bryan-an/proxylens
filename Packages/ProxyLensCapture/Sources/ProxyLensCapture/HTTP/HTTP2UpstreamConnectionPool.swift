@@ -214,7 +214,7 @@ final class HTTP2UpstreamConnectionPool: @unchecked Sendable {
                 do {
                     let tlsHandler = try NIOSSLClientHandler(
                         context: tlsContext,
-                        serverHostname: target.host
+                        serverHostname: target.tlsServerName
                     )
                     try channel.pipeline.syncOperations.addHandler(tlsHandler)
                 } catch {
