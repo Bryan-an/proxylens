@@ -26,6 +26,29 @@ struct ProxyTarget: Sendable {
         return "\(formattedHost):\(port)"
     }
 
+    /// The server name to offer upstream in the TLS SNI extension, or `nil` when there is none.
+    ///
+    /// RFC 6066 forbids an IP address in SNI and NIOSSL throws `cannotUseIPAddressInSNI` rather
+    /// than filtering it, so every upstream TLS site must read the server name from here.
+    ///
+    /// Omitting the server name also omits the name NIOSSL verifies the certificate against: the
+    /// chain is still validated against the system trust store and any additional roots, but the
+    /// leaf is not bound to an `iPAddress` SAN. Named destinations are unaffected, including
+    /// DNS-spoofed ones, because the logical host stays the TLS identity.
+    var tlsServerName: String? {
+        Self.isIPAddressLiteral(host) ? nil : host
+    }
+
+    /// Matches NIOSSL's own SNI test so the two never disagree about what an IP literal is.
+    static func isIPAddressLiteral(_ host: String) -> Bool {
+        var ipv4Address = in_addr()
+        var ipv6Address = in6_addr()
+        return host.withCString { pointer in
+            inet_pton(AF_INET, pointer, &ipv4Address) == 1
+                || inet_pton(AF_INET6, pointer, &ipv6Address) == 1
+        }
+    }
+
     var connectionIdentity: ProxyConnectionIdentity {
         ProxyConnectionIdentity(
             logicalHost: host.lowercased(),

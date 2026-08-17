@@ -1758,7 +1758,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                         }
                         let tlsHandler = try NIOSSLClientHandler(
                             context: upstreamTLSContext,
-                            serverHostname: target.host
+                            serverHostname: target.tlsServerName
                         )
                         try channel.pipeline.syncOperations.addHandler(tlsHandler)
                         tlsFuture = channel.eventLoop.makeSucceededVoidFuture()
@@ -1843,7 +1843,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 Result<Void, Error> {
                     let tlsHandler = try NIOSSLClientHandler(
                         context: upstreamTLSContext,
-                        serverHostname: target.host
+                        serverHostname: target.tlsServerName
                     )
                     try channel.pipeline.syncOperations.addHandler(
                         tlsHandler,

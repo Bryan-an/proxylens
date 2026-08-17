@@ -537,7 +537,10 @@ before an upstream channel is opened; the first matching enabled rule supplies a
 IPv6 literal without changing the logical authority.
 
 HTTP/1.1 and WebSocket bootstraps connect to `connectionHost`, while upstream TLS still uses the
-logical host. The HTTP/2 pool key contains the logical scheme/host/port and the physical
+logical host. Every upstream TLS site reads its server name from `ProxyTarget.tlsServerName`, which
+is the logical host for a named destination and `nil` for a bare IP literal, since RFC 6066 forbids
+an IP address in SNI. A spoofed destination therefore keeps offering and verifying its logical name
+even though the socket goes to the literal. The HTTP/2 pool key contains the logical scheme/host/port and the physical
 destination, preventing requests with different routing decisions from sharing a parent channel.
 Flow connection metadata deliberately records the logical upstream host so inspection, persistence,
 search, and export do not expose transport routing as request identity. Invalid profile data fails
