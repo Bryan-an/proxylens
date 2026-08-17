@@ -160,7 +160,8 @@ struct ProxyTarget: Sendable {
 
         var components = URLComponents()
         components.scheme = usesTLS ? "https" : "http"
-        components.host = target.host
+        // `URLComponents` yields a nil URL for an unbracketed IPv6 literal host.
+        components.host = target.host.contains(":") ? "[\(target.host)]" : target.host
         if target.port != (usesTLS ? 443 : 80) {
             components.port = target.port
         }
