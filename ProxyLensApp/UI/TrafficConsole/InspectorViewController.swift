@@ -1045,6 +1045,9 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
     private let protobufDescriptorField = NSTextField(labelWithString: "No descriptor")
     private let protobufMessageTypePopup = NSPopUpButton()
     let textView = NSTextView()
+    private let contentScrollView = NSScrollView()
+    private var contentConstraints: [ObjectIdentifier: [NSLayoutConstraint]] = [:]
+    private var contentViews: [NSView] = []
     let jsonTreeView: JSONTreeView
     let jsonPathView: JSONPathView
     let imagePreviewView: ImagePreviewView
@@ -1244,49 +1247,53 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         )
         textView.textContainer?.widthTracksTextView = false
 
-        let scrollView = NSScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .noBorder
-        jsonTreeView.isHidden = true
-        jsonPathView.isHidden = true
-        imagePreviewView.isHidden = true
+        contentScrollView.translatesAutoresizingMaskIntoConstraints = false
+        contentScrollView.documentView = textView
+        contentScrollView.hasVerticalScroller = true
+        contentScrollView.hasHorizontalScroller = true
+        contentScrollView.autohidesScrollers = true
+        contentScrollView.borderType = .noBorder
 
         let container = NSView()
         container.setAccessibilityIdentifier(accessibilityPrefix)
         container.addSubview(chromeStack)
-        container.addSubview(scrollView)
-        container.addSubview(jsonTreeView)
-        container.addSubview(jsonPathView)
-        container.addSubview(imagePreviewView)
         NSLayoutConstraint.activate([
             chromeStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
             chromeStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
             chromeStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
             headerStack.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
             protobufToolbar.widthAnchor.constraint(lessThanOrEqualTo: chromeStack.widthAnchor),
-            protobufMessageTypePopup.widthAnchor.constraint(lessThanOrEqualToConstant: 240),
-            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
-            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            jsonTreeView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            jsonTreeView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            jsonTreeView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
-            jsonTreeView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            jsonPathView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            jsonPathView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            jsonPathView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
-            jsonPathView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            imagePreviewView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            imagePreviewView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            imagePreviewView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
-            imagePreviewView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            protobufMessageTypePopup.widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
+
+        // Only one of these fills the region under the chrome at a time. A hidden view still takes
+        // part in Auto Layout, so leaving them all pinned lets the one with the smallest fitting
+        // height dictate the region and pushes the chrome into the leftover space. Constraints are
+        // therefore activated for the visible view alone.
+        contentViews = [contentScrollView, jsonTreeView, jsonPathView, imagePreviewView]
+        for contentView in contentViews {
+            container.addSubview(contentView)
+            contentView.isHidden = true
+            contentConstraints[ObjectIdentifier(contentView)] = [
+                contentView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                contentView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                contentView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
+                contentView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            ]
+        }
         view = container
+        showContentView(contentScrollView)
+    }
+
+    /// Makes `contentView` the only content view participating in the layout of the region below
+    /// the chrome.
+    private func showContentView(_ contentView: NSView) {
+        for candidate in contentViews where candidate !== contentView {
+            NSLayoutConstraint.deactivate(contentConstraints[ObjectIdentifier(candidate)] ?? [])
+            candidate.isHidden = true
+        }
+        NSLayoutConstraint.activate(contentConstraints[ObjectIdentifier(contentView)] ?? [])
+        contentView.isHidden = false
     }
 
     override func viewWillLayout() {
@@ -1331,10 +1338,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         protobufSchema: TrafficProtobufSchemaInspection? = nil
     ) {
         isUpdatingContent = true
-        textView.enclosingScrollView?.isHidden = false
-        jsonTreeView.isHidden = true
-        jsonPathView.isHidden = true
-        imagePreviewView.isHidden = true
+        showContentView(contentScrollView)
         textView.textStorage?.setAttributedString(
             InspectorSyntaxHighlighter.highlight(
                 content,
@@ -1357,10 +1361,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
     ) {
         isUpdatingContent = true
         textView.isEditable = false
-        textView.enclosingScrollView?.isHidden = true
-        jsonTreeView.isHidden = false
-        jsonPathView.isHidden = true
-        imagePreviewView.isHidden = true
+        showContentView(jsonTreeView)
         protobufToolbar.isHidden = true
         jsonTreeView.display(presentation)
         sectionSelector.isEnabled = isSelectorEnabled
@@ -1375,10 +1376,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
     ) {
         isUpdatingContent = true
         textView.isEditable = false
-        textView.enclosingScrollView?.isHidden = true
-        jsonTreeView.isHidden = true
-        jsonPathView.isHidden = false
-        imagePreviewView.isHidden = true
+        showContentView(jsonPathView)
         protobufToolbar.isHidden = true
         jsonPathView.display(presentation)
         sectionSelector.isEnabled = isSelectorEnabled
@@ -1393,10 +1391,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
     ) {
         isUpdatingContent = true
         textView.isEditable = false
-        textView.enclosingScrollView?.isHidden = true
-        jsonTreeView.isHidden = true
-        jsonPathView.isHidden = true
-        imagePreviewView.isHidden = false
+        showContentView(imagePreviewView)
         protobufToolbar.isHidden = true
         imagePreviewView.display(presentation)
         sectionSelector.isEnabled = isSelectorEnabled

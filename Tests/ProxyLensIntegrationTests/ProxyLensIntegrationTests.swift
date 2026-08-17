@@ -4829,6 +4829,112 @@ final class ProxyLensIntegrationTests: XCTestCase {
         XCTAssertEqual(timing.phases.map(\.kind), [.requestHeaders, .requestBody])
     }
 
+    func testInspectorMessagePanesGiveTheirContentTheFullPaneHeight() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(index: 12, host: "panes.example.com", statusCode: 200)
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = TrafficConsoleViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.appearance = NSAppearance(named: .aqua)
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        controller.view.frame = NSRect(origin: .zero, size: frame.size)
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        window.contentView?.layoutSubtreeIfNeeded()
+        controller.view.displayIfNeeded()
+
+        for prefix in ["inspector.request", "inspector.response"] {
+            let paneView = try XCTUnwrap(
+                Self.descendant(
+                    of: NSView.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == prefix }
+                )
+            )
+            let textView = try XCTUnwrap(
+                Self.descendant(
+                    of: NSTextView.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == "\(prefix).content" }
+                )
+            )
+            let scrollView = try XCTUnwrap(textView.enclosingScrollView)
+            // The chrome above the content is one row of controls, so the scrollable content must
+            // keep nearly the whole pane. Regression guard: an unconstrained chrome stack used to
+            // inflate to ~287pt of a 349pt pane and leave the headers squeezed into a 46pt strip.
+            XCTAssertGreaterThan(
+                scrollView.frame.height,
+                paneView.frame.height - 80,
+                "\(prefix) content is squeezed: pane=\(paneView.frame.height)"
+                    + " content=\(scrollView.frame.height)"
+            )
+            // The pane container is not flipped, so the content region starts at y == 0.
+            XCTAssertEqual(
+                scrollView.frame.minY,
+                0,
+                accuracy: 1,
+                "\(prefix) content should reach the bottom of the pane"
+            )
+        }
+
+        // The same region is shared with the Tree view, which must fill it too once selected.
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.section" }
+            )
+        )
+        let treeSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Tree"
+            }
+        )
+        sectionSelector.selectedSegment = treeSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let requestPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request" }
+            )
+        )
+        let treeView = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.tree" }
+            )
+        )
+        XCTAssertFalse(treeView.isHidden)
+        XCTAssertGreaterThan(
+            treeView.frame.height,
+            requestPane.frame.height - 80,
+            "tree view is squeezed: pane=\(requestPane.frame.height)"
+                + " tree=\(treeView.frame.height)"
+        )
+    }
+
     func testInspectorGivesVerticalSlackToMessagePanes() async throws {
         let viewModel = TrafficConsoleViewModel(
             captureController: RecordingCaptureController(),
