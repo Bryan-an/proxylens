@@ -153,6 +153,7 @@ struct TrafficFlowRow: Equatable, Identifiable, Sendable {
     let duration: TimeInterval?
     let byteCount: Int64
     let usesTLS: Bool
+    let isWebSocket: Bool
     let annotation: FlowAnnotation?
     let hasRequestBody: Bool
     let hasResponse: Bool
@@ -177,6 +178,9 @@ struct TrafficFlowRow: Equatable, Identifiable, Sendable {
             flow.connection?.protocolKind == .https
             || flow.connection?.protocolKind == .secureWebSocket
             || flow.request.url.scheme?.lowercased() == "https"
+        isWebSocket =
+            flow.connection?.protocolKind == .webSocket
+            || flow.connection?.protocolKind == .secureWebSocket
         annotation = flow.annotation
         hasRequestBody = flow.request.body != nil
         hasResponse = flow.response != nil
@@ -233,17 +237,56 @@ enum TrafficBodyPresentation: Equatable, Sendable {
     case failed(metadata: String, message: String)
 }
 
+enum TrafficMessageDirection: Equatable, Sendable {
+    case request
+    case response
+}
+
+struct TrafficProtobufSchemaInspection: Equatable, Sendable {
+    let descriptorName: String?
+    let messageTypeNames: [String]
+    let selectedMessageType: String?
+
+    static let schemaLess = TrafficProtobufSchemaInspection(
+        descriptorName: nil,
+        messageTypeNames: [],
+        selectedMessageType: nil
+    )
+}
+
+struct TrafficImagePreview: Equatable, Sendable {
+    let metadata: String
+    let thumbnailPNGData: Data
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let thumbnailPixelWidth: Int
+    let thumbnailPixelHeight: Int
+    let format: String
+    let frameCount: Int
+}
+
+enum TrafficImagePresentation: Equatable, Sendable {
+    case none(String)
+    case loading(String)
+    case content(TrafficImagePreview)
+    case failed(metadata: String, message: String)
+}
+
 struct TrafficMessageInspection: Equatable, Sendable {
     let title: String
     let headers: String
     let query: String?
     let cookies: String
     let body: TrafficBodyPresentation
+    let image: TrafficImagePresentation
+    let hex: TrafficBodyPresentation
     let json: TrafficBodyPresentation
     let jsonTree: TrafficJSONTreePresentation
     let xml: TrafficBodyPresentation
     let form: TrafficBodyPresentation
     let graphql: TrafficBodyPresentation
+    let protobuf: TrafficBodyPresentation
+    let protobufSchema: TrafficProtobufSchemaInspection
     let bodyContentType: String?
 
     init(
@@ -252,11 +295,15 @@ struct TrafficMessageInspection: Equatable, Sendable {
         query: String? = nil,
         cookies: String = "No cookies.",
         body: TrafficBodyPresentation,
+        image: TrafficImagePresentation = .none(ImageBodyPreviewBuilder.noBodyReason),
+        hex: TrafficBodyPresentation = .none(HexBodyView.noBodyReason),
         json: TrafficBodyPresentation,
         jsonTree: TrafficJSONTreePresentation = .none(JSONBodyView.notJSONReason),
         xml: TrafficBodyPresentation = .none(XMLBodyView.notXMLReason),
         form: TrafficBodyPresentation = .none(FormBodyView.notFormReason),
         graphql: TrafficBodyPresentation = .none(GraphQLBodyView.notGraphQLReason),
+        protobuf: TrafficBodyPresentation = .none(ProtobufBodyView.notProtobufReason),
+        protobufSchema: TrafficProtobufSchemaInspection = .schemaLess,
         bodyContentType: String?
     ) {
         self.title = title
@@ -264,11 +311,15 @@ struct TrafficMessageInspection: Equatable, Sendable {
         self.query = query
         self.cookies = cookies
         self.body = body
+        self.image = image
+        self.hex = hex
         self.json = json
         self.jsonTree = jsonTree
         self.xml = xml
         self.form = form
         self.graphql = graphql
+        self.protobuf = protobuf
+        self.protobufSchema = protobufSchema
         self.bodyContentType = bodyContentType
     }
 }
@@ -321,6 +372,9 @@ struct TrafficTimingInspection: Equatable, Sendable {
     let totalDuration: TimeInterval
     let timeToFirstByte: TimeInterval?
     let isComplete: Bool
+    let clientProtocol: String
+    let upstreamProtocol: String
+    let connectionReuse: String
     let phases: [TrafficTimingPhaseInspection]
 
     init(flow: Flow) {
@@ -328,6 +382,16 @@ struct TrafficTimingInspection: Equatable, Sendable {
         startedAt = timing.startedAt
         isComplete = timing.completedAt != nil
         timeToFirstByte = timing.timeToFirstByte
+        clientProtocol = flow.request.version.rawValue
+        upstreamProtocol = flow.connection?.upstreamHTTPVersion?.rawValue ?? "Unknown"
+        switch flow.connection?.isUpstreamConnectionReused {
+        case true:
+            connectionReuse = "Reused Connection"
+        case false:
+            connectionReuse = "New Connection"
+        case nil:
+            connectionReuse = "Unknown"
+        }
 
         let latestMilestone =
             [
@@ -434,6 +498,13 @@ enum TrafficWebSocketPayloadSyntax: Equatable, Sendable {
     case plainText
     case json
     case binary
+    case protobuf
+}
+
+enum TrafficWebSocketPayloadMode: String, CaseIterable, Equatable, Sendable {
+    case automatic = "Auto"
+    case protobuf = "Protobuf"
+    case hex = "Hex"
 }
 
 enum TrafficWebSocketDirectionFilter: String, CaseIterable, Equatable, Sendable {
@@ -498,11 +569,17 @@ struct TrafficWebSocketInspection: Equatable, Sendable {
     let selectedFrameID: UUID?
     let payload: TrafficBodyPresentation
     let payloadSyntax: TrafficWebSocketPayloadSyntax
+    let payloadMode: TrafficWebSocketPayloadMode
+    let canDecodePayloadAsProtobuf: Bool
     let omittedFrameCount: Int
     let statusMessage: String?
     let directionFilter: TrafficWebSocketDirectionFilter
     let searchText: String
     let isSearching: Bool
+    let canCompose: Bool
+    let canReconnect: Bool
+    let canDisconnect: Bool
+    let composeStatusMessage: String?
 
     init(
         frames: [TrafficWebSocketFrameInspection],
@@ -510,22 +587,34 @@ struct TrafficWebSocketInspection: Equatable, Sendable {
         selectedFrameID: UUID?,
         payload: TrafficBodyPresentation,
         payloadSyntax: TrafficWebSocketPayloadSyntax,
+        payloadMode: TrafficWebSocketPayloadMode = .automatic,
+        canDecodePayloadAsProtobuf: Bool = false,
         omittedFrameCount: Int,
         statusMessage: String?,
         directionFilter: TrafficWebSocketDirectionFilter = .all,
         searchText: String = "",
-        isSearching: Bool = false
+        isSearching: Bool = false,
+        canCompose: Bool = false,
+        canReconnect: Bool = false,
+        canDisconnect: Bool = false,
+        composeStatusMessage: String? = nil
     ) {
         self.frames = frames
         self.capturedFrameCount = capturedFrameCount ?? frames.count
         self.selectedFrameID = selectedFrameID
         self.payload = payload
         self.payloadSyntax = payloadSyntax
+        self.payloadMode = payloadMode
+        self.canDecodePayloadAsProtobuf = canDecodePayloadAsProtobuf
         self.omittedFrameCount = omittedFrameCount
         self.statusMessage = statusMessage
         self.directionFilter = directionFilter
         self.searchText = searchText
         self.isSearching = isSearching
+        self.canCompose = canCompose
+        self.canReconnect = canReconnect
+        self.canDisconnect = canDisconnect
+        self.composeStatusMessage = composeStatusMessage
     }
 
     static let loading = TrafficWebSocketInspection(
@@ -535,6 +624,82 @@ struct TrafficWebSocketInspection: Equatable, Sendable {
         payloadSyntax: .plainText,
         omittedFrameCount: 0,
         statusMessage: "Loading captured WebSocket frames…"
+    )
+}
+
+enum TrafficServerSentEventPayloadSyntax: Equatable, Sendable {
+    case plainText
+    case json
+}
+
+struct TrafficServerSentEventRow: Equatable, Identifiable, Sendable {
+    let id: UUID
+    let sequenceNumber: Int64
+    let eventType: String
+    let eventID: String?
+    let retryMilliseconds: Int?
+    let byteCount: Int64
+    let isTruncated: Bool
+    let receivedAt: Date
+
+    init(event: CapturedServerSentEvent) {
+        id = event.id
+        sequenceNumber = event.sequenceNumber
+        eventType = event.eventType
+        eventID = event.eventID
+        retryMilliseconds = event.retryMilliseconds
+        byteCount = event.dataByteCount
+        isTruncated = event.isDataTruncated
+        receivedAt = event.receivedAt
+    }
+}
+
+struct TrafficServerSentEventInspection: Equatable, Sendable {
+    let events: [TrafficServerSentEventRow]
+    let capturedEventCount: Int
+    let selectedEventID: UUID?
+    let payload: TrafficBodyPresentation
+    let payloadSyntax: TrafficServerSentEventPayloadSyntax
+    let accumulated: TrafficBodyPresentation
+    let omittedEventCount: Int
+    let statusMessage: String?
+    let searchText: String
+    let isSearching: Bool
+
+    init(
+        events: [TrafficServerSentEventRow],
+        capturedEventCount: Int? = nil,
+        selectedEventID: UUID?,
+        payload: TrafficBodyPresentation,
+        payloadSyntax: TrafficServerSentEventPayloadSyntax,
+        accumulated: TrafficBodyPresentation = .loading(
+            "Building accumulated streaming response preview…"
+        ),
+        omittedEventCount: Int,
+        statusMessage: String?,
+        searchText: String = "",
+        isSearching: Bool = false
+    ) {
+        self.events = events
+        self.capturedEventCount = capturedEventCount ?? events.count
+        self.selectedEventID = selectedEventID
+        self.payload = payload
+        self.payloadSyntax = payloadSyntax
+        self.accumulated = accumulated
+        self.omittedEventCount = omittedEventCount
+        self.statusMessage = statusMessage
+        self.searchText = searchText
+        self.isSearching = isSearching
+    }
+
+    static let loading = TrafficServerSentEventInspection(
+        events: [],
+        selectedEventID: nil,
+        payload: .none("Select a Server-Sent Event to inspect its data."),
+        payloadSyntax: .plainText,
+        accumulated: .loading("Building accumulated streaming response preview…"),
+        omittedEventCount: 0,
+        statusMessage: "Loading captured Server-Sent Events…"
     )
 }
 
@@ -549,6 +714,7 @@ struct TrafficFlowInspection: Equatable, Sendable {
     let breakpoint: TrafficBreakpointInspection?
     let annotation: FlowAnnotation?
     let webSocket: TrafficWebSocketInspection?
+    let serverSentEvents: TrafficServerSentEventInspection?
 
     init(
         flowID: FlowID?,
@@ -560,7 +726,8 @@ struct TrafficFlowInspection: Equatable, Sendable {
         timing: TrafficTimingInspection? = nil,
         breakpoint: TrafficBreakpointInspection?,
         annotation: FlowAnnotation? = nil,
-        webSocket: TrafficWebSocketInspection? = nil
+        webSocket: TrafficWebSocketInspection? = nil,
+        serverSentEvents: TrafficServerSentEventInspection? = nil
     ) {
         self.flowID = flowID
         self.title = title
@@ -572,6 +739,7 @@ struct TrafficFlowInspection: Equatable, Sendable {
         self.breakpoint = breakpoint
         self.annotation = annotation
         self.webSocket = webSocket
+        self.serverSentEvents = serverSentEvents
     }
 
     static let empty = TrafficFlowInspection(
@@ -587,6 +755,26 @@ struct TrafficFlowInspection: Equatable, Sendable {
 struct TrafficBreakpointInspection: Equatable, Sendable {
     let phase: BreakpointPhase
     let canEditBody: Bool
+    let webSocketFrame: TrafficWebSocketBreakpointInspection?
+
+    init(
+        phase: BreakpointPhase,
+        canEditBody: Bool,
+        webSocketFrame: TrafficWebSocketBreakpointInspection? = nil
+    ) {
+        self.phase = phase
+        self.canEditBody = canEditBody
+        self.webSocketFrame = webSocketFrame
+    }
+}
+
+struct TrafficWebSocketBreakpointInspection: Equatable, Sendable {
+    let sequenceNumber: Int
+    let opcode: WebSocketFrameOpcode
+    let payload: String
+    let syntax: TrafficWebSocketPayloadSyntax
+    let canEditPayload: Bool
+    let statusMessage: String
 }
 
 struct TrafficConsoleSnapshot: Equatable, Sendable {
@@ -1086,7 +1274,7 @@ struct TrafficConsoleStore {
     }
 
     private static func applicationProjection(for flow: Flow) -> ApplicationProjection? {
-        guard flow.source.kind == .desktopProxy else {
+        guard flow.source.kind == .desktopProxy || flow.source.kind == .socks5Proxy else {
             return nil
         }
         guard let application = flow.source.application else {

@@ -25,6 +25,10 @@ actor FlowTransaction {
         flow.response
     }
 
+    func snapshot() -> Flow {
+        flow
+    }
+
     func start(at date: Date) async {
         guard flow.state == .created else {
             return
@@ -89,7 +93,9 @@ actor FlowTransaction {
                 protocolKind: usesTLS ? .https : .http,
                 upstreamHost: host,
                 upstreamPort: port,
-                tlsIntercepted: flow.connection?.tlsIntercepted ?? false
+                tlsIntercepted: flow.connection?.tlsIntercepted ?? false,
+                upstreamHTTPVersion: flow.connection?.upstreamHTTPVersion,
+                isUpstreamConnectionReused: flow.connection?.isUpstreamConnectionReused
             )
         )
         await eventSink.publish(.updated(flow))
@@ -119,7 +125,11 @@ actor FlowTransaction {
         await complete(at: date)
     }
 
-    func markUpstreamConnected(at date: Date) async {
+    func markUpstreamConnected(
+        at date: Date,
+        upstreamHTTPVersion: HTTPVersion? = nil,
+        isConnectionReused: Bool? = nil
+    ) async {
         guard !isFinished else {
             return
         }
@@ -128,6 +138,16 @@ actor FlowTransaction {
             try? flow.transition(to: .connectingUpstream)
         }
 
+        if let connection = flow.connection,
+            upstreamHTTPVersion != nil || isConnectionReused != nil
+        {
+            flow.replaceConnection(
+                connection.replacingTransport(
+                    upstreamHTTPVersion: upstreamHTTPVersion,
+                    isUpstreamConnectionReused: isConnectionReused
+                )
+            )
+        }
         flow.markUpstreamConnected(at: date)
         await eventSink.publish(.updated(flow))
     }
@@ -193,7 +213,9 @@ actor FlowTransaction {
                     protocolKind: secure ? .secureWebSocket : .webSocket,
                     upstreamHost: connection.upstreamHost,
                     upstreamPort: connection.upstreamPort,
-                    tlsIntercepted: connection.tlsIntercepted
+                    tlsIntercepted: connection.tlsIntercepted,
+                    upstreamHTTPVersion: connection.upstreamHTTPVersion,
+                    isUpstreamConnectionReused: connection.isUpstreamConnectionReused
                 )
             )
         }
@@ -229,6 +251,15 @@ actor FlowTransaction {
         }
 
         try? flow.transition(to: nextState)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func resumeWebSocketBreakpoint() async {
+        guard !isFinished, flow.state == .paused(.webSocketResponse) else {
+            return
+        }
+
+        try? flow.transition(to: .receivingResponse)
         await eventSink.publish(.updated(flow))
     }
 

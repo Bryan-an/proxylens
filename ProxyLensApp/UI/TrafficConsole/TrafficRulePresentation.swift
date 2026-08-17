@@ -24,6 +24,8 @@ struct TrafficRulePresentation: Equatable, Identifiable, Sendable {
 
     private static func actionTitle(_ action: RuleAction) -> String {
         switch action {
+        case .dnsSpoof(let spec):
+            "DNS Spoof → \(spec.address)"
         case .mapLocal:
             "Map Local"
         case .mapRemote:
@@ -44,6 +46,8 @@ struct TrafficRulePresentation: Equatable, Identifiable, Sendable {
             "Annotate"
         case .noCache:
             "No Cache"
+        case .script:
+            "Script"
         }
     }
 

@@ -18,12 +18,32 @@ struct ConnectTarget: Equatable, Hashable, Sendable {
             throw ConnectTargetError.invalidAuthority(authority)
         }
 
-        let port = components.port ?? 443
+        try self.init(host: host, port: components.port ?? 443)
+    }
+
+    init(host: String, port: Int) throws {
+        let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedHost.isEmpty,
+            normalizedHost.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            }),
+            !normalizedHost.contains(where: \Character.isWhitespace)
+        else {
+            throw ConnectTargetError.invalidAuthority(host)
+        }
         guard (1...65_535).contains(port) else {
             throw ConnectTargetError.invalidPort(port)
         }
 
-        self.host = host
+        let authorityHost = normalizedHost.contains(":") ? "[\(normalizedHost)]" : normalizedHost
+        guard let components = URLComponents(string: "https://\(authorityHost):\(port)"),
+            components.host != nil,
+            components.url != nil
+        else {
+            throw ConnectTargetError.invalidAuthority(host)
+        }
+
+        self.host = normalizedHost
         self.port = port
     }
 }

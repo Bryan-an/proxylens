@@ -372,7 +372,8 @@ dependency order, not excluded scope or paid feature tiers.
 - Generated root CA, install/export instructions, and per-domain SSL Proxying rules.
 - Three-pane flow workspace with app/domain grouping, a persistent Source List visibility toggle,
   and persistent pinned domains.
-- Request/response headers, query, cookies, raw message, body, JSON pretty/tree view, and search.
+- Request/response headers, query, cookies, raw message, body, bounded captured-byte Hex, native
+  image Preview with metadata, JSON pretty/tree view, and search.
 - Primary URL/status/content-type filters plus full-text search.
 - HAR import/export and a native local session format.
 - Clear/save session, pin/folder organization, comments, and flow annotations.
@@ -381,12 +382,54 @@ dependency order, not excluded scope or paid feature tiers.
 
 ### P1: differentiated debugger
 
-- Compose tool with cURL import, JSON/form/multipart/raw editing, reusable local presets, bounded recent history, and WebSocket compose. ProxyLens now provides the HTTP/HTTPS portion with native local preset/history controls; WebSocket compose remains future work.
+- Compose tool with cURL import, JSON/form/multipart/raw editing, reusable local presets, bounded
+  recent history, and WebSocket compose. ProxyLens provides the HTTP/HTTPS composer plus a native
+  live WebSocket composer for UTF-8 text and Base64 binary frames in either direction. Historical
+  WebSocket flows can open a fresh `ws://` or verified `wss://` connection, optionally replay one
+  bounded reconstructed text/binary message toward the server, and continue composing on the new
+  replay flow without changing the original capture.
 - WebSocket frame capture and inspection now covers HTTP and intercepted HTTPS upgrades, live
   sent/received frame metadata, bounded latest-frame presentation, and lazy formatted JSON, text,
-  or hex payload display. The Frames view now filters All/Sent/Received traffic, searches bounded
-  text payloads, and exports the complete persisted flow history in versioned local JSON. Frame
-  replay/compose and SSE streaming remain future increments.
+  Protobuf, or hex payload display. Auto and Protobuf reconstruct complete text/binary messages
+  across continuation frames and interleaved control frames. Negotiated `permessage-deflate`
+  messages are decompressed with direction-specific context/window parameters and explicit input,
+  history, and output limits. Binary messages apply request/response descriptor selections by
+  direction, while Hex always shows the authoritative bytes of the selected frame. The Frames view
+  now filters All/Sent/Received traffic, searches bounded text payloads, exports the complete flow
+  history in versioned local JSON, and composes bounded text or binary frames on the selected live
+  connection. Closed/imported flows switch that action to Reconnect; the native editor seeds URL,
+  headers, and a safe complete selected message, while explicit Connect, Connect & Replay, and
+  Disconnect controls preserve every authored and received frame in the normal session history.
+  WebSocket response breakpoints can pause incoming data frames before they reach the client. The
+  Frames inspector permits bounded UTF-8 edits only for complete, uncompressed text frames;
+  binary, fragmented, compressed, invalid UTF-8, and oversized payloads remain pauseable but
+  read-only. Continue preserves transport-owned frame metadata, Abort closes both peers, control
+  frames remain live, and the original upstream bytes remain authoritative in capture.
+- Server-Sent Event capture and inspection now covers identity, gzip, x-gzip, and deflate
+  `text/event-stream` responses with bounded incremental decoding and parsing, persisted
+  event type/ID/retry/data, live latest-event
+  presentation, bounded metadata/data search, lazy JSON formatting, and complete versioned export.
+  The Events inspector can also build a searchable, copyable accumulated-text preview from
+  recognized OpenAI Chat Completions and Responses API deltas. It derives only from the visible
+  latest-500 history, reports omitted/ignored/safety-limited events, and bounds input to 8 MiB,
+  each event to 256 KiB, and output to 1 MiB. Raw response bytes remain authoritative and unknown
+  schemas remain available as individual events. Decoding failures and unsupported or stacked
+  codings, including Brotli, leave the authoritative raw response inspectable and stop only the
+  derived Events path.
+- Intercepted HTTPS now negotiates downstream HTTP/2 with ALPN. Each HTTP/2 stream becomes an
+  independent captured flow and uses the same rules, body storage, breakpoints, throttling, SSE,
+  inspector, search, and export paths as HTTP/1.1. The connection advertises explicit concurrent-
+  stream and header-list bounds, while clients that negotiate `http/1.1` or omit ALPN retain the
+  existing TLS pipeline. Eligible HTTPS requests now negotiate `h2` upstream and multiplex through
+  one origin connection per proxy event loop; concurrent first use shares one ALPN negotiation,
+  closed parents are evicted, and capture shutdown closes every retained parent before its event
+  loops. HTTP/1.1-only origins incur one probe per capture run and then use the existing dedicated
+  transport from cached fallback knowledge. Client-facing protocol metadata remains independent of
+  the upstream transport, while each flow records the observed upstream HTTP version and whether
+  its HTTP/2 parent was newly established or reused. The Timing inspector presents those values
+  explicitly and older/imported captures degrade to Unknown. WebSocket upgrades retain their
+  dedicated HTTP/1.1 path; h2c, server push, connection coalescing, and RFC 8441 extended `CONNECT`
+  remain later increments.
 - GraphQL operation-name matching.
 - Network throttling and request timing breakdown. ProxyLens currently provides removable,
   host-scoped latency-only presets plus Lost Connection, Very Bad Network, Slow 3G, Fast 3G, and
@@ -396,9 +439,10 @@ dependency order, not excluded scope or paid feature tiers.
   optional profile name persists the settings locally for reuse from any flow, and saved profiles
   can be removed from the same menu. The bottom inspector now has a native
   Timing waterfall for request, connection, TLS, waiting, response, and finalization milestones,
-  including truthful partial views for incomplete flows. Lower-level packet/segment loss is
-  intentionally deferred because dropping arbitrary bytes would corrupt HTTP framing; DNS and
-  socket-reuse instrumentation plus the zoomable cross-flow Chart View remain staged increments.
+  including truthful partial views for incomplete flows. Its Connection summary distinguishes
+  client and upstream HTTP versions plus new/reused upstream sockets. Lower-level packet/segment
+  loss is intentionally deferred because dropping arbitrary bytes would corrupt HTTP framing; DNS
+  instrumentation and the zoomable cross-flow Chart View remain staged increments.
 - Rule management. A compact header action opens a native table of the ordered live rule set with
   enabled state, action, phase, priority, and matcher scope. Any rule can be toggled without losing
   its identity or removed immediately. A native New Rule form creates Block, Allow, Breakpoint, and
@@ -412,6 +456,39 @@ dependency order, not excluded scope or paid feature tiers.
   Map Local resources, use stable identities for same-name updates, and are bounded to 50 local
   profiles and 64 MiB each. Portable `.proxylensrules` import and export use native file panels;
   imports validate schema and bounds and update local storage without silently applying live rules.
+- DNS Spoofing is implemented as a connection-phase rule that maps an exact, wildcard, or regular-
+  expression logical host to a validated IPv4 or IPv6 literal. HTTP/1.1, intercepted HTTPS,
+  WebSocket, and upstream HTTP/2 sockets use the physical address while the original URL, `Host`
+  header, TLS SNI, certificate validation identity, capture metadata, and exports remain logical.
+  HTTP/2 connection identity includes both logical and physical destinations so differently routed
+  rules cannot share a parent connection. The native Rules editor supports creation and editing,
+  profiles/import/export preserve the action, and the flow context menu can seed an exact-host rule.
+  ProxyLens does not modify macOS DNS settings or accept hostnames as spoof destinations.
+- Reverse Proxy is available from the main toolbar as a native route manager. Each enabled route
+  binds a numeric IPv4 or IPv6 loopback listener and forwards origin-form HTTP requests to one
+  validated HTTP or HTTPS base URL. Routes persist locally, can be added, edited, enabled, disabled,
+  or removed only while capture is stopped, and apply on the next capture start. Starting capture
+  binds the forward proxy and all enabled reverse listeners atomically; any bind failure closes the
+  listeners already opened. Reverse traffic is labelled by route and inherits the shared capture,
+  rules, body storage, WebSocket upgrade, SSE, scripting, breakpoint, throttling, and upstream
+  HTTP/2 paths while preserving the configured upstream `Host`, TLS SNI, and certificate identity.
+  Current listeners are intentionally loopback-only and HTTP-facing; LAN exposure, local listener
+  TLS, dynamic upstream selection, and load balancing remain later increments.
+- A local SOCKS5 listener is available from the same compact Listeners manager. It is disabled by
+  default, persists a numeric IPv4 or IPv6 loopback endpoint, locks while capture is active, and
+  applies on the next capture start. The bounded no-auth negotiation accepts CONNECT destinations
+  expressed as IPv4, IPv6, or domain names, then classifies the application bytes as HTTP or TLS.
+  Both paths reuse the ordinary capture, rules, body storage, WebSocket, SSE, scripting,
+  breakpoint, and upstream HTTP/2 pipeline while retaining the requested destination for URL,
+  `Host`, SNI, certificate, and source identity. The forward, SOCKS5, and reverse listeners start
+  atomically. Authentication, BIND, UDP ASSOCIATE, opaque TCP forwarding, and LAN exposure remain
+  separate security-scoped increments.
+- Custom Filters are available directly in the traffic filter bar. A preset stores the complete
+  search, method, status, content-type, source, and annotation combination, then reapplies every
+  facet atomically through the existing display-filter path. Presets can be saved, updated by name,
+  renamed, applied, or deleted; stable identities and ordering survive same-name updates. The local
+  versioned preference is bounded to 50 presets, validates names and search size, and fails closed
+  for corrupt or unknown documents without changing captured sessions.
 - Diff is available from a two-row traffic selection. The native comparison sheet aligns request
   or response start lines, headers, and decoded UTF-8 bodies side by side, keeps both panes scrolled
   together, and marks removals/changes in red and additions/changes in green. Body loading and the
@@ -425,16 +502,57 @@ dependency order, not excluded scope or paid feature tiers.
   headers. Selected flows can also be exported as bounded, deterministic OpenAPI 3.0 YAML. The
   export describes observed paths, methods, query names, response statuses, media types, and
   inferred JSON shapes without copying header values or body examples. The inspector now includes
-  a bounded JSONPath query for the derived JSON view; remaining Proxyman generator targets, custom
-  filters, and `jq` remain staged increments.
+  a compact JSONPath/jq query surface over the derived JSON view. The in-process jq evaluator is a
+  documented, side-effect-free subset for traversal, iteration, pipelines, and scalar `select`
+  comparisons; input, query complexity, expansion, and rendered output are bounded. Remaining
+  Proxyman generator targets and the wider jq language remain staged increments.
 - The captured-flow context menu provides a Proxyman-style Copy submenu for URL, request/response
   headers, bodies, cookies, and cURL. Unavailable values are disabled, body reads are bounded, and
   binary bodies copy as base64 instead of lossy text. The bottom request/response selectors also
   preserve full tab names, independently falling back to a compact native menu when a split pane is
-  too narrow.
-- Reverse proxy, SOCKS listener, external upstream proxy, and DNS Spoofing.
-- Protobuf/MessagePack decoding.
-- A constrained JavaScript scripting engine with safe local file access and shared state.
+  too narrow. Both message panes expose a read-only Hex tab with offsets, grouped 16-byte rows, and
+  printable ASCII over the authoritative captured bytes; output is capped at 64 KiB with an explicit
+  omission notice. Both panes also expose a native read-only image Preview. ImageIO recognizes the
+  raster formats supported by macOS (including PNG, JPEG, GIF, WebP, TIFF, and HEIC), builds only a
+  bounded 2,048-pixel first-frame thumbnail from at most 16 MiB of decoded content, and shows format,
+  dimensions, frame count, and capture metadata. Truncated, oversized, unsupported, or malformed
+  bodies fail closed in Preview while Body, Hex, Raw, export, and replay retain the authoritative
+  captured bytes.
+- External upstream proxy configuration remains staged.
+- Protobuf wire decoding is implemented for declared Protobuf bodies. The inspector keeps a
+  schema-less mode and can also import a compiled `FileDescriptorSet`, restore it locally, and use
+  independently selected request and response message types to render field names, scalar types,
+  enum labels, nested messages, and packed repeated values. Descriptor parsing, decoded input, field
+  counts, nesting, and rendered output are bounded; a failed import preserves the last valid local
+  descriptor. Protobuf Content-Type values with `delimited=true` decode multiple varint-length-
+  prefixed messages. Native gRPC bodies decode repeated 5-byte-framed Protobuf messages, including
+  explicit gzip/deflate per-message compression; unsupported compression stays visible and does not
+  trigger codec guessing. Binary and text gRPC-Web bodies decode data and terminal trailer frames,
+  including independently padded base64 chunks in text mode; compressed frames are summarized
+  without guessing. Complete binary WebSocket messages can also be explicitly decoded schema-less
+  or with the direction's selected descriptor after bounded fragmentation and negotiated
+  `permessage-deflate` decoding. Groups, Google well-known-type presentation, and MessagePack remain
+  future increments.
+- The constrained JavaScript scripting foundation is implemented with process-isolated,
+  synchronous request/response handlers, a fresh context per invocation, bounded logging and I/O,
+  a parent-enforced timeout, and native validation. It deliberately exposes no filesystem, network,
+  module, environment, Keychain, or native-object bridge. Matching request/response header and body
+  script rules now run serially before their corresponding message is forwarded, preserve the
+  authoritative captured bytes, and fail open with a rule trace. Header scripts receive no body,
+  preserve native framing fields, validate rewritten targets, and run within bounded request and
+  response gates. WebSocket upgrades reuse those phases: request scripts receive a semantic
+  `ws://`/`wss://` URL and may rewrite it plus ordinary headers, while response scripts may rewrite
+  ordinary `101` headers. Method, status, Host, upgrade/security, subprotocol, and extension fields
+  remain transport-owned, and invalid edits fail open per script without discarding prior valid
+  mutations. WebSocket frame payload scripting remains unsupported. Body scripts can rewrite
+  eligible bounded text messages; streaming, non-UTF-8,
+  encoded, oversized, and invalid messages remain unmodified. Successful bounded
+  `context.log(...)` entries now stay on the owning local rule trace, appear in the selected flow's
+  Rules inspector, and participate in traffic search without entering global diagnostics. A native
+  Rules editor supports all four HTTP script phases with safe templates, restrained JavaScript
+  highlighting, edit round-tripping, and the runtime's 64 KiB source validation. A standalone
+  streaming console, controlled local files, shared state, async HTTP, addons, and packages remain
+  later capabilities.
 - CLI for session/rule export and automation.
 
 ### P2: platform and collaboration expansion

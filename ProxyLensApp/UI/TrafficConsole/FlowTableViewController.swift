@@ -345,6 +345,13 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 action: #selector(disableCaching)
             )
         )
+        menu.addItem(
+            ruleMenuItem(
+                title: "DNS Spoof \(host)…",
+                host: host,
+                action: #selector(dnsSpoof)
+            )
+        )
         let networkConditionsItem = NSMenuItem(
             title: "Network Conditions",
             action: nil,
@@ -544,6 +551,19 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         responseBreakpointItem.target = self
         responseBreakpointItem.representedObject = HostPathMenuTarget(host: host, path: path)
         menu.addItem(responseBreakpointItem)
+        if rows[rowIndex].isWebSocket {
+            let webSocketBreakpointItem = NSMenuItem(
+                title: "Breakpoint WebSocket responses \(host)\(path)",
+                action: #selector(breakpointWebSocketResponse),
+                keyEquivalent: ""
+            )
+            webSocketBreakpointItem.target = self
+            webSocketBreakpointItem.representedObject = HostPathMenuTarget(
+                host: host,
+                path: path
+            )
+            menu.addItem(webSocketBreakpointItem)
+        }
         if let operation = rows[rowIndex].graphqlOperationMetadata {
             let operationBreakpointItem = NSMenuItem(
                 title:
@@ -879,6 +899,15 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         viewModel.disableCaching(forHost: host)
     }
 
+    @objc private func dnsSpoof(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        Task { @MainActor in
+            await promptDNSSpoof(host: host)
+        }
+    }
+
     @objc private func applyNetworkCondition(_ sender: NSMenuItem) {
         guard let target = sender.representedObject as? HostNetworkConditionMenuTarget else {
             return
@@ -1150,6 +1179,13 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         viewModel.breakpoint(host: target.host, path: target.path, phase: .responseHeaders)
     }
 
+    @objc private func breakpointWebSocketResponse(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? HostPathMenuTarget else {
+            return
+        }
+        viewModel.breakpoint(host: target.host, path: target.path, phase: .webSocketFrame)
+    }
+
     @objc private func breakpointGraphQLOperation(_ sender: NSMenuItem) {
         guard let operation = sender.representedObject as? GraphQLOperationMetadata else {
             return
@@ -1341,6 +1377,38 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             throw ProxyLensError.invalidURL(text)
         }
         return destination
+    }
+
+    private func promptDNSSpoof(host: String) async {
+        let alert = NSAlert()
+        alert.messageText = "DNS Spoof"
+        alert.informativeText =
+            "Connect requests for \(host) to a numeric IPv4 or IPv6 address while preserving the original Host header and TLS identity."
+        alert.addButton(withTitle: "Create Rule")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "127.0.0.1 or ::1"
+        field.setAccessibilityIdentifier("dnsSpoof.address")
+        field.setAccessibilityLabel("DNS spoof address")
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await alert.beginSheetModal(for: window)
+        } else {
+            response = alert.runModal()
+        }
+        guard response == .alertFirstButtonReturn else {
+            return
+        }
+
+        do {
+            try await viewModel.dnsSpoof(host: host, address: field.stringValue)
+        } catch {
+            await presentRuleError(error)
+        }
     }
 
     private func presentRuleError(_ error: Error) async {

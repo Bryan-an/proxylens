@@ -1,7 +1,7 @@
 import Foundation
 import ProxyLensCore
 
-enum TrafficMethodFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficMethodFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case get
     case post
@@ -29,7 +29,7 @@ enum TrafficMethodFilter: String, CaseIterable, Equatable, Sendable {
     )
 }
 
-enum TrafficStatusFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficStatusFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case informational
     case success
@@ -58,7 +58,7 @@ enum TrafficStatusFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-enum TrafficContentTypeFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficContentTypeFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case graphql
     case json
@@ -131,9 +131,11 @@ enum TrafficContentTypeFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-enum TrafficOriginFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficOriginFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case desktopProxy
+    case socks5Proxy
+    case reverseProxy
     case importedSession
     case replay
 
@@ -143,6 +145,10 @@ enum TrafficOriginFilter: String, CaseIterable, Equatable, Sendable {
             true
         case .desktopProxy:
             kind == .desktopProxy
+        case .socks5Proxy:
+            kind == .socks5Proxy
+        case .reverseProxy:
+            kind == .reverseProxy
         case .importedSession:
             kind == .importedSession
         case .replay:
@@ -151,7 +157,7 @@ enum TrafficOriginFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-enum TrafficAnnotationFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficAnnotationFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case commented
     case highlighted
@@ -179,7 +185,7 @@ enum TrafficAnnotationFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-struct TrafficDisplayFilter: Equatable, Sendable {
+struct TrafficDisplayFilter: Codable, Equatable, Sendable {
     var searchText = ""
     var method: TrafficMethodFilter = .all
     var status: TrafficStatusFilter = .all
@@ -277,6 +283,7 @@ struct TrafficDisplayFilter: Equatable, Sendable {
             fields.append(trace.ruleName ?? "")
             fields.append(trace.phase.rawValue)
             fields.append(String(describing: trace.outcome))
+            fields.append(contentsOf: trace.logs)
         }
         if let annotation = flow.annotation {
             fields.append(annotation.comment ?? "")

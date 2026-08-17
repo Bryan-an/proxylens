@@ -1,5 +1,17 @@
 import Foundation
 
+public struct PlannedScript: Equatable, Hashable, Sendable {
+    public let ruleID: RuleID
+    public let ruleName: String
+    public let spec: ScriptRuleSpec
+
+    public init(ruleID: RuleID, ruleName: String, spec: ScriptRuleSpec) {
+        self.ruleID = ruleID
+        self.ruleName = ruleName
+        self.spec = spec
+    }
+}
+
 public struct RulePlan: Equatable, Sendable {
     public let phase: RulePhase
     public let traces: [RuleTrace]
@@ -8,10 +20,12 @@ public struct RulePlan: Equatable, Sendable {
     public let applyNoCache: Bool
     public let mapLocalResourceID: String?
     public let mapRemoteURL: URL?
+    public let dnsSpoofAddress: String?
     public let redirectURL: URL?
     public let replacementBody: BodyReference?
     public let throttleProfile: ThrottleProfile?
     public let shouldBreakpoint: Bool
+    public let scripts: [PlannedScript]
 
     public init(
         phase: RulePhase,
@@ -21,10 +35,12 @@ public struct RulePlan: Equatable, Sendable {
         applyNoCache: Bool = false,
         mapLocalResourceID: String? = nil,
         mapRemoteURL: URL? = nil,
+        dnsSpoofAddress: String? = nil,
         redirectURL: URL? = nil,
         replacementBody: BodyReference? = nil,
         throttleProfile: ThrottleProfile? = nil,
-        shouldBreakpoint: Bool = false
+        shouldBreakpoint: Bool = false,
+        scripts: [PlannedScript] = []
     ) {
         self.phase = phase
         self.traces = traces
@@ -33,10 +49,12 @@ public struct RulePlan: Equatable, Sendable {
         self.applyNoCache = applyNoCache
         self.mapLocalResourceID = mapLocalResourceID
         self.mapRemoteURL = mapRemoteURL
+        self.dnsSpoofAddress = dnsSpoofAddress
         self.redirectURL = redirectURL
         self.replacementBody = replacementBody
         self.throttleProfile = throttleProfile
         self.shouldBreakpoint = shouldBreakpoint
+        self.scripts = scripts
     }
 }
 
@@ -54,6 +72,10 @@ public enum RulePlanner: Sendable {
             "Map Remote currently applies during request headers or request body"
         public static let alreadyMappedReason =
             "A previous mapping rule already decided this request"
+        public static let dnsSpoofPhaseReason =
+            "DNS Spoof applies during connection planning"
+        public static let alreadyDNSSpoofedReason =
+            "A previous DNS Spoof rule already selected the connection destination"
         public static let redirectPhaseReason =
             "Redirect currently applies during request headers"
         public static let alreadyRedirectedReason =
@@ -67,7 +89,9 @@ public enum RulePlanner: Sendable {
         public static let alreadyThrottledReason =
             "A previous Throttle rule already selected network conditions"
         public static let breakpointPhaseReason =
-            "Breakpoint currently applies during request headers, request body, or response headers"
+            "Breakpoint currently applies during request headers, request body, response headers, or WebSocket frames"
+        public static let scriptPhaseReason =
+            "Scripts currently apply during HTTP request or response phases"
         public static let alreadyPausedReason =
             "A previous breakpoint rule already paused this phase"
         public static let unimplementedActionReason = "Action is not implemented yet"
@@ -86,14 +110,25 @@ public enum RulePlanner: Sendable {
         var applyNoCache = false
         var mapLocalResourceID: String?
         var mapRemoteURL: URL?
+        var dnsSpoofAddress: String?
         var redirectURL: URL?
         var replacementBody: BodyReference?
         var throttleProfile: ThrottleProfile?
         var shouldBreakpoint = false
+        var scripts: [PlannedScript] = []
 
         for rule in rules.matchingRules(for: context, phase: phase) {
-            let outcome: RuleTraceOutcome
+            let outcome: RuleTraceOutcome?
             switch rule.action {
+            case .dnsSpoof(let spec):
+                if dnsSpoofAddress != nil {
+                    outcome = .skipped(reason: Decision.alreadyDNSSpoofedReason)
+                } else if phase == .connection {
+                    dnsSpoofAddress = spec.address
+                    outcome = .applied
+                } else {
+                    outcome = .skipped(reason: Decision.dnsSpoofPhaseReason)
+                }
             case .allow:
                 if terminated {
                     outcome = .skipped(reason: Decision.alreadyDecidedReason)
@@ -167,7 +202,7 @@ public enum RulePlanner: Sendable {
                 } else if shouldBreakpoint {
                     outcome = .skipped(reason: Decision.alreadyPausedReason)
                 } else if phase == .requestHeaders || phase == .requestBody
-                    || phase == .responseHeaders
+                    || phase == .responseHeaders || phase == .webSocketFrame
                 {
                     outcome = .applied
                     shouldBreakpoint = true
@@ -204,17 +239,32 @@ public enum RulePlanner: Sendable {
                 } else {
                     outcome = .skipped(reason: Decision.unimplementedActionReason)
                 }
+            case .script(let spec):
+                if terminated {
+                    outcome = .skipped(reason: Decision.alreadyDecidedReason)
+                } else if phase == .requestHeaders || phase == .requestBody
+                    || phase == .responseHeaders || phase == .responseBody
+                {
+                    scripts.append(
+                        PlannedScript(ruleID: rule.id, ruleName: rule.name, spec: spec)
+                    )
+                    outcome = nil
+                } else {
+                    outcome = .skipped(reason: Decision.scriptPhaseReason)
+                }
             }
 
-            traces.append(
-                RuleTrace(
-                    ruleID: rule.id,
-                    phase: phase,
-                    outcome: outcome,
-                    recordedAt: recordedAt,
-                    ruleName: rule.name
+            if let outcome {
+                traces.append(
+                    RuleTrace(
+                        ruleID: rule.id,
+                        phase: phase,
+                        outcome: outcome,
+                        recordedAt: recordedAt,
+                        ruleName: rule.name
+                    )
                 )
-            )
+            }
         }
 
         return RulePlan(
@@ -225,10 +275,12 @@ public enum RulePlanner: Sendable {
             applyNoCache: applyNoCache,
             mapLocalResourceID: mapLocalResourceID,
             mapRemoteURL: mapRemoteURL,
+            dnsSpoofAddress: dnsSpoofAddress,
             redirectURL: redirectURL,
             replacementBody: replacementBody,
             throttleProfile: throttleProfile,
-            shouldBreakpoint: shouldBreakpoint
+            shouldBreakpoint: shouldBreakpoint,
+            scripts: scripts
         )
     }
 }

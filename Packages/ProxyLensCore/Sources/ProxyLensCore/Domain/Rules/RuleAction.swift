@@ -67,7 +67,30 @@ public struct ThrottleProfile: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+public struct ScriptRuleSpec: Codable, Equatable, Hashable, Sendable {
+    public let source: String
+
+    public init(source: String) throws {
+        guard source.utf8.count <= ScriptExecutionLimits.maximumSourceByteCount else {
+            throw ScriptExecutionError.sourceTooLarge(
+                maximumByteCount: ScriptExecutionLimits.maximumSourceByteCount
+            )
+        }
+        self.source = source
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(source: container.decode(String.self, forKey: .source))
+    }
+}
+
 public enum RuleAction: Codable, Equatable, Hashable, Sendable {
+    case dnsSpoof(DNSSpoofSpec)
     case mapLocal(resourceID: String)
     case mapRemote(url: URL)
     case breakpoint
@@ -78,4 +101,5 @@ public enum RuleAction: Codable, Equatable, Hashable, Sendable {
     case redirect(url: URL)
     case annotate(message: String)
     case noCache
+    case script(ScriptRuleSpec)
 }

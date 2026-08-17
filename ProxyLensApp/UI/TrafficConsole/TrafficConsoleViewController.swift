@@ -18,6 +18,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let clearSessionButton = NSButton()
     private let composeButton = NSButton()
     private let importButton = NSButton()
+    private let reverseProxyButton = NSButton()
     private let rulesButton = NSButton()
     private let certificateButton = NSButton()
     private let sourceToggleButton = NSButton()
@@ -138,6 +139,20 @@ final class TrafficConsoleViewController: NSViewController {
         importButton.setAccessibilityIdentifier("session.import")
         importButton.setAccessibilityLabel("Import ProxyLens session or HAR file")
 
+        reverseProxyButton.translatesAutoresizingMaskIntoConstraints = false
+        reverseProxyButton.image = NSImage(
+            systemSymbolName: "arrow.triangle.branch",
+            accessibilityDescription: "Reverse Proxy"
+        )
+        reverseProxyButton.imagePosition = .imageOnly
+        reverseProxyButton.bezelStyle = .texturedRounded
+        reverseProxyButton.isBordered = false
+        reverseProxyButton.target = self
+        reverseProxyButton.action = #selector(showReverseProxy)
+        reverseProxyButton.toolTip = "Manage Listeners"
+        reverseProxyButton.setAccessibilityIdentifier("reverseProxy.manage")
+        reverseProxyButton.setAccessibilityLabel("Manage Proxy Listeners")
+
         rulesButton.translatesAutoresizingMaskIntoConstraints = false
         rulesButton.image = NSImage(
             systemSymbolName: "slider.horizontal.3",
@@ -165,6 +180,7 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
+        header.addSubview(reverseProxyButton)
         header.addSubview(rulesButton)
         header.addSubview(importButton)
         header.addSubview(composeButton)
@@ -186,7 +202,12 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.leadingAnchor.constraint(equalTo: statusImage.trailingAnchor, constant: 5),
             statusField.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusField.trailingAnchor.constraint(
-                lessThanOrEqualTo: rulesButton.leadingAnchor, constant: -12),
+                lessThanOrEqualTo: reverseProxyButton.leadingAnchor, constant: -12),
+            reverseProxyButton.trailingAnchor.constraint(
+                equalTo: rulesButton.leadingAnchor, constant: -8),
+            reverseProxyButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            reverseProxyButton.widthAnchor.constraint(equalToConstant: 28),
+            reverseProxyButton.heightAnchor.constraint(equalToConstant: 28),
             rulesButton.trailingAnchor.constraint(
                 equalTo: importButton.leadingAnchor, constant: -8),
             rulesButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -470,6 +491,17 @@ final class TrafficConsoleViewController: NSViewController {
 
     @objc private func showRules() {
         let controller = RuleManagerViewController(viewModel: viewModel)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else {
+                return
+            }
+            self.dismiss(controller)
+        }
+        presentAsSheet(controller)
+    }
+
+    @objc private func showReverseProxy() {
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
         controller.onClose = { [weak self, weak controller] in
             guard let self, let controller else {
                 return

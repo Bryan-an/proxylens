@@ -10,15 +10,21 @@ enum WebSocketBridge {
         upstreamChannel: Channel,
         transaction: FlowTransaction,
         flowID: FlowID,
+        usesTLS: Bool,
         bodyStore: (any BodyStore)?,
         maximumCapturedFrameBytes: Int64,
         maximumFrameBytes: Int,
-        eventSink: any WebSocketFrameEventSink
+        eventSink: any WebSocketFrameEventSink,
+        connectionRegistry: NIOWebSocketConnectionRegistry,
+        ruleSnapshot: (any RuleSnapshotSource)?,
+        ruleContext: RuleMatchContext,
+        breakpointGate: any BreakpointGate
     ) -> EventLoopFuture<Void> {
         clientChannel.eventLoop.assertInEventLoop()
         upstreamChannel.eventLoop.assertInEventLoop()
 
         let state = WebSocketBridgeState()
+        let connectionToken = UUID()
         let recorder = bodyStore.map {
             WebSocketFrameRecorder(
                 bodyStore: $0,
@@ -32,7 +38,12 @@ enum WebSocketBridge {
             flowID: flowID,
             direction: .clientToServer,
             recorder: recorder,
-            state: state
+            state: state,
+            connectionRegistry: connectionRegistry,
+            connectionToken: connectionToken,
+            ruleSnapshot: nil,
+            ruleContext: ruleContext,
+            breakpointGate: ImmediateBreakpointGate()
         )
         let upstreamRelay = WebSocketRelayHandler(
             peerChannel: clientChannel,
@@ -40,7 +51,19 @@ enum WebSocketBridge {
             flowID: flowID,
             direction: .serverToClient,
             recorder: recorder,
-            state: state
+            state: state,
+            connectionRegistry: connectionRegistry,
+            connectionToken: connectionToken,
+            ruleSnapshot: ruleSnapshot,
+            ruleContext: ruleContext,
+            breakpointGate: breakpointGate
+        )
+        let connection = NIOWebSocketConnection(
+            clientChannel: clientChannel,
+            upstreamChannel: upstreamChannel,
+            state: state,
+            recorder: recorder,
+            maximumFrameBytes: maximumFrameBytes
         )
 
         return clientChannel.setOption(ChannelOptions.autoRead, value: false)
@@ -70,6 +93,20 @@ enum WebSocketBridge {
             }
             .flatMap {
                 removeHandler(named: HTTPClientPipeline.responseDecoderName, from: upstreamChannel)
+            }
+            .flatMap {
+                clientChannel.eventLoop.makeFutureWithTask {
+                    await connectionRegistry.register(
+                        connection,
+                        for: flowID,
+                        token: connectionToken
+                    )
+                }
+            }
+            .flatMap {
+                clientChannel.eventLoop.makeFutureWithTask {
+                    await transaction.beginWebSocket(secure: usesTLS, at: Date())
+                }
             }
             .map {
                 clientRelay.activate()
@@ -177,10 +214,16 @@ enum WebSocketBridge {
     }
 }
 
-private final class WebSocketBridgeState {
+final class WebSocketBridgeState: @unchecked Sendable {
     private var nextSequenceNumber: Int64 = 1
-    private var isTerminal = false
     private var latestCaptureTasks: [WebSocketFrameDirection: Task<Void, Error>] = [:]
+    private var hasSentClose = false
+
+    var isTerminal: Bool {
+        isTerminalStorage
+    }
+
+    private var isTerminalStorage = false
 
     func nextSequence() -> Int64 {
         defer {
@@ -191,11 +234,118 @@ private final class WebSocketBridgeState {
     }
 
     func beginTerminalTransition() -> Bool {
-        guard !isTerminal else {
+        guard !isTerminalStorage else {
             return false
         }
-        isTerminal = true
+        isTerminalStorage = true
         return true
+    }
+
+    func beginCloseWrite() -> Bool {
+        guard !hasSentClose else {
+            return false
+        }
+        hasSentClose = true
+        return true
+    }
+
+    func send(
+        _ transmission: WebSocketFrameTransmission,
+        clientChannel: Channel,
+        upstreamChannel: Channel,
+        recorder: WebSocketFrameRecorder?
+    ) -> EventLoopFuture<Void> {
+        clientChannel.eventLoop.assertInEventLoop()
+        guard !isTerminalStorage, clientChannel.isActive, upstreamChannel.isActive else {
+            return clientChannel.eventLoop.makeFailedFuture(
+                ProxyLensError.unsupportedOperation(
+                    "The selected WebSocket connection is no longer open"
+                )
+            )
+        }
+
+        let opcode: WebSocketOpcode
+        switch transmission.opcode {
+        case .text:
+            opcode = .text
+        case .binary:
+            opcode = .binary
+        default:
+            return clientChannel.eventLoop.makeFailedFuture(
+                ProxyLensError.unsupportedOperation(
+                    "The WebSocket composer supports text and binary messages"
+                )
+            )
+        }
+
+        let targetChannel: Channel
+        let maskKey: WebSocketMaskingKey?
+        switch transmission.direction {
+        case .clientToServer:
+            targetChannel = upstreamChannel
+            maskKey = [
+                UInt8.random(in: .min ... .max),
+                UInt8.random(in: .min ... .max),
+                UInt8.random(in: .min ... .max),
+                UInt8.random(in: .min ... .max)
+            ]
+        case .serverToClient:
+            targetChannel = clientChannel
+            maskKey = nil
+        }
+
+        var data = targetChannel.allocator.buffer(capacity: transmission.payload.count)
+        data.writeBytes(transmission.payload)
+        let frame = WebSocketFrame(
+            fin: true,
+            opcode: opcode,
+            maskKey: maskKey,
+            data: data
+        )
+        let sequenceNumber = nextSequence()
+        let writeFuture = targetChannel.writeAndFlush(frame)
+        guard let recorder else {
+            return writeFuture
+        }
+        return writeFuture.flatMap {
+            self.capture(
+                frame,
+                flowID: transmission.flowID,
+                sequenceNumber: sequenceNumber,
+                direction: transmission.direction,
+                recorder: recorder,
+                eventLoop: targetChannel.eventLoop
+            )
+        }
+    }
+
+    func capture(
+        _ frame: WebSocketFrame,
+        flowID: FlowID,
+        sequenceNumber: Int64,
+        direction: WebSocketFrameDirection,
+        recorder: WebSocketFrameRecorder,
+        eventLoop: EventLoop
+    ) -> EventLoopFuture<Void> {
+        let previousTask = latestCaptureTasks[direction]
+        let promise = eventLoop.makePromise(of: Void.self)
+        let captureTask = Task { [previousTask, recorder, frame, flowID, direction] in
+            do {
+                try await previousTask?.value
+                try await recorder.record(
+                    frame,
+                    flowID: flowID,
+                    sequenceNumber: sequenceNumber,
+                    direction: direction
+                )
+                promise.succeed(())
+            } catch {
+                promise.fail(error)
+                throw error
+            }
+        }
+        trackCaptureTask(captureTask, direction: direction)
+        return promise.futureResult
     }
 
     func trackCaptureTask(
@@ -225,11 +375,17 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
     private let direction: WebSocketFrameDirection
     private let recorder: WebSocketFrameRecorder?
     private let state: WebSocketBridgeState
-    private var captureTask: Task<Void, Error>?
+    private let connectionRegistry: NIOWebSocketConnectionRegistry
+    private let connectionToken: UUID
+    private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let ruleContext: RuleMatchContext
+    private let breakpointGate: any BreakpointGate
+    private let maximumEditableBreakpointPayloadBytes = 1 * 1_024 * 1_024
     private var context: ChannelHandlerContext?
     private var pendingFrames: [WebSocketFrame] = []
     private var pendingOperations = 0
     private var isReady = false
+    private var breakpointTask: Task<Void, Never>?
 
     init(
         peerChannel: Channel,
@@ -237,7 +393,12 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
         flowID: FlowID,
         direction: WebSocketFrameDirection,
         recorder: WebSocketFrameRecorder?,
-        state: WebSocketBridgeState
+        state: WebSocketBridgeState,
+        connectionRegistry: NIOWebSocketConnectionRegistry,
+        connectionToken: UUID,
+        ruleSnapshot: (any RuleSnapshotSource)?,
+        ruleContext: RuleMatchContext,
+        breakpointGate: any BreakpointGate
     ) {
         self.peerChannel = peerChannel
         self.transaction = transaction
@@ -245,6 +406,11 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
         self.direction = direction
         self.recorder = recorder
         self.state = state
+        self.connectionRegistry = connectionRegistry
+        self.connectionToken = connectionToken
+        self.ruleSnapshot = ruleSnapshot
+        self.ruleContext = ruleContext
+        self.breakpointGate = breakpointGate
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -252,6 +418,8 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
     }
 
     func handlerRemoved(context _: ChannelHandlerContext) {
+        breakpointTask?.cancel()
+        breakpointTask = nil
         context = nil
         pendingFrames.removeAll(keepingCapacity: false)
     }
@@ -279,6 +447,33 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
 
     private func relay(_ frame: WebSocketFrame, context: ChannelHandlerContext) {
         let sequenceNumber = state.nextSequence()
+        let opcode = WebSocketFrameRelay.capturedOpcode(frame.opcode)
+        if direction == .serverToClient,
+            WebSocketBreakpointFrame.isEligibleDataOpcode(opcode)
+        {
+            let plan = RulePlanner.plan(
+                rules: ruleSnapshot?.currentRules() ?? RuleSet(),
+                context: ruleContext,
+                phase: .webSocketFrame
+            )
+            if plan.shouldBreakpoint {
+                relayThroughBreakpoint(
+                    frame,
+                    opcode: opcode,
+                    sequenceNumber: sequenceNumber,
+                    plan: plan,
+                    context: context
+                )
+                return
+            }
+            if !plan.traces.isEmpty {
+                let transaction = self.transaction
+                Task { [transaction, traces = plan.traces] in
+                    await transaction.appendRuleTraces(traces)
+                }
+            }
+        }
+
         let boundSelf = NIOLoopBound(self, eventLoop: context.eventLoop)
         let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
         beginOperation(context: context)
@@ -292,32 +487,172 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
             return
         }
         beginOperation(context: context)
-        let previousTask = captureTask
-        let flowID = self.flowID
-        let direction = self.direction
-        let recordTask = Task { [previousTask, recorder, frame, flowID, direction] in
-            try await previousTask?.value
-            try await recorder.record(
-                frame,
-                flowID: flowID,
-                sequenceNumber: sequenceNumber,
-                direction: direction
-            )
-        }
-        captureTask = recordTask
-        state.trackCaptureTask(recordTask, direction: direction)
-        context.eventLoop.makeFutureWithTask { [recordTask] in
-            try await recordTask.value
-        }.whenComplete { result in
+        state.capture(
+            frame,
+            flowID: flowID,
+            sequenceNumber: sequenceNumber,
+            direction: direction,
+            recorder: recorder,
+            eventLoop: context.eventLoop
+        ).whenComplete { result in
             boundSelf.value.completeOperation(result, context: boundContext.value)
         }
     }
 
+    private func relayThroughBreakpoint(
+        _ frame: WebSocketFrame,
+        opcode: WebSocketFrameOpcode,
+        sequenceNumber: Int64,
+        plan: RulePlan,
+        context: ChannelHandlerContext
+    ) {
+        guard let request = ruleContext.request else {
+            terminateWithFailure(
+                "A WebSocket breakpoint could not recover the upgrade request",
+                context: context
+            )
+            return
+        }
+
+        let payloadBuffer = frame.unmaskedData
+        let payloadByteCount = payloadBuffer.readableBytes
+        let editablePayload =
+            payloadByteCount <= maximumEditableBreakpointPayloadBytes
+            ? Data(payloadBuffer.readableBytesView) : nil
+        let breakpointFrame = WebSocketBreakpointFrame(
+            sequenceNumber: Int(clamping: sequenceNumber),
+            opcode: opcode,
+            isFinal: frame.fin,
+            reservedBits: WebSocketFrameRelay.reservedBits(frame),
+            payload: editablePayload,
+            originalPayloadByteCount: payloadByteCount,
+            maximumEditablePayloadBytes: maximumEditableBreakpointPayloadBytes
+        )
+        let hit = BreakpointHit(
+            flowID: flowID,
+            phase: .webSocketResponse,
+            request: request,
+            response: ruleContext.response,
+            webSocketFrame: breakpointFrame
+        )
+        let boundSelf = NIOLoopBound(self, eventLoop: context.eventLoop)
+        let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
+
+        beginOperation(context: context)
+        let captureFuture: EventLoopFuture<Void>
+        if let recorder {
+            captureFuture = state.capture(
+                frame,
+                flowID: flowID,
+                sequenceNumber: sequenceNumber,
+                direction: direction,
+                recorder: recorder,
+                eventLoop: context.eventLoop
+            )
+        } else {
+            captureFuture = context.eventLoop.makeSucceededVoidFuture()
+        }
+
+        captureFuture.whenComplete { captureResult in
+            guard case .success = captureResult else {
+                boundSelf.value.completeOperation(captureResult, context: boundContext.value)
+                return
+            }
+            guard !boundSelf.value.state.isTerminal else {
+                boundSelf.value.completeOperation(.success(()), context: boundContext.value)
+                return
+            }
+
+            let transaction = boundSelf.value.transaction
+            let gate = boundSelf.value.breakpointGate
+            let eventLoop = boundContext.value.eventLoop
+            let task = Task { [transaction, gate, hit, traces = plan.traces] in
+                await transaction.appendRuleTraces(traces)
+                await transaction.pause(.webSocketResponse)
+                let decision = await gate.pause(hit)
+                eventLoop.execute {
+                    boundSelf.value.applyBreakpointDecision(
+                        decision,
+                        originalFrame: frame,
+                        breakpointFrame: breakpointFrame,
+                        context: boundContext.value
+                    )
+                }
+            }
+            boundSelf.value.breakpointTask = task
+        }
+    }
+
+    private func applyBreakpointDecision(
+        _ decision: BreakpointDecision,
+        originalFrame: WebSocketFrame,
+        breakpointFrame: WebSocketBreakpointFrame,
+        context: ChannelHandlerContext
+    ) {
+        breakpointTask = nil
+        guard !state.isTerminal else {
+            completeOperation(.success(()), context: context)
+            return
+        }
+
+        switch decision {
+        case .abort:
+            terminateWithFailure(
+                "Aborted at WebSocket response breakpoint",
+                context: context
+            )
+        case .continue(let decidedHit):
+            let replacementPayload = validatedReplacementPayload(
+                from: decidedHit,
+                original: breakpointFrame
+            )
+            let forwardedFrame = WebSocketFrameRelay.forwardedFrame(
+                originalFrame,
+                direction: direction,
+                replacingPayload: replacementPayload
+            )
+            let transaction = self.transaction
+            let peerChannel = self.peerChannel
+            let boundSelf = NIOLoopBound(self, eventLoop: context.eventLoop)
+            let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
+            context.eventLoop.makeFutureWithTask {
+                await transaction.resumeWebSocketBreakpoint()
+            }.flatMap {
+                peerChannel.writeAndFlush(forwardedFrame)
+            }.whenComplete { result in
+                boundSelf.value.completeOperation(result, context: boundContext.value)
+            }
+        }
+    }
+
+    private func validatedReplacementPayload(
+        from decidedHit: BreakpointHit,
+        original: WebSocketBreakpointFrame
+    ) -> Data? {
+        guard decidedHit.flowID == flowID,
+            decidedHit.phase == .webSocketResponse,
+            let candidate = decidedHit.webSocketFrame,
+            candidate.sequenceNumber == original.sequenceNumber,
+            candidate.opcode == original.opcode,
+            let payload = candidate.payload,
+            let validated = try? original.replacingPayload(payload)
+        else {
+            return nil
+        }
+        return validated.payload
+    }
+
     func channelInactive(context: ChannelHandlerContext) {
+        breakpointTask?.cancel()
+        breakpointTask = nil
         if state.beginTerminalTransition() {
             let transaction = self.transaction
             let captureTasks = state.captureTasks()
-            Task { [transaction, captureTasks] in
+            let connectionRegistry = self.connectionRegistry
+            let flowID = self.flowID
+            let connectionToken = self.connectionToken
+            Task { [transaction, captureTasks, connectionRegistry, flowID, connectionToken] in
+                await connectionRegistry.unregister(flowID: flowID, token: connectionToken)
                 do {
                     for task in captureTasks {
                         try await task.value
@@ -371,9 +706,15 @@ private final class WebSocketRelayHandler: ChannelInboundHandler, @unchecked Sen
             context.close(promise: nil)
             return
         }
+        breakpointTask?.cancel()
+        breakpointTask = nil
         state.cancelCaptureTasks()
         let transaction = self.transaction
-        Task { [transaction] in
+        let connectionRegistry = self.connectionRegistry
+        let flowID = self.flowID
+        let connectionToken = self.connectionToken
+        Task { [transaction, connectionRegistry, flowID, connectionToken] in
+            await connectionRegistry.unregister(flowID: flowID, token: connectionToken)
             await transaction.fail(.protocolError(message))
         }
         peerChannel.close(promise: nil)

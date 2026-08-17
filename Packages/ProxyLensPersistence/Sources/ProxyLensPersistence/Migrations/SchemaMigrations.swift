@@ -91,6 +91,28 @@ public enum SchemaMigrations {
             )
         }
 
+        migrator.registerMigration("v4_add_server_sent_events") { database in
+            try database.create(table: "server_sent_events") { table in
+                table.column("id", .text).primaryKey()
+                table.column("flow_id", .text).notNull()
+                    .references("flows", onDelete: .cascade)
+                table.column("sequence_number", .integer).notNull()
+                table.column("event_type", .text).notNull()
+                table.column("event_id", .text)
+                table.column("retry_milliseconds", .integer)
+                table.column("received_at", .double).notNull()
+                table.column("data_byte_count", .integer).notNull()
+                table.column("snapshot", .blob).notNull()
+                table.column("updated_at", .double).notNull()
+                table.uniqueKey(["flow_id", "sequence_number"])
+            }
+            try database.create(
+                index: "server_sent_events_flow_sequence",
+                on: "server_sent_events",
+                columns: ["flow_id", "sequence_number"]
+            )
+        }
+
         return migrator
     }
 }

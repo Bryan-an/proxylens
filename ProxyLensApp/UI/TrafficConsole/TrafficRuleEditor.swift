@@ -4,6 +4,7 @@ import ProxyLensCore
 enum TrafficRuleDraftError: Error, Equatable, LocalizedError {
     case missingName
     case missingMatcherValue
+    case missingScriptSource
     case invalidRegularExpression
     case unsupportedPhase
 
@@ -13,6 +14,8 @@ enum TrafficRuleDraftError: Error, Equatable, LocalizedError {
             "Enter a rule name."
         case .missingMatcherValue:
             "Enter a matcher value."
+        case .missingScriptSource:
+            "Enter JavaScript source for the rule."
         case .invalidRegularExpression:
             "Enter a valid regular expression."
         case .unsupportedPhase:
@@ -22,13 +25,17 @@ enum TrafficRuleDraftError: Error, Equatable, LocalizedError {
 }
 
 enum TrafficRuleActionKind: String, CaseIterable {
+    case dnsSpoof
     case block
     case allow
     case breakpoint
     case noCache
+    case script
 
     var title: String {
         switch self {
+        case .dnsSpoof:
+            "DNS Spoof"
         case .block:
             "Block"
         case .allow:
@@ -37,24 +44,32 @@ enum TrafficRuleActionKind: String, CaseIterable {
             "Breakpoint"
         case .noCache:
             "No Cache"
+        case .script:
+            "Script"
         }
     }
 
     var allowedPhases: [RulePhase] {
         switch self {
+        case .dnsSpoof:
+            [.connection]
         case .block:
             [.requestHeaders, .requestBody]
         case .allow:
             [.requestHeaders]
         case .breakpoint:
-            [.requestHeaders, .requestBody, .responseHeaders]
+            [.requestHeaders, .requestBody, .responseHeaders, .webSocketFrame]
         case .noCache:
             [.requestHeaders, .responseHeaders]
+        case .script:
+            [.requestHeaders, .requestBody, .responseHeaders, .responseBody]
         }
     }
 
-    var ruleAction: RuleAction {
+    var ruleAction: RuleAction? {
         switch self {
+        case .dnsSpoof:
+            nil
         case .block:
             .block(reason: "Blocked by ProxyLens")
         case .allow:
@@ -63,11 +78,15 @@ enum TrafficRuleActionKind: String, CaseIterable {
             .breakpoint
         case .noCache:
             .noCache
+        case .script:
+            nil
         }
     }
 
     init?(ruleAction: RuleAction) {
         switch ruleAction {
+        case .dnsSpoof:
+            self = .dnsSpoof
         case .block:
             self = .block
         case .allow:
@@ -76,6 +95,8 @@ enum TrafficRuleActionKind: String, CaseIterable {
             self = .breakpoint
         case .noCache:
             self = .noCache
+        case .script:
+            self = .script
         case .mapLocal, .mapRemote, .replaceBody, .throttle, .redirect, .annotate:
             return nil
         }
@@ -134,6 +155,8 @@ struct TrafficRuleDraft {
     let matcher: TrafficRuleMatcherKind
     let patternKind: TrafficRulePatternKind
     let matcherValue: String
+    let actionValue: String
+    let scriptSource: String
     let enabled: Bool
     private let originalAction: RuleAction?
 
@@ -146,6 +169,8 @@ struct TrafficRuleDraft {
         matcher: TrafficRuleMatcherKind,
         patternKind: TrafficRulePatternKind,
         matcherValue: String,
+        actionValue: String = "",
+        scriptSource: String = "",
         enabled: Bool = true,
         originalAction: RuleAction? = nil
     ) {
@@ -157,6 +182,8 @@ struct TrafficRuleDraft {
         self.matcher = matcher
         self.patternKind = patternKind
         self.matcherValue = matcherValue
+        self.actionValue = actionValue
+        self.scriptSource = scriptSource
         self.enabled = enabled
         self.originalAction = originalAction
     }
@@ -179,6 +206,8 @@ struct TrafficRuleDraft {
             matcher: matcherConfiguration.matcher,
             patternKind: matcherConfiguration.pattern,
             matcherValue: matcherConfiguration.value,
+            actionValue: Self.actionValue(for: rule.action),
+            scriptSource: Self.scriptSource(for: rule.action),
             enabled: rule.enabled,
             originalAction: rule.action
         )
@@ -200,7 +229,7 @@ struct TrafficRuleDraft {
             priority: priority,
             phase: phase,
             matcher: try makeMatcher(),
-            action: resolvedAction
+            action: try resolvedAction()
         )
     }
 
@@ -212,6 +241,8 @@ struct TrafficRuleDraft {
         matcher: TrafficRuleMatcherKind,
         patternKind: TrafficRulePatternKind,
         matcherValue: String,
+        actionValue: String,
+        scriptSource: String,
         enabled: Bool
     ) -> TrafficRuleDraft {
         TrafficRuleDraft(
@@ -223,18 +254,46 @@ struct TrafficRuleDraft {
             matcher: matcher,
             patternKind: patternKind,
             matcherValue: matcherValue,
+            actionValue: actionValue,
+            scriptSource: scriptSource,
             enabled: enabled,
             originalAction: originalAction
         )
     }
 
-    private var resolvedAction: RuleAction {
+    private func resolvedAction() throws -> RuleAction {
+        if action == .dnsSpoof {
+            return .dnsSpoof(try DNSSpoofSpec(address: actionValue))
+        }
+        if action == .script {
+            guard !scriptSource.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw TrafficRuleDraftError.missingScriptSource
+            }
+            return .script(try ScriptRuleSpec(source: scriptSource))
+        }
         guard let originalAction,
             TrafficRuleActionKind(ruleAction: originalAction) == action
         else {
-            return action.ruleAction
+            guard let ruleAction = action.ruleAction else {
+                throw TrafficRuleDraftError.unsupportedPhase
+            }
+            return ruleAction
         }
         return originalAction
+    }
+
+    private static func scriptSource(for action: RuleAction) -> String {
+        guard case .script(let spec) = action else {
+            return ""
+        }
+        return spec.source
+    }
+
+    private static func actionValue(for action: RuleAction) -> String {
+        guard case .dnsSpoof(let spec) = action else {
+            return ""
+        }
+        return spec.address
     }
 
     private func makeMatcher() throws -> Matcher {
@@ -321,7 +380,7 @@ struct TrafficRuleDraft {
 }
 
 @MainActor
-final class TrafficRuleEditorViewController: NSViewController {
+final class TrafficRuleEditorViewController: NSViewController, NSTextViewDelegate {
     var onSubmit: ((Rule) -> Void)?
     var onCancel: (() -> Void)?
 
@@ -329,14 +388,24 @@ final class TrafficRuleEditorViewController: NSViewController {
 
     private let nameField = NSTextField()
     private let actionPopup = NSPopUpButton()
+    private let actionValueLabel = NSTextField(labelWithString: "Address")
+    private let actionValueField = NSTextField()
     private let phasePopup = NSPopUpButton()
     private let matcherPopup = NSPopUpButton()
     private let patternPopup = NSPopUpButton()
     private let valueField = NSTextField()
     private let priorityField = NSTextField(string: "10")
     private let enabledButton = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
+    private let scriptSection = NSView()
+    private let scriptTextView = NSTextView()
+    private let scriptScrollView = NSScrollView()
+    private let scriptByteCountField = NSTextField(labelWithString: "")
+    private let scriptHelpField = NSTextField(wrappingLabelWithString: "")
     private let errorField = NSTextField(wrappingLabelWithString: "")
     private var phaseChoices: [RulePhase] = []
+    private var scriptSectionHeightConstraint: NSLayoutConstraint?
+    private var lastSeededScriptTemplate: String?
+    private var isApplyingScriptHighlight = false
 
     init(draft: TrafficRuleDraft? = nil) {
         initialDraft = draft
@@ -358,15 +427,17 @@ final class TrafficRuleEditorViewController: NSViewController {
 
         let subtitle = NSTextField(
             wrappingLabelWithString:
-                "Create a live rule with a bounded matcher. Mapping and body-file actions remain available from a captured flow."
+                "Create a live rule with a bounded matcher. Body scripts run in an isolated worker."
         )
         subtitle.textColor = .secondaryLabelColor
         subtitle.translatesAutoresizingMaskIntoConstraints = false
 
         configureControls()
+        configureScriptSection()
         let grid = NSGridView(views: [
             [label("Name"), nameField],
             [label("Action"), actionPopup],
+            [actionValueLabel, actionValueField],
             [label("Phase"), phasePopup],
             [label("Match"), matcherPopup],
             [label("Comparison"), patternPopup],
@@ -404,6 +475,7 @@ final class TrafficRuleEditorViewController: NSViewController {
         container.addSubview(title)
         container.addSubview(subtitle)
         container.addSubview(grid)
+        container.addSubview(scriptSection)
         container.addSubview(errorField)
         container.addSubview(createButton)
         container.addSubview(cancelButton)
@@ -417,9 +489,12 @@ final class TrafficRuleEditorViewController: NSViewController {
             grid.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             grid.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             grid.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 18),
+            scriptSection.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            scriptSection.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            scriptSection.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 12),
             errorField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             errorField.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            errorField.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 10),
+            errorField.topAnchor.constraint(equalTo: scriptSection.bottomAnchor, constant: 10),
             cancelButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             cancelButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
             createButton.trailingAnchor.constraint(
@@ -427,7 +502,6 @@ final class TrafficRuleEditorViewController: NSViewController {
             createButton.centerYAnchor.constraint(equalTo: cancelButton.centerYAnchor)
         ])
 
-        preferredContentSize = NSSize(width: 560, height: 430)
         view = container
         applyInitialDraft()
         updatePhaseChoices()
@@ -435,6 +509,8 @@ final class TrafficRuleEditorViewController: NSViewController {
             phasePopup.selectItem(at: index)
         }
         updateMatcherControls()
+        updateActionControls()
+        updateScriptControls()
     }
 
     private func configureControls() {
@@ -446,7 +522,17 @@ final class TrafficRuleEditorViewController: NSViewController {
         actionPopup.action = #selector(actionChanged)
         actionPopup.setAccessibilityIdentifier("ruleEditor.action")
 
+        actionValueLabel.textColor = .secondaryLabelColor
+        actionValueField.placeholderString = "127.0.0.1 or ::1"
+        actionValueField.setAccessibilityIdentifier("ruleEditor.actionValue")
+        actionValueField.setAccessibilityLabel("DNS spoof address")
+        actionValueField.setAccessibilityHelp(
+            "Enter a numeric IPv4 or IPv6 destination. Hostnames and ports are not accepted."
+        )
+
         phasePopup.setAccessibilityIdentifier("ruleEditor.phase")
+        phasePopup.target = self
+        phasePopup.action = #selector(phaseChanged)
 
         matcherPopup.addItems(withTitles: TrafficRuleMatcherKind.allCases.map(\.title))
         matcherPopup.target = self
@@ -459,6 +545,79 @@ final class TrafficRuleEditorViewController: NSViewController {
         priorityField.setAccessibilityIdentifier("ruleEditor.priority")
         enabledButton.state = .on
         enabledButton.setAccessibilityIdentifier("ruleEditor.enabled")
+    }
+
+    private func configureScriptSection() {
+        scriptSection.translatesAutoresizingMaskIntoConstraints = false
+        scriptSection.setAccessibilityIdentifier("ruleEditor.scriptSection")
+
+        let scriptLabel = NSTextField(labelWithString: "JavaScript")
+        scriptLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        scriptLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        scriptByteCountField.alignment = .right
+        scriptByteCountField.textColor = .secondaryLabelColor
+        scriptByteCountField.translatesAutoresizingMaskIntoConstraints = false
+        scriptByteCountField.setAccessibilityIdentifier("ruleEditor.scriptByteCount")
+
+        scriptTextView.delegate = self
+        scriptTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        scriptTextView.textContainerInset = NSSize(width: 8, height: 8)
+        scriptTextView.isAutomaticQuoteSubstitutionEnabled = false
+        scriptTextView.isAutomaticDashSubstitutionEnabled = false
+        scriptTextView.isAutomaticTextReplacementEnabled = false
+        scriptTextView.isHorizontallyResizable = true
+        scriptTextView.isVerticallyResizable = true
+        scriptTextView.autoresizingMask = [.width]
+        scriptTextView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        scriptTextView.textContainer?.widthTracksTextView = false
+        scriptTextView.usesFindBar = true
+        scriptTextView.isIncrementalSearchingEnabled = true
+        scriptTextView.setAccessibilityIdentifier("ruleEditor.scriptSource")
+        scriptTextView.setAccessibilityLabel("JavaScript source")
+        scriptTextView.setAccessibilityHelp(
+            "Define onRequest(context) or onResponse(context) and return the edited message."
+        )
+
+        scriptScrollView.documentView = scriptTextView
+        scriptScrollView.borderType = .bezelBorder
+        scriptScrollView.hasVerticalScroller = true
+        scriptScrollView.hasHorizontalScroller = true
+        scriptScrollView.autohidesScrollers = true
+        scriptScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        scriptHelpField.stringValue =
+            "Runs in an isolated worker. Header phases cannot read or replace bodies. Async functions are not supported yet."
+        scriptHelpField.textColor = .secondaryLabelColor
+        scriptHelpField.maximumNumberOfLines = 2
+        scriptHelpField.translatesAutoresizingMaskIntoConstraints = false
+        scriptHelpField.setAccessibilityIdentifier("ruleEditor.scriptHelp")
+
+        scriptSection.addSubview(scriptLabel)
+        scriptSection.addSubview(scriptByteCountField)
+        scriptSection.addSubview(scriptScrollView)
+        scriptSection.addSubview(scriptHelpField)
+        NSLayoutConstraint.activate([
+            scriptLabel.leadingAnchor.constraint(equalTo: scriptSection.leadingAnchor),
+            scriptLabel.topAnchor.constraint(equalTo: scriptSection.topAnchor),
+            scriptByteCountField.trailingAnchor.constraint(equalTo: scriptSection.trailingAnchor),
+            scriptByteCountField.centerYAnchor.constraint(equalTo: scriptLabel.centerYAnchor),
+            scriptScrollView.leadingAnchor.constraint(equalTo: scriptSection.leadingAnchor),
+            scriptScrollView.trailingAnchor.constraint(equalTo: scriptSection.trailingAnchor),
+            scriptScrollView.topAnchor.constraint(equalTo: scriptLabel.bottomAnchor, constant: 6),
+            scriptScrollView.heightAnchor.constraint(equalToConstant: 190),
+            scriptHelpField.leadingAnchor.constraint(equalTo: scriptSection.leadingAnchor),
+            scriptHelpField.trailingAnchor.constraint(equalTo: scriptSection.trailingAnchor),
+            scriptHelpField.topAnchor.constraint(
+                equalTo: scriptScrollView.bottomAnchor, constant: 6),
+            scriptHelpField.bottomAnchor.constraint(equalTo: scriptSection.bottomAnchor)
+        ])
+        let heightConstraint = scriptSection.heightAnchor.constraint(equalToConstant: 0)
+        heightConstraint.isActive = true
+        scriptSectionHeightConstraint = heightConstraint
     }
 
     private func applyInitialDraft() {
@@ -475,6 +634,8 @@ final class TrafficRuleEditorViewController: NSViewController {
         patternPopup.selectItem(
             at: TrafficRulePatternKind.allCases.firstIndex(of: initialDraft.patternKind)!)
         valueField.stringValue = initialDraft.matcherValue
+        actionValueField.stringValue = initialDraft.actionValue
+        scriptTextView.string = initialDraft.scriptSource
     }
 
     private func label(_ title: String) -> NSTextField {
@@ -515,8 +676,86 @@ final class TrafficRuleEditorViewController: NSViewController {
         valueField.placeholderString = matcher == .method ? "GET" : "Matcher value"
     }
 
+    private func updateActionControls() {
+        let showsAddress = selectedAction == .dnsSpoof
+        actionValueLabel.isHidden = !showsAddress
+        actionValueField.isHidden = !showsAddress
+        actionValueField.isEnabled = showsAddress
+    }
+
+    private var selectedPhase: RulePhase? {
+        guard phaseChoices.indices.contains(phasePopup.indexOfSelectedItem) else {
+            return nil
+        }
+        return phaseChoices[phasePopup.indexOfSelectedItem]
+    }
+
+    private func updateScriptControls() {
+        let showsScript = selectedAction == .script
+        scriptSection.isHidden = !showsScript
+        scriptScrollView.isHidden = !showsScript
+        scriptSectionHeightConstraint?.constant = showsScript ? 260 : 0
+        preferredContentSize = NSSize(
+            width: showsScript ? 720 : 560,
+            height: showsScript ? 700 : 430
+        )
+
+        guard showsScript, let phase = selectedPhase else {
+            return
+        }
+        seedScriptTemplateIfNeeded(for: phase)
+        applyScriptHighlighting()
+        updateScriptByteCount()
+    }
+
+    private func seedScriptTemplateIfNeeded(for phase: RulePhase) {
+        let currentSource = scriptTextView.string
+        guard
+            currentSource.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || currentSource == lastSeededScriptTemplate
+        else {
+            return
+        }
+        let template = Self.scriptTemplate(for: phase)
+        scriptTextView.string = template
+        lastSeededScriptTemplate = template
+    }
+
+    private func updateScriptByteCount() {
+        let byteCount = scriptTextView.string.utf8.count
+        let maximum = ScriptExecutionLimits.maximumSourceByteCount
+        scriptByteCountField.stringValue = "\(byteCount.formatted()) / \(maximum.formatted()) bytes"
+        scriptByteCountField.textColor = byteCount > maximum ? .systemRed : .secondaryLabelColor
+        scriptByteCountField.setAccessibilityLabel(
+            "JavaScript source size: \(byteCount) of \(maximum) bytes"
+        )
+    }
+
+    private func applyScriptHighlighting() {
+        guard !isApplyingScriptHighlight else {
+            return
+        }
+        let selection = scriptTextView.selectedRanges
+        isApplyingScriptHighlight = true
+        scriptTextView.textStorage?.setAttributedString(
+            InspectorSyntaxHighlighter.highlight(scriptTextView.string, as: .javaScript)
+        )
+        scriptTextView.selectedRanges = selection
+        scriptTextView.typingAttributes = [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: NSColor.textColor
+        ]
+        isApplyingScriptHighlight = false
+    }
+
     @objc private func actionChanged() {
         updatePhaseChoices()
+        updateActionControls()
+        updateScriptControls()
+    }
+
+    @objc private func phaseChanged() {
+        updateScriptControls()
     }
 
     @objc private func matcherChanged() {
@@ -536,6 +775,8 @@ final class TrafficRuleEditorViewController: NSViewController {
                 matcher: selectedMatcher,
                 patternKind: selectedPattern,
                 matcherValue: valueField.stringValue,
+                actionValue: actionValueField.stringValue,
+                scriptSource: scriptTextView.string,
                 enabled: enabledButton.state == .on
             )
             let draft =
@@ -547,6 +788,8 @@ final class TrafficRuleEditorViewController: NSViewController {
                     matcher: values.matcher,
                     patternKind: values.patternKind,
                     matcherValue: values.matcherValue,
+                    actionValue: values.actionValue,
+                    scriptSource: values.scriptSource,
                     enabled: values.enabled
                 )
                 ?? TrafficRuleDraft(
@@ -557,6 +800,8 @@ final class TrafficRuleEditorViewController: NSViewController {
                     matcher: values.matcher,
                     patternKind: values.patternKind,
                     matcherValue: values.matcherValue,
+                    actionValue: values.actionValue,
+                    scriptSource: values.scriptSource,
                     enabled: values.enabled
                 )
             let rule = try draft.makeRule()
@@ -570,6 +815,63 @@ final class TrafficRuleEditorViewController: NSViewController {
 
     @objc private func cancel() {
         onCancel?()
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard
+            !isApplyingScriptHighlight,
+            let textView = notification.object as? NSTextView,
+            textView === scriptTextView
+        else {
+            return
+        }
+        applyScriptHighlighting()
+        updateScriptByteCount()
+    }
+
+    private static func scriptTemplate(for phase: RulePhase) -> String {
+        switch phase {
+        case .requestHeaders:
+            """
+            function onRequest(context) {
+              // Edit context.request.headers, method, or url.
+              // WebSocket handshakes support ws/wss URL and ordinary header edits.
+              // The method and upgrade-critical headers are protected.
+              context.request.headers.push({ name: "X-ProxyLens", value: "request" });
+              context.log("Request headers updated");
+              return context.request;
+            }
+            """
+        case .requestBody:
+            """
+            function onRequest(context) {
+              // Edit context.request.headers, body, method, or url.
+              context.log("Request script applied");
+              return context.request;
+            }
+            """
+        case .responseHeaders:
+            """
+            function onResponse(context) {
+              // Edit context.response.headers or statusCode.
+              // WebSocket handshakes support ordinary response header edits.
+              // The 101 status and upgrade-critical headers are protected.
+              context.response.headers.push({ name: "X-ProxyLens", value: "response" });
+              context.log("Response headers updated");
+              return context.response;
+            }
+            """
+        case .responseBody:
+            """
+            function onResponse(context) {
+              // Edit context.response.headers, body, or statusCode.
+              context.log("Response script applied");
+              return context.response;
+            }
+            """
+        case .connection, .webSocketFrame:
+            ""
+        }
     }
 
     private static func phaseTitle(_ phase: RulePhase) -> String {

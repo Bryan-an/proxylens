@@ -285,7 +285,7 @@ The initial implementation does not need every directory above. Create the P0 fi
 | `ProxyLensApplication` | Use cases, orchestration, flow events, rule execution coordination | Socket handlers, SQL queries, view controllers |
 | `ProxyLensCapture` | Listeners, NIO channels, HTTP/1.1, CONNECT, TLS pipelines, WebSockets | SQLite, Keychain mutation, UI state |
 | `ProxyLensPersistence` | GRDB database, migrations, repositories, body files, session actor | Protocol parsing, AppKit, rule UI |
-| `ProxyLensPlatform` | Keychain, CA material, system proxy configuration, logging, future helpers | Flow presentation, protocol parsing, product use cases |
+| `ProxyLensPlatform` | Keychain, CA material, system proxy configuration, logging, isolated JavaScript execution, future helpers | Flow presentation, protocol parsing, product use cases |
 | `ProxyLensApp` | Composition root, SwiftUI, AppKit, view models, menus, commands | Direct database or socket access |
 
 ## Composition root
@@ -342,8 +342,17 @@ Important rules:
 - `Flow` contains metadata and references, not necessarily all body bytes in memory.
 - `BodyReference` identifies raw data, its size, encoding, hash, and storage location.
 - A body can be inline for small payloads or file-backed for large payloads.
-- Decoded JSON, XML, form, and GraphQL views are bounded derived values; Protobuf remains a
-  future derived decoder.
+- Hex, native image thumbnails, decoded JSON, XML, form, GraphQL, and Protobuf views are bounded
+  derived values. The Protobuf view activates only for declared Protobuf, native gRPC, or gRPC-Web
+  media types and never replaces the captured bytes. It can render schema-less wire values or apply
+  an explicitly selected message schema from a locally imported, bounded `FileDescriptorSet`
+  catalog. Explicit `delimited=true` bodies decode varint-length-prefixed message sequences. Native
+  gRPC applies `grpc-encoding` separately from whole-body HTTP `Content-Encoding`; binary/text
+  gRPC-Web decodes data and terminal trailer frames, including independently padded text chunks.
+  Complete binary WebSocket messages can be explicitly rendered as Protobuf after bounded
+  fragmentation reconstruction and negotiated `permessage-deflate` decoding, using the request
+  schema for client-to-server traffic and the response schema for the opposite direction. Hex keeps
+  showing the authoritative bytes of the selected frame.
 - GraphQL inspection accepts JSON request envelopes and `application/graphql` source, formats
   operations and variables for display, and never replaces the authoritative request body.
 - Capture derives only the bounded GraphQL operation kind/name into `HTTPRequest` metadata. This
@@ -353,28 +362,84 @@ Important rules:
   oversized bodies simply omit the metadata and retain their raw bytes.
 - A decoder failure must never make the raw body unavailable.
 - A partially captured flow is a valid persisted state with an explicit completion/error status.
+- `ConnectionInfo` keeps client-facing destination metadata plus optional observed upstream HTTP
+  version and connection-reuse state. The optional fields preserve decoding of older snapshots and
+  must never be inferred for imports or transports that did not observe them.
 
 Avoid an enormous `Models` directory. Group models by domain concept so the owner and lifecycle of each type are clear.
 
 ## Capture lifecycle
 
-The first HTTP/HTTPS flow should follow this sequence:
+An HTTP/HTTPS flow follows this sequence:
 
 1. `ProxyListener` accepts a client connection.
-2. The client pipeline parses the HTTP/1.1 request.
-3. For `CONNECT`, the tunnel handler establishes the interception path and TLS channel configuration.
-4. A flow is created with a stable `FlowID` and start time.
-5. Request metadata is emitted as an event.
-6. Request-phase rules are evaluated.
-7. The request body is streamed, recorded, or temporarily buffered according to the active rules.
-8. The upstream connection is opened and the request is forwarded.
-9. Response metadata and body bytes are captured.
-10. Response-phase rules are evaluated.
-11. The response is forwarded to the client.
-12. The completed flow and raw body references are persisted.
-13. The UI receives a final flow snapshot and refreshes derived views.
+2. The initial client pipeline parses an HTTP/1.1 forward request or `CONNECT` authority.
+3. For `CONNECT`, the tunnel handler establishes TLS interception and ALPN selects downstream
+   HTTP/2 or HTTP/1.1 after the handshake.
+4. HTTP/2 installs a bounded connection multiplexer; every stream receives the NIO HTTP/2-to-HTTP/1
+   codec plus a fresh shared proxy handler. HTTP/1.1 installs the existing connection pipeline.
+5. A flow is created with a stable `FlowID` and start time.
+6. Request metadata is emitted as an event.
+7. Request-phase rules are evaluated.
+8. The request body is streamed, recorded, or temporarily buffered according to the active rules.
+9. The upstream transport is acquired and the request is forwarded. Eligible HTTPS requests share
+   an HTTP/2 origin connection scoped to the proxy event loop. Origins that negotiate HTTP/1.1 use
+   the existing dedicated connection path after one cached ALPN probe per capture run. The flow
+   records the observed upstream version and whether the HTTP/2 parent was new or reused.
+10. Response metadata and body bytes are captured.
+11. Response-phase rules are evaluated.
+12. The response is forwarded to the originating HTTP/1.1 connection or HTTP/2 stream.
+13. The completed flow and raw body references are persisted.
+14. The UI receives a final flow snapshot and refreshes derived views.
 
 The default path should stream and tee data into the body store. Buffer only when a breakpoint, body transformation, decoder, or replay operation requires complete content. Large bodies must not force the entire flow into memory.
+
+### Reverse proxy listener ownership
+
+Reverse Proxy is capture configuration, not a rule action. `ProxyConfiguration` carries a bounded,
+validated list of routes from numeric loopback endpoints to HTTP or HTTPS base URLs. On start,
+`NIOProxyEngine` creates the ordinary forward listener and each enabled reverse listener on the same
+event-loop group. The start is atomic: if any listener cannot bind, the engine closes all listeners
+already opened, closes the upstream HTTP/2 pool, shuts down the group, and publishes a failed state.
+Stop closes every listener before ending the event-loop group.
+
+Each reverse child channel installs the normal HTTP pipeline with an immutable route snapshot and a
+distinct `FlowSource`. It accepts origin-form HTTP requests, rejects `CONNECT`, resolves the raw
+target against the configured base path, and then enters the same rules, scripting, body capture,
+WebSocket, SSE, breakpoint, throttling, and upstream transport paths as forward traffic. The
+resolved URL is the logical destination: its host supplies upstream `Host`, TLS SNI, certificate
+validation, HTTP/2 pool identity, capture metadata, and exports. Client headers and raw target stay
+available as authoritative captured input. DNS Spoofing may still choose a separate physical socket
+address without changing that logical identity.
+
+The `@MainActor` route store owns the versioned local configuration document. UI changes are allowed
+only while capture is stopped or failed, and a validated route snapshot is injected into the next
+capture start. Listener addresses remain loopback-only to avoid silently exposing an unauthenticated
+debugging proxy to the LAN; local TLS termination, LAN exposure, dynamic routing, and load balancing
+require separate security and lifecycle specifications.
+
+### SOCKS5 listener ownership
+
+SOCKS5 is optional capture configuration, not a rule or a macOS system-proxy replacement.
+`ProxyConfiguration` carries one numeric-loopback endpoint and the same listener validation rejects
+collisions with the ordinary forward proxy and enabled reverse routes. `NIOProxyEngine` binds the
+SOCKS5 channel between the forward and reverse listeners and includes it in the same start rollback
+and stop lifecycle.
+
+Each SOCKS child channel starts with an event-loop-confined, 512-byte bounded negotiation handler.
+It accepts only version 5, no-auth CONNECT with IPv4, IPv6, or domain destinations. Once the CONNECT
+reply is sent, the handler preserves coalesced bytes and classifies the first application prefix as
+HTTP/1.x or a TLS ClientHello. Plain HTTP installs the shared HTTP pipeline against the requested
+destination. TLS obtains a leaf identity for that destination and installs the same negotiated
+HTTP/1.1 or HTTP/2 interception pipeline used after ordinary CONNECT. Unsupported application
+protocols close rather than being misrepresented as HTTP flows.
+
+SOCKS framing is transport metadata and never becomes an HTTP body. The requested destination stays
+the logical URL, `Host`, SNI, certificate-validation, rule, connection-pool, and capture identity;
+successful HTTP/TLS traffic inherits the existing authoritative raw-byte, body-bound, persistence,
+WebSocket, SSE, scripting, breakpoint, and throttling paths. A distinct `FlowSource` labels it
+`SOCKS5 Proxy`. The `@MainActor` listener store persists a versioned disabled-by-default preference,
+and the native Listeners sheet permits changes only while capture is stopped or failed.
 
 ## Concurrency and ownership
 
@@ -408,6 +473,50 @@ Rules:
 
 SwiftNIO's official model is based on event loops, channels, handlers, and channel pipelines. Its `NIOEmbedded` facilities are appropriate for protocol tests without real sockets: [SwiftNIO](https://github.com/apple/swift-nio).
 
+### HTTP/2 stream ownership
+
+`ProxyLensCapture` owns HTTP/2 transport details. Intercepted server TLS advertises `h2` before
+`http/1.1`, and the ALPN result installs exactly one connection-level pipeline. The HTTP/2 parent
+channel owns frame parsing, HPACK state, flow-control windows, and a maximum of 100 concurrent
+streams with a 16 KiB header-list limit. Each stream channel owns one `HTTPProxyHandler`, one flow
+transaction, and one independent upstream request stream or dedicated HTTP/1.1 fallback channel.
+Closing a downstream stream ends only that flow and its upstream request stream; closing the
+downstream parent tears down every child through NIO lifecycle propagation.
+
+The HTTP/2-to-HTTP/1 codec consumes pseudo-headers and translates ordinary request/response parts.
+The shared conversion boundary strips hop-by-hop fields before upstream forwarding and records the
+client-facing request and response version independently of the upstream wire protocol. App,
+application, persistence, and UI layers continue to receive ordinary immutable flow snapshots and
+do not depend on HTTP/2 channel types.
+
+One engine-owned `HTTP2UpstreamConnectionPool` retains at most one active parent per normalized
+HTTPS origin and proxy event loop. Concurrent first-use requests share a single negotiation future;
+the `h2` branch installs a client multiplexer and one codec/response-handler pair per stream. The
+`http/1.1` branch closes its one-time probe, caches the result for the capture run, and routes
+waiting and later requests through the dedicated HTTP/1.1 connector. Parent close removes only its
+matching entry, and engine stop closes every parent/probe before shutting down the event-loop group.
+The request that initiates a new negotiation is marked as a new connection; requests that join its
+future or acquire an active parent are marked reused. Cached HTTP/1.1 fallback is protocol knowledge,
+not socket reuse, because that connector still opens one dedicated channel per request.
+WebSocket upgrades bypass this pool. Cleartext h2c, server push, origin coalescing, and RFC 8441
+extended `CONNECT` require separate specifications because they change authority or stream
+ownership.
+
+### Logical and physical upstream identity
+
+`ProxyTarget.host` remains the logical authority used by the captured URL, HTTP `Host` header, TLS
+SNI, certificate validation, rules, and exports. A separate `connectionHost` is the physical socket
+destination. Connection-phase DNS Spoof rules are evaluated after request target rewrites and
+before an upstream channel is opened; the first matching enabled rule supplies a validated IPv4 or
+IPv6 literal without changing the logical authority.
+
+HTTP/1.1 and WebSocket bootstraps connect to `connectionHost`, while upstream TLS still uses the
+logical host. The HTTP/2 pool key contains the logical scheme/host/port and the physical
+destination, preventing requests with different routing decisions from sharing a parent channel.
+Flow connection metadata deliberately records the logical upstream host so inspection, persistence,
+search, and export do not expose transport routing as request identity. Invalid profile data fails
+closed during decoding, and the feature never mutates macOS DNS or trust configuration.
+
 ## UI architecture
 
 ### SwiftUI
@@ -434,6 +543,12 @@ Source List visibility is owned by the AppKit split-view controller and restored
 `UserDefaults` preference at launch. Pinned domain identifiers use the same local-preference
 boundary; the traffic view model projects them into every snapshot so a pin remains visible with a
 zero-flow count after the current session is cleared.
+
+Saved Custom Filters use that same UI-preference boundary. Each bounded, versioned preset owns one
+complete `TrafficDisplayFilter` value and a stable local identifier. The traffic view model applies
+the value in one update through `TrafficConsoleStore`, which keeps source selection independent and
+drops only flow selections hidden by the resulting projection. Malformed or future-version
+preference documents fail closed and never affect captured session data.
 
 The main traffic window should be managed by `MainWindowController`. SwiftUI views can be hosted inside auxiliary windows or panels without making the traffic table depend on SwiftUI rendering behavior.
 
@@ -481,8 +596,10 @@ or truncates every label to fragments. Timing is a derived native
 waterfall built only from persisted `FlowTiming` milestones: request headers/body, upstream
 connect, TLS handshake, first-byte waiting, response body, and finalization. Its scale uses the
 latest captured milestone for live or incomplete flows, and it omits phases whose endpoints were
-not captured instead of estimating them. DNS timing, socket reuse, and a zoomable cross-flow chart
-require additional capture instrumentation and remain separate increments.
+not captured instead of estimating them. A compact Connection summary derives the client protocol
+from the captured request and reads optional upstream protocol/reuse facts from `ConnectionInfo`;
+missing facts render as Unknown rather than being estimated. DNS timing and a zoomable cross-flow
+chart require additional capture instrumentation and remain separate increments.
 
 Compose Request, Repeat Request, and Edit & Repeat are explicit control-plane actions.
 `ReplayService` sends the composed, captured, or edited request through the core
@@ -524,19 +641,61 @@ Recommended responsibilities:
 - `FileBodyStore` writes and reads raw payload files.
 - `SessionStore` actor serializes storage commands and coordinates database/file operations.
 
-SQLite should store searchable metadata, headers, timing, body references, rule traces, annotations, and indexes. Large request/response bodies and WebSocket frames should be stored as managed files. GRDB is the persistence adapter; domain code should depend on `FlowStore` and `BodyStore` protocols instead.
+SQLite should store searchable metadata, headers, timing, body references, rule traces, annotations, and indexes. Large request/response bodies, WebSocket frames, and derived Server-Sent Event data should be stored as managed files. GRDB is the persistence adapter; domain code should depend on `FlowStore` and `BodyStore` protocols instead.
 
 WebSocket capture follows the same metadata/payload split. The NIO upgrade bridge relays frames on
 their channel event loops, emits immutable frame snapshots through `WebSocketFrameEventSink`, and
 serializes persistence without blocking those loops. GRDB stores frame direction, opcode, flags,
 sequence, time, and payload references while `FileBodyStore` owns larger payload bytes. The AppKit
 inspector subscribes through an application-layer event bus, keeps only the latest 500 frame rows
-in its live presentation, and loads the selected payload lazily for derived JSON, text, or hex
-display. Direction filtering remains metadata-only. Payload search reads at most 8 MiB per query
-and skips individual payloads above 256 KiB, reporting skipped frames instead of allowing an
-unbounded inspector task. Export loads the complete persisted flow history and streams a versioned
-JSON document through an atomic staging file; text payloads use UTF-8 and binary or invalid UTF-8
-payloads use base64. Captured bytes and stored payload references remain authoritative.
+in its live presentation, and loads bounded same-direction history lazily. Auto and Protobuf derive
+the complete message containing the selected data frame across continuation frames and interleaved
+control frames. A Core decoder validates the RFC 6455 sequence and accepted RFC 7692
+`permessage-deflate` parameters, rebuilds directional compression context when required, and bounds
+frame count plus compressed input, history output, and displayed output. Invalid, incomplete,
+truncated, or over-limit messages stay available as exact selected-frame Hex. Direction filtering
+remains metadata-only. Payload search reads at most 8 MiB per query and skips individual
+payloads above 256 KiB, reporting skipped frames instead of allowing an unbounded inspector task.
+Export loads the complete persisted flow history and streams a versioned JSON document through an
+atomic staging file; text payloads use UTF-8 and binary or invalid UTF-8 payloads use base64.
+Captured bytes and stored payload references remain authoritative.
+
+Live WebSocket composition crosses the existing module boundaries through
+`WebSocketFrameTransmitter`. `WebSocketComposeService` validates and bounds UTF-8 or Base64 input in
+the application layer, while the capture adapter keeps a registry of currently open upgraded
+channels. A transmission is scheduled on the owning NIO event loop, uses client masking only when
+sent toward the upstream server, and is recorded through the same frame event and persistence path
+as relayed traffic. The UI can query availability but never retains a channel.
+
+Historical WebSocket reconnect uses the transport-neutral `WebSocketConnectionClient` port through
+the same application service. `NIOWebSocketConnectionClient` owns an event-loop group independent of
+proxy capture, validates a fresh HTTP/1.1 upgrade, uses normal hostname/TLS verification for
+`wss://`, and publishes the upgrade as a separate `.replay` flow. Transport-owned headers are
+rebuilt, client frames are masked, Ping receives a captured Pong, and peer/user Close frames are
+captured before the bounded handshake completes. The native Reconnect editor seeds only validated
+headers and an optional complete bounded reconstructed message; Connect & Replay always targets the
+upstream server. The original flow stays immutable, the fresh flow remains available to Compose and
+Disconnect, and application termination closes all client channels before shutting down their event
+loops.
+
+Server-Sent Event capture is a derived path beside authoritative response-body recording. For a
+supported `text/event-stream` response, the HTTP bridge feeds each received body chunk through an
+identity, gzip, x-gzip, or deflate streaming decoder and then into a bounded incremental parser on
+the channel event loop. The decoder supports zlib-wrapped and legacy raw deflate, bounds lifetime
+decoded output to the configured response-capture limit, and disables only derived event capture
+when input is corrupt, truncated, unsupported, or over budget. Parsed immutable event snapshots cross
+`ServerSentEventEventSink`; normalized event data is written asynchronously to `BodyStore`, event
+metadata and body references are serialized through `ServerSentEventStore`, and the application
+event bus updates the selected inspector. The parser handles stream line endings, an initial UTF-8
+BOM, comments, multi-line `data`, `event`, `id`, and valid `retry` fields with 64 KiB line and 1 MiB
+event-data limits. The AppKit Events pane keeps only the latest 500 rows, searches at most 8 MiB per
+query and 256 KiB per event, lazily formats selected JSON, and exports the complete persisted event
+history through an atomic versioned JSON document. A separate application-layer accumulator reads
+only that bounded visible history and recognizes OpenAI Chat Completions and Responses API text
+deltas. Its derived preview is searchable and copyable, bounds total input to 8 MiB, each event to
+256 KiB, and output to 1 MiB, and explicitly reports omitted, ignored, or safety-limited events.
+Unknown event schemas are not guessed. Unsupported or stacked content codings, including Brotli,
+remain available in Raw/Body views without derived event decoding.
 
 The database should use migrations from the first schema and support recovery from interrupted sessions. A flow that ends during a crash or disconnect should remain inspectable with an explicit incomplete state.
 
@@ -550,10 +709,44 @@ Matcher + phase + action
 
 - `Matcher` is deterministic and side-effect-free.
 - `RulePhase` identifies connection, request headers, request body, response headers, response body, or WebSocket frame processing.
-- `RuleAction` describes map, pause, block, allow, transform, throttle, redirect, or annotate behavior.
-- `RuleTrace` records which rules matched and what happened.
+- `RuleAction` describes map, pause, block, allow, transform, throttle, redirect, DNS routing, or
+  annotate behavior.
+- `RuleTrace` records which rules matched and what happened. Successful script traces may also
+  contain runtime-bounded local log entries; older persisted traces decode with an empty log list.
 
 Keep matching and rule planning in `ProxyLensCore`. Keep file reads, breakpoint waits, and other asynchronous work in `ProxyLensApplication` or an adapter.
+
+The P1 scripting foundation keeps executable code outside both NIO event loops and the GUI process.
+`ProxyLensCore` defines bounded, Codable request/result values and a `ScriptExecutor` port.
+`ProxyLensPlatform` evaluates one `onRequest(context)` or `onResponse(context)` handler in a fresh
+JavaScriptCore context hosted by a short-lived worker mode of the signed app executable. The parent
+communicates through owner-only temporary files, validates the result again in Core, and terminates
+the worker at a bounded deadline. The worker receives only JSON data and exposes a bounded log
+function; it has no native-object, filesystem, network, module, environment, or Keychain bridge.
+`RuleAction.script` is planned in request-header, request-body, response-header, and response-body
+phases. Header scripts receive metadata with a `nil` body, execute serially away from the NIO event
+loop before the corresponding head is forwarded, and may rewrite the method, URL, status, or
+ordinary headers. A returned body is rejected, request targets are validated again, and
+`Content-Length`, `Transfer-Encoding`, `Content-Encoding`, and `Trailer` remain owned by the native
+framing pipeline. WebSocket upgrades use the same header phases: request scripts receive a semantic
+`ws://` or `wss://` target and may rewrite that URL plus ordinary request headers; response scripts
+may rewrite ordinary `101` response headers. The native upgrade path retains the method, status,
+Host, Connection/Upgrade, WebSocket key/version/accept, subprotocol, and extension fields. A script
+that changes one of those fields fails open without discarding an earlier valid script mutation.
+Request forwarding remains inside the existing pending-request byte bound.
+Response auto-read pauses while the worker runs, and already-delivered response parts have their own
+1 MiB queue bound before normal backpressure resumes. Body scripts buffer eligible
+identity-encoded UTF-8 bodies within both capture and scripting limits. Every phase forwards the
+last valid serial mutation. A script failure is fail-open and produces a failed `RuleTrace`; raw
+captured request/response bytes remain authoritative. WebSocket upgrades, server-sent event streams,
+encoded bodies, invalid UTF-8, and oversized bodies bypass body mutation with an explicit failed
+trace. The native Rules window creates and edits all four HTTP script phases with phase-aware
+templates, selection-preserving muted JavaScript highlighting, and the runtime's 64 KiB source
+validation.
+Successful `context.log(...)` output remains attached to its owning `RuleTrace`, survives local flow
+persistence, participates in traffic search, and appears under that rule in the selected flow's
+Rules inspector. Logs keep the worker's 100-entry and 64 KiB limits and never enter `OSLog`.
+Deeper static validation and a standalone streaming console remain future increments.
 
 P0 rules currently implemented in the shared pipeline:
 
@@ -603,7 +796,23 @@ P0 rules currently implemented in the shared pipeline:
   its discovered GraphQL kind/name and can coexist with Map Remote and Breakpoint; an edited
   breakpoint response takes precedence over a configured response replacement. Block and Map Local
   still prevent an upstream request.
-- Breakpoint, evaluated during request headers, request bodies, or response headers. The first matching breakpoint pauses the flow until the user continues or aborts. Request-header breakpoints wait until the request is complete, then hold the upstream connect. Activating a request-body rule deliberately buffers bounded requests instead of opening the upstream connection, allowing GraphQL operation discovery and operation-scoped Block or Breakpoint actions before any bytes are forwarded. Response breakpoints buffer the upstream response and hold the client write. Continue can apply edited start-line, headers, and body text. Abort cancels the flow and returns 403 to the client. Matching stays in `RulePlanner`; `BreakpointCoordinator` owns the wait. NIO handlers hop off the event loop, await the decision, then hop back. Block and Map Local skip request breakpoints; Map Remote can still pause.
+- Breakpoint, evaluated during request headers, request bodies, response headers, or incoming
+  WebSocket data frames. The first matching breakpoint pauses the flow until the user continues or
+  aborts. Request-header breakpoints wait until the request is complete, then hold the upstream
+  connect. Activating a request-body rule deliberately buffers bounded requests instead of opening
+  the upstream connection, allowing GraphQL operation discovery and operation-scoped Block or
+  Breakpoint actions before any bytes are forwarded. Response breakpoints buffer the upstream
+  response and hold the client write. WebSocket response breakpoints capture the original upstream
+  frame first, then pause text, binary, or continuation frames before forwarding. Ping, pong, close,
+  and client-to-server frames bypass the pause so protocol liveness is preserved. Only complete,
+  uncompressed, valid UTF-8 text payloads up to 1 MiB can be edited; other paused payloads remain
+  read-only. Continue can apply edited HTTP start-line, headers, and body text or a safe WebSocket
+  payload while preserving opcode, FIN/RSV bits, masking direction, and extension state. Abort
+  cancels HTTP flows with a 403 or closes both WebSocket peers and fails the flow. Matching stays in
+  `RulePlanner`; `BreakpointCoordinator` owns the wait. NIO handlers hop off the event loop, await
+  the decision, then hop back. Block and Map Local skip request breakpoints; Map Remote can still
+  pause. Captured HTTP and WebSocket bytes remain authoritative even when forwarded content is
+  edited.
 - Display/filter matching.
 
 Live rules are published through `MutableRuleSnapshot`, a synchronous `RuleSnapshotSource` that NIO handlers can read on the event loop. `RuleEngine` in `ProxyLensApplication` owns the active `RuleSet` and updates that snapshot. Matching and planning stay in `RulePlanner` inside `ProxyLensCore`. The native Rules sheet projects the ordered live set and can enable, disable, remove, or safely edit representable rules without changing stable rule identity. Its validated rule form creates and edits Block, Allow, Breakpoint, and No Cache rules with action-compatible phases and bounded matcher inputs. Unsupported composite, case-sensitive, or file-backed shapes stay read-only instead of losing data. File-backed mapping and replacement actions remain contextual so resources are validated and preloaded before publication.
@@ -632,8 +841,15 @@ P0 body inspection currently implemented:
 
 - `JSONBodyView` pretty-prints JSON objects and arrays from captured body bytes. `application/json`, `text/json`, and `+json` types are treated as JSON; unlabeled UTF-8 that parses as an object or array is also accepted.
 - `HTTPContentCoding` unwraps gzip, x-gzip, and deflate with a bounded decoded size for the derived JSON view and Edit & Repeat. Edited compressed text is re-encoded before replay. Brotli and other encodings stay unsupported. The Body tab, HAR/cURL export, and breakpoint Continue keep the captured bytes.
-- The inspector adds read-only JSON, Tree, XML, Form, and request-only GraphQL segments next to Headers and Body. JSON applies native, presentation-only syntax colors; Tree presents the same derived JSON as an expandable native outline with key/value columns. Tree construction runs away from the main actor and is bounded to 10,000 nodes, 64 levels, and the inspector's existing 1 MiB decoded-body limit; truncation is explicit. XML is pretty-printed only after bounded decoding and parsing with external entities disabled; document type declarations are rejected. Form decoding supports declared URL-encoded and multipart form-data, preserves field order, duplicates, and empty values, and summarizes file parts without rendering their untrusted binary bytes. Multipart boundaries, decoded bodies, and rendered output are bounded; nested multiparts and transfer encodings are not interpreted. GraphQL accepts JSON envelopes and `application/graphql`, formats operations and variables, and exposes operation discovery in the flow list and filters. The inspector also colors HTTP header names/values and all supported structured text. Its Timing mode presents total and first-byte duration plus the captured phase waterfall. The Compose Request and Edit & Repeat windows reuse the same palette, initially pretty-print valid JSON, and refresh body highlighting when either headers or body text changes. Opening and sending an untouched formatted captured body still replays the authoritative captured bytes. A decoder failure leaves the raw body available and shows a reason on the relevant derived view. JSONPath queries the derived JSON with root, object-key, array-index, quoted-key, and wildcard selectors; input, match count, depth, and rendered match size are bounded. Protobuf remains a future increment.
+- The inspector adds read-only Preview, JSON, Tree, XML, Form, Protobuf, Hex, and request-only GraphQL segments next to Headers and Body. Preview uses macOS ImageIO away from the main actor to recognize supported raster formats, decode at most 16 MiB of identity/gzip/deflate content, and produce a first-frame PNG thumbnail no larger than 2,048 pixels on either axis. It reports source format, dimensions, frame count, capture metadata, and explicit truncated/oversized/invalid states; the thumbnail never replaces the captured bytes. Hex always renders the authoritative captured bytes as offset, 16-byte hexadecimal, and printable-ASCII columns, caps output at 64 KiB, and states when more bytes were captured. JSON applies native, presentation-only syntax colors; Tree presents the same derived JSON as an expandable native outline with key/value columns. Tree construction runs away from the main actor and is bounded to 10,000 nodes, 64 levels, and the inspector's existing 1 MiB decoded-body limit; truncation is explicit. XML is pretty-printed only after bounded decoding and parsing with external entities disabled; document type declarations are rejected. Form decoding supports declared URL-encoded and multipart form-data, preserves field order, duplicates, and empty values, and summarizes file parts without rendering their untrusted binary bytes. Multipart boundaries, decoded bodies, and rendered output are bounded; nested multiparts and transfer encodings are not interpreted. GraphQL accepts JSON envelopes and `application/graphql`, formats operations and variables, and exposes operation discovery in the flow list and filters. The Protobuf view recognizes declared Protobuf media types and decodes varint, fixed32, fixed64, string, nested-message, and bounded byte-preview values away from the main actor. Its schema-less representation remains available; importing a compiled `FileDescriptorSet` adds a locally persisted immutable catalog, and each message pane can select its own root type to show field names, declared scalar types, enum labels, nested messages, and packed repeated scalars. The Core parser treats descriptor bytes as untrusted, caps the file at 4 MiB, and bounds files, schema elements, strings, and nesting before publishing the new catalog. Explicit `delimited=true` media-type parameters decode one or more varint-length-prefixed messages. Native `application/grpc` and `application/grpc+proto` bodies follow the official 5-byte message framing, render every bounded message independently, and decode per-message gzip/deflate only when `grpc-encoding` declares it. Binary and text gRPC-Web Protobuf media types decode data frames and terminal HTTP/1-style trailer frames; text mode accepts whole base64 bodies and concatenated independently padded chunks. Compressed gRPC-Web frames are summarized without guessing an encoding. Complete text and binary WebSocket messages expose Auto, Protobuf, and Hex representations; Auto/Protobuf reconstruct fragments and decode negotiated `permessage-deflate` within explicit bounds, explicit Protobuf uses the message direction's selected schema, and Hex keeps the selected frame's raw bytes. Control frames remain individually inspected. Protobuf input and rendered UTF-8 output are each limited to 1 MiB, with at most 10,000 decoded fields or packed elements, 1,000 framed messages, and 16 nested levels. Groups and Google well-known-type presentation remain future work. The inspector also colors HTTP header names/values and all supported structured text. Its Timing mode presents total and first-byte duration plus the captured phase waterfall. The Compose Request and Edit & Repeat windows reuse the same palette, initially pretty-print valid JSON, and refresh body highlighting when either headers or body text changes. Opening and sending an untouched formatted captured body still replays the authoritative captured bytes. A decoder failure leaves the raw body available and shows a reason on the relevant derived view. The shared JSON query surface preserves separate JSONPath and jq drafts for the selected message. JSONPath supports root, object-key, array-index, quoted-key, and wildcard selectors. The jq mode is a side-effect-free Core parser/evaluator for traversal, iteration, pipelines, and scalar `select` comparisons; it never invokes a process. Both derived modes bound input, query complexity, expansion, depth, and rendered output.
 - Request and response Cookies segments derive readable cookie pairs and `Set-Cookie` attributes from the captured headers. Multiple header fields remain ordered, cookie values keep embedded equals signs, and the raw headers remain authoritative for export, replay, and breakpoint editing.
+- Identity, gzip, x-gzip, and deflate `text/event-stream` responses expose a native Events mode
+  with event type, ID,
+  retry, timestamp, size, bounded search, lazy JSON/text data inspection, live updates, and complete
+  persisted-history export. Its Accumulated mode recognizes bounded OpenAI Chat Completions and
+  Responses API text deltas, supports native find and copy, and makes omissions and truncation
+  visible. The normalized event payload and accumulated text are derived; the captured response
+  body is still the source of truth.
 
 P0 HAR interchange and export currently implemented:
 
@@ -793,7 +1009,10 @@ Tests must not depend on the public internet.
 11. Restore persisted sessions into the traffic console and clear the workspace.
 12. Package a Hardened Runtime Release zip. Notarized GitHub Releases wait on a Developer ID.
 
-Do not start HTTP/2, HTTP/3, Network Extension, mobile capture, scripting, cloud sync, or team collaboration until the P0 workflow is reliable.
+P0 had to be reliable before HTTP/2, HTTP/3, Network Extension, mobile capture, scripting, cloud
+sync, or team collaboration began. That gate is satisfied for the staged downstream and upstream
+HTTP/2 work described above; keep the remaining roadmap work isolated behind explicit milestones
+and acceptance tests.
 
 ## Architecture rules
 
@@ -818,5 +1037,8 @@ These rules should be reviewed whenever a new feature is added:
 - [SwiftNIO](https://github.com/apple/swift-nio)
 - [GRDB.swift](https://github.com/groue/GRDB.swift)
 - [swift-certificates](https://github.com/apple/swift-certificates)
+- [Protocol Buffers `MessageLite`](https://protobuf.dev/reference/java/api-docs/com/google/protobuf/MessageLite.html)
+- [gRPC over HTTP/2 framing](https://grpc.github.io/grpc/core/md_doc__p_r_o_t_o_c_o_l-_h_t_t_p2.html)
+- [gRPC-Web protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md)
 - [Apple Keychain Services](https://developer.apple.com/documentation/security/keychain-services/)
 - [Apple Network Extension](https://developer.apple.com/documentation/networkextension)

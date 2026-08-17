@@ -1,24 +1,63 @@
 import AppKit
 import ProxyLensCore
 
-/// A small, local JSONPath query surface for the derived JSON inspector view.
+/// A small, local JSONPath and jq query surface for the derived JSON inspector view.
 @MainActor
 final class JSONPathView: NSView, NSTextFieldDelegate {
+    private enum QueryMode: String, CaseIterable {
+        case jsonPath = "JSONPath"
+        case jq
+
+        var defaultQuery: String {
+            switch self {
+            case .jsonPath:
+                "$"
+            case .jq:
+                "."
+            }
+        }
+
+        var placeholder: String {
+            switch self {
+            case .jsonPath:
+                "$.users[*].id"
+            case .jq:
+                ".users[] | select(.active == true) | .id"
+            }
+        }
+
+        var toolTip: String {
+            switch self {
+            case .jsonPath:
+                "Supported: $.key, [0], ['key'], and wildcards"
+            case .jq:
+                "Supported: paths, iteration, pipes, and select comparisons"
+            }
+        }
+    }
+
+    private let modePopup = NSPopUpButton()
     private let queryField = NSTextField()
     private let runButton = NSButton(title: "Run", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "")
     private let resultTextView = NSTextView()
     private var jsonText: String?
+    private var currentMode = QueryMode.jsonPath
+    private var queryDrafts: [QueryMode: String] = [
+        .jsonPath: QueryMode.jsonPath.defaultQuery,
+        .jq: QueryMode.jq.defaultQuery
+    ]
 
     init(accessibilityPrefix: String) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        configureModePopup(accessibilityPrefix: accessibilityPrefix)
         configureQueryField(accessibilityPrefix: accessibilityPrefix)
         configureRunButton(accessibilityPrefix: accessibilityPrefix)
         configureStatusField()
         configureResultView(accessibilityPrefix: accessibilityPrefix)
 
-        let queryStack = NSStackView(views: [queryField, runButton, statusField])
+        let queryStack = NSStackView(views: [modePopup, queryField, runButton, statusField])
         queryStack.translatesAutoresizingMaskIntoConstraints = false
         queryStack.orientation = .horizontal
         queryStack.spacing = 8
@@ -39,6 +78,7 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
             queryStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             queryStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             queryStack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            modePopup.widthAnchor.constraint(equalToConstant: 86),
             runButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 54),
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -63,10 +103,15 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
 
         if nextJSON != jsonText {
             jsonText = nextJSON
-            queryField.stringValue = "$"
+            queryDrafts = [
+                .jsonPath: QueryMode.jsonPath.defaultQuery,
+                .jq: QueryMode.jq.defaultQuery
+            ]
+            queryField.stringValue = draft(for: currentMode)
         }
 
         guard let nextJSON else {
+            modePopup.isEnabled = false
             queryField.isEnabled = false
             runButton.isEnabled = false
             switch presentation {
@@ -79,23 +124,38 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
             return
         }
 
+        modePopup.isEnabled = true
         queryField.isEnabled = true
         runButton.isEnabled = true
         executeQuery(nextJSON)
     }
 
+    private func configureModePopup(accessibilityPrefix: String) {
+        modePopup.translatesAutoresizingMaskIntoConstraints = false
+        modePopup.addItems(withTitles: QueryMode.allCases.map(\.rawValue))
+        modePopup.selectItem(withTitle: currentMode.rawValue)
+        modePopup.controlSize = .small
+        modePopup.target = self
+        modePopup.action = #selector(queryModeChanged)
+        modePopup.setAccessibilityIdentifier("\(accessibilityPrefix).jsonquery.mode")
+        modePopup.setAccessibilityLabel("JSON query language")
+        modePopup.toolTip = "Choose JSONPath or the safe local jq subset"
+        modePopup.setContentHuggingPriority(.required, for: .horizontal)
+        modePopup.setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
     private func configureQueryField(accessibilityPrefix: String) {
         queryField.translatesAutoresizingMaskIntoConstraints = false
-        queryField.placeholderString = "$.users[*].id"
+        queryField.placeholderString = currentMode.placeholder
         queryField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        queryField.stringValue = "$"
+        queryField.stringValue = currentMode.defaultQuery
         queryField.target = self
         queryField.action = #selector(runQuery)
         queryField.delegate = self
         queryField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         queryField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         queryField.setAccessibilityIdentifier("\(accessibilityPrefix).jsonpath.query")
-        queryField.toolTip = "Supported: $.key, [0], ['key'], and wildcards"
+        queryField.toolTip = currentMode.toolTip
     }
 
     private func configureRunButton(accessibilityPrefix: String) {
@@ -144,6 +204,21 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
         executeQuery(jsonText)
     }
 
+    @objc private func queryModeChanged() {
+        queryDrafts[currentMode] = queryField.stringValue
+        guard let title = modePopup.selectedItem?.title,
+            let selectedMode = QueryMode(rawValue: title)
+        else {
+            modePopup.selectItem(withTitle: currentMode.rawValue)
+            return
+        }
+        currentMode = selectedMode
+        queryField.stringValue = draft(for: selectedMode)
+        queryField.placeholderString = selectedMode.placeholder
+        queryField.toolTip = selectedMode.toolTip
+        runQuery()
+    }
+
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool
     {
         guard selector == #selector(NSResponder.insertNewline(_:)) else {
@@ -154,11 +229,19 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
     }
 
     private func executeQuery(_ json: String) {
+        queryDrafts[currentMode] = queryField.stringValue
+        switch currentMode {
+        case .jsonPath:
+            executeJSONPath(json)
+        case .jq:
+            executeJQ(json)
+        }
+    }
+
+    private func executeJSONPath(_ json: String) {
         switch JSONPathBodyView.evaluate(json: json, query: queryField.stringValue) {
         case .unavailable(let reason):
-            statusField.stringValue = "Not available"
-            resultTextView.string = reason
-            resultTextView.textColor = .secondaryLabelColor
+            showUnavailable(reason)
         case .matches(let matches):
             statusField.stringValue =
                 matches.isEmpty
@@ -166,6 +249,29 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
             resultTextView.textColor = .textColor
             resultTextView.textStorage?.setAttributedString(render(matches))
         }
+    }
+
+    private func executeJQ(_ json: String) {
+        switch JQBodyView.evaluate(json: json, query: queryField.stringValue) {
+        case .unavailable(let reason):
+            showUnavailable(reason)
+        case .values(let values):
+            statusField.stringValue =
+                values.isEmpty
+                ? "No values" : "\(values.count) value\(values.count == 1 ? "" : "s")"
+            resultTextView.textColor = .textColor
+            resultTextView.textStorage?.setAttributedString(renderJQ(values))
+        }
+    }
+
+    private func showUnavailable(_ reason: String) {
+        statusField.stringValue = "Not available"
+        resultTextView.string = reason
+        resultTextView.textColor = .secondaryLabelColor
+    }
+
+    private func draft(for mode: QueryMode) -> String {
+        queryDrafts[mode] ?? mode.defaultQuery
     }
 
     private func render(_ matches: [JSONPathBodyView.Match]) -> NSAttributedString {
@@ -198,6 +304,27 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
                     as: .json
                 )
             )
+        }
+        return result
+    }
+
+    private func renderJQ(_ values: [String]) -> NSAttributedString {
+        guard !values.isEmpty else {
+            return NSAttributedString(
+                string: "No values matched this jq expression.",
+                attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
+        }
+
+        let result = NSMutableAttributedString()
+        for (index, value) in values.enumerated() {
+            if index > 0 {
+                result.append(NSAttributedString(string: "\n\n"))
+            }
+            result.append(InspectorSyntaxHighlighter.highlight(value, as: .json))
         }
         return result
     }

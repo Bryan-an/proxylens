@@ -44,6 +44,8 @@ enum InspectorSyntaxHighlighter {
         case urlEncodedForm
         case xml
         case graphql
+        case protobuf
+        case javaScript
     }
 
     static func language(forContentType contentType: String?) -> Language {
@@ -208,6 +210,89 @@ enum InspectorSyntaxHighlighter {
                     range: match.range
                 )
             }
+        case .protobuf:
+            protobufNumberPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.number,
+                    range: match.range
+                )
+            }
+            protobufTypePattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.literal,
+                    range: match.range
+                )
+            }
+            protobufStringPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.string,
+                    range: match.range
+                )
+            }
+            protobufFieldPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match, match.numberOfRanges == 2 else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.key,
+                    range: match.range(at: 1)
+                )
+            }
+        case .javaScript:
+            javaScriptKeywordPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.literal,
+                    range: match.range
+                )
+            }
+            javaScriptAPINamePattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.key,
+                    range: match.range
+                )
+            }
+            javaScriptNumberPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.number,
+                    range: match.range
+                )
+            }
+            javaScriptStringPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: InspectorSyntaxPalette.string,
+                    range: match.range
+                )
+            }
+            javaScriptCommentPattern.enumerateMatches(in: text, range: syntaxRange) {
+                match, _, _ in
+                guard let match else { return }
+                result.addAttribute(
+                    .foregroundColor,
+                    value: NSColor.secondaryLabelColor,
+                    range: match.range
+                )
+            }
         }
 
         return result
@@ -262,5 +347,45 @@ enum InspectorSyntaxHighlighter {
 
     private static let graphqlStringPattern = try! NSRegularExpression(
         pattern: #"\"(?:\\.|[^\"\\])*\""#
+    )
+
+    private static let protobufFieldPattern = try! NSRegularExpression(
+        pattern: #"(?m)^\s*(\d+)(?=\s{2})"#
+    )
+
+    private static let protobufTypePattern = try! NSRegularExpression(
+        pattern: #"\b(?:varint|fixed32|fixed64|string|bytes|message)\b"#
+    )
+
+    private static let protobufNumberPattern = try! NSRegularExpression(
+        pattern: #"\b(?:0x[0-9a-f]+|\d+(?:\.\d+)?)\b"#,
+        options: [.caseInsensitive]
+    )
+
+    private static let protobufStringPattern = try! NSRegularExpression(
+        pattern: #"\"(?:\\.|[^\"\\])*\""#
+    )
+
+    private static let javaScriptKeywordPattern = try! NSRegularExpression(
+        pattern:
+            #"\b(?:async|await|break|case|catch|class|const|continue|default|delete|do|else|export|extends|false|finally|for|function|if|import|in|instanceof|let|new|null|return|switch|throw|true|try|typeof|undefined|var|void|while|yield)\b"#
+    )
+
+    private static let javaScriptAPINamePattern = try! NSRegularExpression(
+        pattern:
+            #"\b(?:onRequest|onResponse|context|request|response|headers|body|method|url|statusCode|log)\b"#
+    )
+
+    private static let javaScriptNumberPattern = try! NSRegularExpression(
+        pattern: #"\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"#
+    )
+
+    private static let javaScriptStringPattern = try! NSRegularExpression(
+        pattern: #"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#
+    )
+
+    private static let javaScriptCommentPattern = try! NSRegularExpression(
+        pattern: #"//.*?$|/\*.*?\*/"#,
+        options: [.anchorsMatchLines, .dotMatchesLineSeparators]
     )
 }

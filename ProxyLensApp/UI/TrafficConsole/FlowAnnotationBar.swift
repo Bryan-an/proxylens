@@ -55,8 +55,6 @@ final class FlowAnnotationBar: NSStackView, NSTextFieldDelegate {
         orientation = .horizontal
         alignment = .centerY
         spacing = 7
-        setHuggingPriority(.defaultHigh, for: .vertical)
-
         let label = NSTextField(labelWithString: "Annotation")
         label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
         label.textColor = .secondaryLabelColor
@@ -96,6 +94,7 @@ final class FlowAnnotationBar: NSStackView, NSTextFieldDelegate {
         addArrangedSubview(highlightPopup)
         addArrangedSubview(strikeButton)
         addArrangedSubview(saveButton)
+        heightAnchor.constraint(equalToConstant: fittingSize.height).isActive = true
     }
 
     private func apply(_ annotation: FlowAnnotation?) {

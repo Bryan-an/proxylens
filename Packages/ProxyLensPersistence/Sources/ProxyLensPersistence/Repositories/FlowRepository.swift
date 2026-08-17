@@ -189,6 +189,8 @@ struct FlowRepository: Sendable {
             "paused_request"
         case .paused(.response):
             "paused_response"
+        case .paused(.webSocketResponse):
+            "paused_websocket_response"
         case .completed:
             "completed"
         case .cancelled:

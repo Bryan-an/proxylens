@@ -24,6 +24,8 @@ let package = Package(
                 .product(name: "X509", package: "swift-certificates")
             ],
             linkerSettings: [
+                .linkedFramework("JavaScriptCore"),
+                .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration")
             ]
         ),

@@ -4,6 +4,109 @@ import XCTest
 @testable import ProxyLensCore
 
 final class ProxyLensCoreTests: XCTestCase {
+    func testScriptExecutionRequestPreservesDuplicateHeadersThroughCodable() throws {
+        let request = try ScriptExecutionRequest(
+            hook: .request,
+            source: "function onRequest(context) {}",
+            message: ScriptHTTPMessage(
+                method: "POST",
+                url: "https://example.test/items",
+                headers: [
+                    try HTTPHeader(name: "Set-Cookie", value: "first=1"),
+                    try HTTPHeader(name: "Set-Cookie", value: "second=2")
+                ],
+                body: #"{"enabled":true}"#
+            )
+        )
+
+        let restored = try JSONDecoder().decode(
+            ScriptExecutionRequest.self,
+            from: JSONEncoder().encode(request)
+        )
+
+        XCTAssertEqual(restored, request)
+        XCTAssertEqual(restored.message.headers.map(\.value), ["first=1", "second=2"])
+    }
+
+    func testScriptExecutionRequestValidatesHookShapeAndSourceLimit() throws {
+        XCTAssertThrowsError(
+            try ScriptExecutionRequest(
+                hook: .request,
+                source: "function onRequest(context) {}",
+                message: ScriptHTTPMessage(statusCode: 200)
+            )
+        ) { error in
+            XCTAssertEqual(error as? ScriptExecutionError, .invalidRequestMessage)
+        }
+
+        XCTAssertThrowsError(
+            try ScriptExecutionRequest(
+                hook: .response,
+                source: String(
+                    repeating: "x",
+                    count: ScriptExecutionLimits.maximumSourceByteCount + 1
+                ),
+                message: ScriptHTTPMessage(statusCode: 200)
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ScriptExecutionError,
+                .sourceTooLarge(maximumByteCount: ScriptExecutionLimits.maximumSourceByteCount)
+            )
+        }
+    }
+
+    func testScriptExecutionRequestAcceptsWebSocketURLsAndRejectsOtherSchemes() throws {
+        for url in ["ws://example.test/socket", "wss://example.test/socket"] {
+            XCTAssertNoThrow(
+                try ScriptExecutionRequest(
+                    hook: .request,
+                    source: "function onRequest(context) {}",
+                    message: ScriptHTTPMessage(method: "GET", url: url)
+                )
+            )
+        }
+
+        XCTAssertThrowsError(
+            try ScriptExecutionRequest(
+                hook: .request,
+                source: "function onRequest(context) {}",
+                message: ScriptHTTPMessage(method: "GET", url: "file:///tmp/socket")
+            )
+        ) { error in
+            XCTAssertEqual(error as? ScriptExecutionError, .invalidRequestMessage)
+        }
+    }
+
+    func testRuleTraceLogsRoundTripAndLegacyDecoding() throws {
+        let trace = RuleTrace(
+            ruleID: RuleID(),
+            phase: .requestBody,
+            outcome: .applied,
+            ruleName: "Rewrite request",
+            logs: ["request started", "request updated"]
+        )
+
+        let encoded = try JSONEncoder().encode(trace)
+        XCTAssertEqual(try JSONDecoder().decode(RuleTrace.self, from: encoded), trace)
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "logs")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let restoredLegacy = try JSONDecoder().decode(RuleTrace.self, from: legacyData)
+        XCTAssertTrue(restoredLegacy.logs.isEmpty)
+
+        var oversizedObject = legacyObject
+        oversizedObject["logs"] = Array(
+            repeating: "entry",
+            count: ScriptExecutionLimits.maximumLogCount + 1
+        )
+        let oversizedData = try JSONSerialization.data(withJSONObject: oversizedObject)
+        XCTAssertThrowsError(try JSONDecoder().decode(RuleTrace.self, from: oversizedData))
+    }
+
     func testSessionNamesNormalizePersistAndRejectOversizedValues() throws {
         var session = Session(
             id: SessionID(),
@@ -58,6 +161,40 @@ final class ProxyLensCoreTests: XCTestCase {
 
         flow.setAnnotation(nil)
         XCTAssertNil(flow.annotation)
+    }
+
+    func testConnectionInfoDecodesLegacySnapshotsWithoutTransportDiagnostics() throws {
+        let snapshot = Data(
+            #"{"protocolKind":"https","upstreamHost":"legacy.example.com","upstreamPort":443,"tlsIntercepted":true}"#
+                .utf8
+        )
+
+        let connection = try JSONDecoder().decode(ConnectionInfo.self, from: snapshot)
+
+        XCTAssertEqual(connection.protocolKind, .https)
+        XCTAssertEqual(connection.upstreamHost, "legacy.example.com")
+        XCTAssertNil(connection.upstreamHTTPVersion)
+        XCTAssertNil(connection.isUpstreamConnectionReused)
+    }
+
+    func testConnectionInfoTransportDiagnosticsRoundTripAndReplace() throws {
+        let connection = ConnectionInfo(
+            protocolKind: .https,
+            upstreamHost: "api.example.com",
+            upstreamPort: 443,
+            tlsIntercepted: true,
+            upstreamHTTPVersion: .http2,
+            isUpstreamConnectionReused: true
+        )
+
+        let restored = try JSONDecoder().decode(
+            ConnectionInfo.self,
+            from: JSONEncoder().encode(connection)
+        )
+
+        XCTAssertEqual(restored, connection)
+        XCTAssertEqual(restored.upstreamHTTPVersion, .http2)
+        XCTAssertEqual(restored.isUpstreamConnectionReused, true)
     }
 
     func testFlowAnnotationRejectsCommentsAboveTheLocalStorageLimit() {
@@ -1450,6 +1587,69 @@ final class ProxyLensCoreTests: XCTestCase {
         )
     }
 
+    func testRulePlannerPlansBodyScriptsInPriorityOrderWithoutPrematureTraces() throws {
+        let request = HTTPRequest(
+            method: .post,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let first = Rule(
+            name: "Normalize request",
+            priority: 20,
+            phase: .requestBody,
+            action: .script(try ScriptRuleSpec(source: "function onRequest(context) {}"))
+        )
+        let second = Rule(
+            name: "Add metadata",
+            priority: 30,
+            phase: .requestBody,
+            action: .script(try ScriptRuleSpec(source: "function onRequest(context) {}"))
+        )
+
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [second, first]),
+            context: RuleMatchContext(request: request),
+            phase: .requestBody
+        )
+
+        XCTAssertEqual(plan.scripts.map(\.ruleID), [first.id, second.id])
+        XCTAssertEqual(plan.scripts.map(\.ruleName), [first.name, second.name])
+        XCTAssertTrue(plan.traces.isEmpty)
+    }
+
+    func testRulePlannerPlansScriptsInBothHeaderPhases() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "https://api.example.com/users")!
+        )
+        let response = try HTTPResponse(statusCode: 200)
+        let requestRule = Rule(
+            name: "Request header script",
+            phase: .requestHeaders,
+            action: .script(try ScriptRuleSpec(source: "function onRequest(context) {}"))
+        )
+        let responseRule = Rule(
+            name: "Response header script",
+            phase: .responseHeaders,
+            action: .script(try ScriptRuleSpec(source: "function onResponse(context) {}"))
+        )
+
+        let requestPlan = RulePlanner.plan(
+            rules: RuleSet(rules: [requestRule]),
+            context: RuleMatchContext(request: request),
+            phase: .requestHeaders
+        )
+        let responsePlan = RulePlanner.plan(
+            rules: RuleSet(rules: [responseRule]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .responseHeaders
+        )
+
+        XCTAssertEqual(requestPlan.scripts.map(\.ruleID), [requestRule.id])
+        XCTAssertTrue(requestPlan.traces.isEmpty)
+        XCTAssertEqual(responsePlan.scripts.map(\.ruleID), [responseRule.id])
+        XCTAssertTrue(responsePlan.traces.isEmpty)
+    }
+
     func testRulePlannerSkipsBreakpointAfterBlockOrMapLocal() throws {
         let request = HTTPRequest(
             method: .get,
@@ -1600,6 +1800,88 @@ final class ProxyLensCoreTests: XCTestCase {
             plan.traces.map(\.outcome),
             [.skipped(reason: RulePlanner.Decision.breakpointPhaseReason)]
         )
+    }
+
+    func testRulePlannerAppliesBreakpointToWebSocketFrames() throws {
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "wss://socket.example.com/events")!
+        )
+        let response = try HTTPResponse(statusCode: 101)
+        let rule = Rule(
+            name: "Pause incoming messages",
+            phase: .webSocketFrame,
+            matcher: .host(.exact("socket.example.com")),
+            action: .breakpoint
+        )
+
+        let plan = RulePlanner.plan(
+            rules: RuleSet(rules: [rule]),
+            context: RuleMatchContext(request: request, response: response),
+            phase: .webSocketFrame
+        )
+
+        XCTAssertTrue(plan.shouldBreakpoint)
+        XCTAssertEqual(plan.traces.map(\.phase), [.webSocketFrame])
+        XCTAssertEqual(plan.traces.map(\.outcome), [.applied])
+    }
+
+    func testWebSocketBreakpointFrameAllowsOnlyBoundedCompletePlainTextEdits() throws {
+        let frame = WebSocketBreakpointFrame(
+            sequenceNumber: 7,
+            opcode: .text,
+            isFinal: true,
+            payload: Data(#"{"state":"before"}"#.utf8),
+            originalPayloadByteCount: 18,
+            maximumEditablePayloadBytes: 64
+        )
+
+        XCTAssertTrue(frame.canEditPayload)
+        XCTAssertNil(frame.editingUnavailableReason)
+        let edited = try frame.replacingPayload(Data(#"{"state":"after"}"#.utf8))
+        XCTAssertEqual(edited.payload, Data(#"{"state":"after"}"#.utf8))
+
+        XCTAssertThrowsError(
+            try frame.replacingPayload(Data(repeating: 0x61, count: 65))
+        )
+
+        for readOnly in [
+            WebSocketBreakpointFrame(
+                sequenceNumber: 8,
+                opcode: .binary,
+                isFinal: true,
+                payload: Data([0x01]),
+                originalPayloadByteCount: 1,
+                maximumEditablePayloadBytes: 64
+            ),
+            WebSocketBreakpointFrame(
+                sequenceNumber: 9,
+                opcode: .text,
+                isFinal: false,
+                payload: Data("part".utf8),
+                originalPayloadByteCount: 4,
+                maximumEditablePayloadBytes: 64
+            ),
+            WebSocketBreakpointFrame(
+                sequenceNumber: 10,
+                opcode: .text,
+                isFinal: true,
+                reservedBits: .rsv1,
+                payload: Data("compressed".utf8),
+                originalPayloadByteCount: 10,
+                maximumEditablePayloadBytes: 64
+            )
+        ] {
+            XCTAssertFalse(readOnly.canEditPayload)
+            XCTAssertNotNil(readOnly.editingUnavailableReason)
+        }
+
+        XCTAssertTrue(WebSocketBreakpointFrame.isEligibleDataOpcode(.text))
+        XCTAssertTrue(WebSocketBreakpointFrame.isEligibleDataOpcode(.binary))
+        XCTAssertTrue(WebSocketBreakpointFrame.isEligibleDataOpcode(.continuation))
+        XCTAssertFalse(WebSocketBreakpointFrame.isEligibleDataOpcode(.ping))
+        XCTAssertFalse(WebSocketBreakpointFrame.isEligibleDataOpcode(.pong))
+        XCTAssertFalse(WebSocketBreakpointFrame.isEligibleDataOpcode(.close))
     }
 
     func testRulePlannerSkipsUnimplementedActions() throws {
@@ -1788,6 +2070,242 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertTrue(arrayText.contains("2"))
     }
 
+    func testHexBodyViewFormatsOffsetsHexColumnsAndPrintableASCIIWithinItsBound() {
+        let firstLine = Data(Array(0...15).map(UInt8.init))
+        XCTAssertEqual(
+            HexBodyView.render(firstLine),
+            "00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f  |................|"
+        )
+
+        XCTAssertEqual(
+            HexBodyView.render(Data([0x20, 0x41, 0x7E, 0x7F])),
+            "00000000  20 41 7e 7f                                       | A~.            |"
+        )
+
+        let oversized = Data(repeating: 0x41, count: HexBodyView.maximumDisplayedByteCount + 1)
+        let rendered = HexBodyView.render(oversized)
+        XCTAssertTrue(rendered.hasPrefix("00000000  41 41"))
+        XCTAssertTrue(rendered.contains("0000fff0  41 41"))
+        XCTAssertTrue(rendered.hasSuffix("[Displaying the first 65.5 KB of 65.5 KB.]"))
+        XCTAssertFalse(rendered.contains("00010000"))
+    }
+
+    func testProtobufBodyViewDecodesSchemaLessWireValuesWithoutChangingBytes() {
+        let payload = Data([
+            0x08, 0x96, 0x01,
+            0x12, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
+            0x1A, 0x02, 0x08, 0x07,
+            0x25, 0x00, 0x00, 0x80, 0x3F,
+            0x2A, 0x04, 0xDE, 0xAD, 0xBE, 0xEF,
+            0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F
+        ])
+
+        let result = ProtobufBodyView.render(
+            data: payload,
+            contentType: "application/x-protobuf; messageType=Example",
+            contentEncoding: nil
+        )
+
+        guard case .decoded(let text) = result else {
+            return XCTFail("expected a schema-less Protobuf view, got \(result)")
+        }
+        XCTAssertTrue(text.contains("1  varint   150"))
+        XCTAssertTrue(text.contains("2  string   \"hello\""))
+        XCTAssertTrue(text.contains("3  message  2 B"))
+        XCTAssertTrue(text.contains("  1  varint   7"))
+        XCTAssertTrue(text.contains("4  fixed32"))
+        XCTAssertTrue(text.contains("float 1"))
+        XCTAssertTrue(text.contains("5  bytes    de ad be ef"))
+        XCTAssertTrue(text.contains("6  fixed64"))
+        XCTAssertTrue(text.contains("double 1"))
+        XCTAssertEqual(payload[0], 0x08)
+        XCTAssertEqual(payload.count, 34)
+    }
+
+    func testProtobufBodyViewRejectsUndeclaredMalformedTruncatedAndOversizedBodies() {
+        let valid = Data([0x08, 0x01])
+        XCTAssertEqual(
+            ProtobufBodyView.render(
+                data: valid,
+                contentType: "application/octet-stream",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: ProtobufBodyView.notProtobufReason)
+        )
+
+        let incomplete = Data([0x0A, 0x05, 0x41])
+        let malformed = ProtobufBodyView.render(
+            data: incomplete,
+            contentType: "application/protobuf",
+            contentEncoding: nil
+        )
+        guard case .unavailable(let malformedReason) = malformed else {
+            return XCTFail("expected invalid Protobuf, got \(malformed)")
+        }
+        XCTAssertTrue(malformedReason.hasPrefix("Invalid Protobuf:"))
+        XCTAssertEqual(
+            ProtobufBodyView.render(
+                data: incomplete,
+                contentType: "application/protobuf",
+                contentEncoding: nil,
+                isTruncated: true
+            ),
+            .unavailable(reason: ProtobufBodyView.truncatedReason)
+        )
+
+        let oversized = Data(
+            repeating: 0,
+            count: ProtobufBodyView.maximumDecodedByteCount + 1
+        )
+        XCTAssertEqual(
+            ProtobufBodyView.render(
+                data: oversized,
+                contentType: "application/protobuf",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: ProtobufBodyView.exceedsDisplayLimitReason)
+        )
+
+        var tooManyFields = Data()
+        for _ in 0...ProtobufBodyView.maximumFieldCount {
+            tooManyFields.append(contentsOf: [0x08, 0x01])
+        }
+        XCTAssertEqual(
+            ProtobufBodyView.render(
+                data: tooManyFields,
+                contentType: "application/protobuf",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: ProtobufBodyView.fieldLimitReason)
+        )
+    }
+
+    func testProtobufBodyViewBoundsNestedMessageDecoding() {
+        var nested = Data([0x08, 0x01])
+        for _ in 0...ProtobufBodyView.maximumNestingDepth {
+            XCTAssertLessThan(nested.count, 128)
+            var parent = Data([0x0A, UInt8(nested.count)])
+            parent.append(nested)
+            nested = parent
+        }
+
+        let result = ProtobufBodyView.render(
+            data: nested,
+            contentType: "application/protobuf",
+            contentEncoding: nil
+        )
+
+        guard case .decoded(let text) = result else {
+            return XCTFail("expected bounded nested Protobuf output, got \(result)")
+        }
+        XCTAssertLessThanOrEqual(
+            text.components(separatedBy: "message").count - 1,
+            ProtobufBodyView.maximumNestingDepth
+        )
+        XCTAssertTrue(text.contains("bytes"))
+    }
+
+    func testProtobufBodyViewDecodesLengthPrefixedGRPCMessages() {
+        let firstMessage = Data([0x08, 0x96, 0x01])
+        let secondMessage = Data([0x12, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F])
+        var body = Data([0x00, 0x00, 0x00, 0x00, UInt8(firstMessage.count)])
+        body.append(firstMessage)
+        body.append(contentsOf: [0x00, 0x00, 0x00, 0x00, UInt8(secondMessage.count)])
+        body.append(secondMessage)
+
+        let result = ProtobufBodyView.render(
+            data: body,
+            contentType: "application/grpc+proto",
+            contentEncoding: nil
+        )
+
+        guard case .decoded(let text) = result else {
+            return XCTFail("expected framed gRPC messages, got \(result)")
+        }
+        XCTAssertTrue(text.contains("Message 1 · 3 B · uncompressed"))
+        XCTAssertTrue(text.contains("1  varint   150"))
+        XCTAssertTrue(text.contains("Message 2 · 7 B · uncompressed"))
+        XCTAssertTrue(text.contains("2  string   \"hello\""))
+    }
+
+    func testProtobufBodyViewDecodesExplicitlyCompressedGRPCMessages() throws {
+        let message = Data([0x08, 0x2A])
+        let compressed = try HTTPContentCoding.encode(message, contentEncoding: "gzip")
+        var body = Data([0x01])
+        let length = UInt32(compressed.count).bigEndian
+        withUnsafeBytes(of: length) { body.append(contentsOf: $0) }
+        body.append(compressed)
+
+        let result = ProtobufBodyView.render(
+            data: body,
+            contentType: "application/grpc",
+            contentEncoding: nil,
+            grpcEncoding: "gzip"
+        )
+
+        guard case .decoded(let text) = result else {
+            return XCTFail("expected compressed gRPC message, got \(result)")
+        }
+        XCTAssertTrue(text.contains("Message 1 · 2 B · gzip"))
+        XCTAssertTrue(text.contains("1  varint   42"))
+    }
+
+    func testProtobufBodyViewRejectsMalformedGRPCFrames() {
+        let truncatedFrame = Data([0x00, 0x00, 0x00, 0x00, 0x02, 0x08])
+        let invalidFlag = Data([0x02, 0x00, 0x00, 0x00, 0x00])
+        let compressedWithoutEncoding = Data([0x01, 0x00, 0x00, 0x00, 0x00])
+
+        for body in [truncatedFrame, invalidFlag, compressedWithoutEncoding] {
+            let result = ProtobufBodyView.render(
+                data: body,
+                contentType: "application/grpc+proto",
+                contentEncoding: nil
+            )
+            guard case .unavailable(let reason) = result else {
+                return XCTFail("expected malformed gRPC frame rejection, got \(result)")
+            }
+            XCTAssertTrue(reason.hasPrefix("Invalid Protobuf:"))
+        }
+
+        XCTAssertEqual(
+            ProtobufBodyView.render(
+                data: truncatedFrame,
+                contentType: "application/grpc+proto",
+                contentEncoding: nil,
+                isTruncated: true
+            ),
+            .unavailable(reason: ProtobufBodyView.truncatedReason)
+        )
+    }
+
+    func testProtobufBodyViewBoundsGRPCMessageCountAndExplainsUnsupportedCompression() {
+        var tooManyMessages = Data()
+        for _ in 0...ProtobufBodyView.maximumGRPCMessageCount {
+            tooManyMessages.append(contentsOf: [0x00, 0x00, 0x00, 0x00, 0x00])
+        }
+        XCTAssertEqual(
+            ProtobufBodyView.render(
+                data: tooManyMessages,
+                contentType: "application/grpc",
+                contentEncoding: nil
+            ),
+            .unavailable(reason: ProtobufBodyView.grpcMessageLimitReason)
+        )
+
+        let unsupported = ProtobufBodyView.render(
+            data: Data([0x01, 0x00, 0x00, 0x00, 0x02, 0xDE, 0xAD]),
+            contentType: "application/grpc+proto",
+            contentEncoding: nil,
+            grpcEncoding: "snappy"
+        )
+        guard case .decoded(let text) = unsupported else {
+            return XCTFail(
+                "expected an explicit unsupported-compression summary, got \(unsupported)")
+        }
+        XCTAssertTrue(text.contains("Message 1 · 2 B · snappy (compressed)"))
+        XCTAssertTrue(text.contains("unsupported grpc-encoding \"snappy\""))
+    }
+
     func testJSONPathBodyViewResolvesKeysIndexesAndWildcards() {
         let json =
             #"{"users":[{"name":"Ada","roles":["admin","owner"]},{"name":"Lin","roles":["reader"]}],"meta":{"count":2}}"#
@@ -1856,6 +2374,127 @@ final class ProxyLensCoreTests: XCTestCase {
         } else {
             XCTFail("expected an explicit depth bound")
         }
+    }
+
+    func testJQBodyViewProjectsFiltersAndIteratesDeterministically() {
+        let json =
+            #"{"users":[{"name":"Ada","active":true,"score":12,"alias":null},{"name":"Lin","active":false,"score":20,"alias":"L"},{"name":"Mo","active":true,"score":9,"alias":null}],"meta":{"count":3}}"#
+
+        XCTAssertEqual(
+            JQBodyView.evaluate(
+                json: json,
+                query: ".users[] | select(.active == true) | .name"
+            ),
+            .values([#""Ada""#, #""Mo""#])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(
+                json: json,
+                query: ".users[] | select(.score >= 12) | .score"
+            ),
+            .values(["12", "20"])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(
+                json: json,
+                query: #".users[] | select(.name != "Lin") | .name"#
+            ),
+            .values([#""Ada""#, #""Mo""#])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(
+                json: json,
+                query: ".users[] | select(.alias == null) | .name"
+            ),
+            .values([#""Ada""#, #""Mo""#])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: #"{"b":2,"a":1}"#, query: ".[]"),
+            .values(["1", "2"])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: json, query: ".[\"meta\"].count"),
+            .values(["3"])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: json, query: ".users[1].missing"),
+            .values([])
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: json, query: "."),
+            JQBodyView.evaluate(json: json, query: " . ")
+        )
+    }
+
+    func testJQBodyViewRejectsUnsupportedSyntaxAndBoundsEveryResource() throws {
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: "{}", query: ""),
+            .unavailable(reason: JQBodyView.emptyQueryReason)
+        )
+
+        for query in ["map(.id)", ".items |", "select(.name)", ".[-1]"] {
+            guard case .unavailable(let reason) = JQBodyView.evaluate(json: "{}", query: query)
+            else {
+                return XCTFail("expected unsupported jq query: \(query)")
+            }
+            XCTAssertTrue(reason.contains("jq"))
+        }
+
+        let oversizedInput = String(repeating: "x", count: JQBodyView.maximumInputByteCount + 1)
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: oversizedInput, query: "."),
+            .unavailable(reason: JQBodyView.exceedsDisplayLimitReason)
+        )
+
+        let oversizedQuery = String(repeating: ".a", count: 2_049)
+        XCTAssertGreaterThan(oversizedQuery.utf8.count, JQBodyView.maximumQueryByteCount)
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: "{}", query: oversizedQuery),
+            .unavailable(reason: JQBodyView.queryLimitReason)
+        )
+
+        let tooManyStages = Array(
+            repeating: ".",
+            count: JQBodyView.maximumPipelineStageCount + 1
+        ).joined(separator: " | ")
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: "{}", query: tooManyStages),
+            .unavailable(reason: JQBodyView.pipelineLimitReason)
+        )
+
+        let tooDeep = String(repeating: ".a", count: JQBodyView.maximumTraversalDepth + 1)
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: "{}", query: tooDeep),
+            .unavailable(reason: JQBodyView.traversalLimitReason)
+        )
+
+        let expanded = Array(repeating: 1, count: JQBodyView.maximumValueCount + 1)
+        let expandedJSON = try XCTUnwrap(
+            String(
+                data: JSONSerialization.data(withJSONObject: expanded),
+                encoding: .utf8
+            )
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: expandedJSON, query: ".[]"),
+            .unavailable(reason: JQBodyView.valueLimitReason)
+        )
+
+        let oversizedValue = String(
+            repeating: "x",
+            count: JQBodyView.maximumRenderedOutputByteCount + 1
+        )
+        let oversizedOutputJSON = try XCTUnwrap(
+            String(
+                data: JSONSerialization.data(
+                    withJSONObject: oversizedValue, options: .fragmentsAllowed),
+                encoding: .utf8
+            )
+        )
+        XCTAssertEqual(
+            JQBodyView.evaluate(json: oversizedOutputJSON, query: "."),
+            .unavailable(reason: JQBodyView.renderedOutputLimitReason)
+        )
     }
 
     func testJSONBodyViewAcceptsSuffixJSONTypesAndSniffsCompactPayloads() {

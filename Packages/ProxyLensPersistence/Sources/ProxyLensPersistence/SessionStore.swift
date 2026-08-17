@@ -11,7 +11,7 @@ public struct StartupRecoveryReport: Equatable, Sendable {
     }
 }
 
-public actor GRDBSessionStore: SessionStore, WebSocketFrameStore {
+public actor GRDBSessionStore: ServerSentEventStore, SessionStore, WebSocketFrameStore {
     private let database: DatabaseController
     private let bodyStore: (any BodyStore)?
 
@@ -124,6 +124,29 @@ public actor GRDBSessionStore: SessionStore, WebSocketFrameStore {
         try await removeBodies(references)
     }
 
+    public func saveServerSentEvent(_ event: CapturedServerSentEvent) async throws {
+        try await database.pool.write { database in
+            try ServerSentEventRepository.save(event, in: database)
+        }
+    }
+
+    public func listServerSentEvents(for flowID: FlowID) async throws
+        -> [CapturedServerSentEvent]
+    {
+        try await database.pool.read { database in
+            try ServerSentEventRepository.fetchAll(for: flowID, from: database)
+        }
+    }
+
+    public func removeServerSentEvents(for flowID: FlowID) async throws {
+        let references = try await database.pool.write { database in
+            let events = try ServerSentEventRepository.fetchAll(for: flowID, from: database)
+            try ServerSentEventRepository.deleteAll(for: flowID, from: database)
+            return events.map(\.data)
+        }
+        try await removeBodies(references)
+    }
+
     public func remove(flowID: FlowID) async throws {
         let bodyReferences = try await database.pool.write { database in
             guard let flow = try FlowRepository.fetch(flowID, from: database) else {
@@ -134,13 +157,17 @@ public actor GRDBSessionStore: SessionStore, WebSocketFrameStore {
                 for: flowID,
                 from: database
             ).map(\.payload)
+            let eventBodies = try ServerSentEventRepository.fetchAll(
+                for: flowID,
+                from: database
+            ).map(\.data)
 
             try FlowRepository.delete(flowID, from: database)
             if var session = try SessionRepository.fetch(flow.sessionID, from: database) {
                 session.unregisterFlow()
                 try SessionRepository.save(session, in: database)
             }
-            return Self.bodyReferences(in: flow) + frameBodies
+            return Self.bodyReferences(in: flow) + frameBodies + eventBodies
         }
 
         try await removeBodies(bodyReferences)
@@ -152,8 +179,11 @@ public actor GRDBSessionStore: SessionStore, WebSocketFrameStore {
             let frameBodies = try flows.flatMap { flow in
                 try WebSocketFrameRepository.fetchAll(for: flow.id, from: database).map(\.payload)
             }
+            let eventBodies = try flows.flatMap { flow in
+                try ServerSentEventRepository.fetchAll(for: flow.id, from: database).map(\.data)
+            }
             try SessionRepository.delete(sessionID, from: database)
-            return flows.flatMap(Self.bodyReferences(in:)) + frameBodies
+            return flows.flatMap(Self.bodyReferences(in:)) + frameBodies + eventBodies
         }
 
         try await removeBodies(bodyReferences)

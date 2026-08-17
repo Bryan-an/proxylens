@@ -6,6 +6,10 @@ final class WebSocketFramesViewController: NSViewController {
     var onFrameSelection: ((UUID) -> Void)?
     var onDirectionFilterChange: ((TrafficWebSocketDirectionFilter) -> Void)?
     var onSearchTextChange: ((String) -> Void)?
+    var onPayloadModeChange: ((TrafficWebSocketPayloadMode) -> Void)?
+    var onCompose: (() -> Void)?
+    var onReconnect: (() -> Void)?
+    var onDisconnect: (() -> Void)?
     var onExport: (() -> Void)?
 
     private enum Column: String, CaseIterable {
@@ -49,13 +53,24 @@ final class WebSocketFramesViewController: NSViewController {
         action: nil
     )
     private let searchField = NSSearchField()
+    private let connectionStatusField = NSTextField(labelWithString: "Closed")
+    private let composeButton = NSButton(title: "Compose…", target: nil, action: nil)
+    private let disconnectButton = NSButton(title: "Disconnect", target: nil, action: nil)
     private let exportButton = NSButton(title: "Export…", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "No WebSocket frames were captured.")
     private let payloadMetadataField = NSTextField(labelWithString: "")
+    private let payloadModeSelector = NSSegmentedControl(
+        labels: TrafficWebSocketPayloadMode.allCases.map(\.rawValue),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let payloadTextView = NSTextView()
     private let payloadScrollView = NSScrollView()
     private var frames: [TrafficWebSocketFrameInspection] = []
     private var isRendering = false
+    private var reconnectsOnPrimaryAction = false
+    private var renderedBreakpoint: TrafficWebSocketBreakpointInspection?
 
     private let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -103,10 +118,18 @@ final class WebSocketFramesViewController: NSViewController {
         view = container
     }
 
-    func render(_ inspection: TrafficWebSocketInspection?) {
+    func render(
+        _ inspection: TrafficWebSocketInspection?,
+        breakpoint: TrafficWebSocketBreakpointInspection? = nil,
+        resetBreakpoint: Bool = false
+    ) {
         isRendering = true
         defer { isRendering = false }
 
+        let isPaused = breakpoint != nil
+        let isNewBreakpoint =
+            resetBreakpoint
+            || breakpoint?.sequenceNumber != renderedBreakpoint?.sequenceNumber
         frames = inspection?.frames ?? []
         tableView.reloadData()
         directionSelector.selectedSegment = Self.segmentIndex(
@@ -115,9 +138,47 @@ final class WebSocketFramesViewController: NSViewController {
         if searchField.stringValue != (inspection?.searchText ?? "") {
             searchField.stringValue = inspection?.searchText ?? ""
         }
-        directionSelector.isEnabled = inspection != nil
-        searchField.isEnabled = inspection != nil
-        exportButton.isEnabled = (inspection?.capturedFrameCount ?? 0) > 0
+        directionSelector.isEnabled = inspection != nil && !isPaused
+        searchField.isEnabled = inspection != nil && !isPaused
+        tableView.isEnabled = inspection != nil && !isPaused
+        let canCompose = inspection?.canCompose == true
+        let canReconnect = inspection?.canReconnect == true
+        reconnectsOnPrimaryAction = !canCompose && canReconnect
+        composeButton.title = reconnectsOnPrimaryAction ? "Reconnect…" : "Compose…"
+        composeButton.isEnabled = (canCompose || canReconnect) && !isPaused
+        composeButton.setAccessibilityLabel(
+            reconnectsOnPrimaryAction
+                ? "Reconnect WebSocket"
+                : "Compose WebSocket frame"
+        )
+        disconnectButton.isHidden = inspection?.canDisconnect != true
+        disconnectButton.isEnabled = inspection?.canDisconnect == true && !isPaused
+        exportButton.isEnabled = (inspection?.capturedFrameCount ?? 0) > 0 && !isPaused
+        payloadModeSelector.selectedSegment = Self.payloadModeSegmentIndex(
+            for: inspection?.payloadMode ?? .automatic
+        )
+        payloadModeSelector.isEnabled = inspection?.selectedFrameID != nil && !isPaused
+        payloadModeSelector.setEnabled(
+            inspection?.canDecodePayloadAsProtobuf == true,
+            forSegment: Self.payloadModeSegmentIndex(for: .protobuf)
+        )
+
+        let isLive = canCompose
+        connectionStatusField.stringValue = isPaused ? "Paused" : (isLive ? "Live" : "Closed")
+        connectionStatusField.textColor =
+            isPaused
+            ? .systemOrange
+            : (isLive ? .systemGreen : .secondaryLabelColor)
+        let composeHelp =
+            inspection?.composeStatusMessage
+            ?? (isLive
+                ? "Send a text or binary frame on the live WebSocket connection"
+                : "Open a fresh connection from this captured WebSocket")
+        connectionStatusField.toolTip = composeHelp
+        composeButton.toolTip = composeHelp
+        composeButton.setAccessibilityHelp(composeHelp)
+        disconnectButton.toolTip = "Close this replay WebSocket connection"
+        disconnectButton.setAccessibilityHelp(disconnectButton.toolTip)
 
         if let selectedFrameID = inspection?.selectedFrameID,
             let selectedRow = frames.firstIndex(where: { $0.id == selectedFrameID })
@@ -129,17 +190,47 @@ final class WebSocketFramesViewController: NSViewController {
         }
 
         let statusMessage =
-            inspection?.statusMessage
+            breakpoint?.statusMessage
+            ?? inspection?.statusMessage
             ?? Self.frameCountDescription(frames.count)
         if statusField.stringValue != statusMessage {
             statusField.stringValue = statusMessage
             NSAccessibility.post(element: statusField, notification: .valueChanged)
         }
-        renderPayload(
-            inspection?.payload
-                ?? .none("Select a WebSocket flow to inspect captured frames."),
-            syntax: inspection?.payloadSyntax ?? .plainText
-        )
+        if let breakpoint {
+            payloadTextView.isEditable = breakpoint.canEditPayload
+            payloadTextView.setAccessibilityLabel(
+                breakpoint.canEditPayload
+                    ? "Editable paused WebSocket response payload"
+                    : "Read-only paused WebSocket response payload"
+            )
+            if isNewBreakpoint {
+                renderPayload(
+                    .content(
+                        metadata:
+                            "Server → Client • \(Self.opcodeLabel(breakpoint.opcode)) • Frame #\(breakpoint.sequenceNumber)",
+                        value: breakpoint.payload
+                    ),
+                    syntax: breakpoint.syntax
+                )
+            }
+        } else {
+            payloadTextView.isEditable = false
+            payloadTextView.setAccessibilityLabel("Selected WebSocket frame payload")
+            renderPayload(
+                inspection?.payload
+                    ?? .none("Select a WebSocket flow to inspect captured frames."),
+                syntax: inspection?.payloadSyntax ?? .plainText
+            )
+        }
+        renderedBreakpoint = breakpoint
+    }
+
+    func pendingBreakpointPayloadText() -> String? {
+        guard renderedBreakpoint?.canEditPayload == true else {
+            return nil
+        }
+        return payloadTextView.string
     }
 
     private func configureTable() {
@@ -178,6 +269,24 @@ final class WebSocketFramesViewController: NSViewController {
         payloadMetadataField.lineBreakMode = .byTruncatingMiddle
         payloadMetadataField.maximumNumberOfLines = 1
         payloadMetadataField.setAccessibilityIdentifier("inspector.websocket.payload.metadata")
+        payloadMetadataField.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        payloadModeSelector.target = self
+        payloadModeSelector.action = #selector(payloadModeChanged(_:))
+        payloadModeSelector.setAccessibilityIdentifier(
+            "inspector.websocket.payload.representation"
+        )
+        payloadModeSelector.setAccessibilityLabel("Payload representation")
+        payloadModeSelector.setAccessibilityHelp(
+            "Auto and Protobuf inspect the complete reconstructed message. Hex shows the exact bytes of the selected frame."
+        )
+        payloadModeSelector.toolTip =
+            "Auto/Protobuf: complete message; Hex: selected frame bytes"
+        payloadModeSelector.setContentHuggingPriority(.required, for: .horizontal)
+        payloadModeSelector.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         payloadTextView.isEditable = false
         payloadTextView.isSelectable = true
@@ -225,6 +334,30 @@ final class WebSocketFramesViewController: NSViewController {
         searchField.toolTip = "Search frame metadata and bounded text payloads"
         searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        connectionStatusField.translatesAutoresizingMaskIntoConstraints = false
+        connectionStatusField.font = .systemFont(ofSize: 10, weight: .semibold)
+        connectionStatusField.alignment = .center
+        connectionStatusField.setAccessibilityIdentifier("inspector.websocket.connectionStatus")
+        connectionStatusField.setAccessibilityLabel("WebSocket connection status")
+        connectionStatusField.setContentHuggingPriority(.required, for: .horizontal)
+        connectionStatusField.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        composeButton.translatesAutoresizingMaskIntoConstraints = false
+        composeButton.bezelStyle = .rounded
+        composeButton.target = self
+        composeButton.action = #selector(composeFrame(_:))
+        composeButton.setAccessibilityIdentifier("inspector.websocket.compose")
+        composeButton.setAccessibilityLabel("Compose WebSocket frame")
+        composeButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        disconnectButton.translatesAutoresizingMaskIntoConstraints = false
+        disconnectButton.bezelStyle = .rounded
+        disconnectButton.target = self
+        disconnectButton.action = #selector(disconnectConnection(_:))
+        disconnectButton.setAccessibilityIdentifier("inspector.websocket.disconnect")
+        disconnectButton.setAccessibilityLabel("Disconnect WebSocket")
+        disconnectButton.setContentHuggingPriority(.required, for: .horizontal)
+
         exportButton.translatesAutoresizingMaskIntoConstraints = false
         exportButton.bezelStyle = .rounded
         exportButton.target = self
@@ -233,7 +366,14 @@ final class WebSocketFramesViewController: NSViewController {
         exportButton.setAccessibilityLabel("Export all WebSocket frames")
         exportButton.toolTip = "Export the complete frame history as ProxyLens JSON"
 
-        let controls = NSStackView(views: [directionSelector, searchField, exportButton])
+        let controls = NSStackView(views: [
+            directionSelector,
+            searchField,
+            connectionStatusField,
+            composeButton,
+            disconnectButton,
+            exportButton
+        ])
         controls.translatesAutoresizingMaskIntoConstraints = false
         controls.orientation = .horizontal
         controls.alignment = .centerY
@@ -244,6 +384,7 @@ final class WebSocketFramesViewController: NSViewController {
         statusField.textColor = .secondaryLabelColor
         statusField.lineBreakMode = .byTruncatingTail
         statusField.setAccessibilityIdentifier("inspector.websocket.status")
+        statusField.setAccessibilityLabel("WebSocket inspector status")
 
         let container = NSView()
         container.addSubview(controls)
@@ -287,24 +428,51 @@ final class WebSocketFramesViewController: NSViewController {
         onExport?()
     }
 
+    @objc private func composeFrame(_ sender: NSButton) {
+        if reconnectsOnPrimaryAction {
+            onReconnect?()
+        } else {
+            onCompose?()
+        }
+    }
+
+    @objc private func disconnectConnection(_ sender: NSButton) {
+        onDisconnect?()
+    }
+
     private func makePayloadView() -> NSView {
         payloadMetadataField.translatesAutoresizingMaskIntoConstraints = false
+        payloadModeSelector.translatesAutoresizingMaskIntoConstraints = false
+        let header = NSStackView(views: [payloadMetadataField, payloadModeSelector])
+        header.translatesAutoresizingMaskIntoConstraints = false
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
         let container = NSView()
-        container.addSubview(payloadMetadataField)
+        container.addSubview(header)
         container.addSubview(payloadScrollView)
         NSLayoutConstraint.activate([
-            payloadMetadataField.leadingAnchor.constraint(
+            header.leadingAnchor.constraint(
                 equalTo: container.leadingAnchor, constant: 10),
-            payloadMetadataField.trailingAnchor.constraint(
+            header.trailingAnchor.constraint(
                 equalTo: container.trailingAnchor, constant: -10),
-            payloadMetadataField.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+            header.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
             payloadScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             payloadScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             payloadScrollView.topAnchor.constraint(
-                equalTo: payloadMetadataField.bottomAnchor, constant: 5),
+                equalTo: header.bottomAnchor, constant: 5),
             payloadScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         return container
+    }
+
+    @objc private func payloadModeChanged(_ sender: NSSegmentedControl) {
+        guard !isRendering,
+            TrafficWebSocketPayloadMode.allCases.indices.contains(sender.selectedSegment)
+        else {
+            return
+        }
+        onPayloadModeChange?(TrafficWebSocketPayloadMode.allCases[sender.selectedSegment])
     }
 
     private func renderPayload(
@@ -334,11 +502,16 @@ final class WebSocketFramesViewController: NSViewController {
         }
 
         payloadMetadataField.stringValue = metadata
-        let language: InspectorSyntaxHighlighter.Language = syntax == .json ? .json : .plainText
+        let language: InspectorSyntaxHighlighter.Language =
+            switch syntax {
+            case .json: .json
+            case .protobuf: .protobuf
+            case .plainText, .binary: .plainText
+            }
         let attributed = NSMutableAttributedString(
             attributedString: InspectorSyntaxHighlighter.highlight(value, as: language)
         )
-        if syntax != .json || color != .textColor {
+        if (syntax != .json && syntax != .protobuf) || color != .textColor {
             attributed.addAttribute(
                 .foregroundColor,
                 value: color,
@@ -353,8 +526,26 @@ final class WebSocketFramesViewController: NSViewController {
         count == 1 ? "1 captured WebSocket frame" : "\(count) captured WebSocket frames"
     }
 
+    private static func opcodeLabel(_ opcode: WebSocketFrameOpcode) -> String {
+        switch opcode {
+        case .continuation: "Continuation"
+        case .text: "Text"
+        case .binary: "Binary"
+        case .close: "Close"
+        case .ping: "Ping"
+        case .pong: "Pong"
+        case .unknown(let value): String(format: "Unknown 0x%02X", value)
+        }
+    }
+
     private static func segmentIndex(for filter: TrafficWebSocketDirectionFilter) -> Int {
         TrafficWebSocketDirectionFilter.allCases.firstIndex(of: filter) ?? 0
+    }
+
+    private static func payloadModeSegmentIndex(
+        for mode: TrafficWebSocketPayloadMode
+    ) -> Int {
+        TrafficWebSocketPayloadMode.allCases.firstIndex(of: mode) ?? 0
     }
 
     private func value(for frame: TrafficWebSocketFrameInspection, column: Column) -> String {

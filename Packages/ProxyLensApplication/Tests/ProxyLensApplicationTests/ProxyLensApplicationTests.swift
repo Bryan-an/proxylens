@@ -205,6 +205,102 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(persisted, replayed)
     }
 
+    func testWebSocketComposeServiceSendsTextAndBase64FramesToTheSelectedDirection()
+        async throws
+    {
+        let flowID = FlowID()
+        let transmitter = RecordingWebSocketFrameTransmitter(openFlowIDs: [flowID])
+        let service = WebSocketComposeService(
+            transmitter: transmitter,
+            maximumPayloadBytes: 64
+        )
+
+        let isOpen = await service.isConnectionOpen(for: flowID)
+        XCTAssertTrue(isOpen)
+
+        try await service.send(
+            WebSocketComposeRequest(
+                flowID: flowID,
+                direction: .clientToServer,
+                payloadEncoding: .text,
+                payload: "Hello, upstream"
+            )
+        )
+        try await service.send(
+            WebSocketComposeRequest(
+                flowID: flowID,
+                direction: .serverToClient,
+                payloadEncoding: .base64,
+                payload: Data([0x00, 0x7F, 0xFF]).base64EncodedString()
+            )
+        )
+
+        let transmissions = await transmitter.transmissions()
+        XCTAssertEqual(
+            transmissions,
+            [
+                WebSocketFrameTransmission(
+                    flowID: flowID,
+                    direction: .clientToServer,
+                    opcode: .text,
+                    payload: Data("Hello, upstream".utf8)
+                ),
+                WebSocketFrameTransmission(
+                    flowID: flowID,
+                    direction: .serverToClient,
+                    opcode: .binary,
+                    payload: Data([0x00, 0x7F, 0xFF])
+                )
+            ]
+        )
+    }
+
+    func testWebSocketComposeServiceRejectsInvalidBase64AndOversizedPayloadsBeforeSending()
+        async
+    {
+        let flowID = FlowID()
+        let transmitter = RecordingWebSocketFrameTransmitter(openFlowIDs: [flowID])
+        let service = WebSocketComposeService(
+            transmitter: transmitter,
+            maximumPayloadBytes: 4
+        )
+
+        do {
+            try await service.send(
+                WebSocketComposeRequest(
+                    flowID: flowID,
+                    direction: .clientToServer,
+                    payloadEncoding: .base64,
+                    payload: "not base64"
+                )
+            )
+            XCTFail("Expected invalid Base64 to be rejected")
+        } catch let error as WebSocketComposeError {
+            XCTAssertEqual(error, .invalidBase64)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        do {
+            try await service.send(
+                WebSocketComposeRequest(
+                    flowID: flowID,
+                    direction: .serverToClient,
+                    payloadEncoding: .text,
+                    payload: "12345"
+                )
+            )
+            XCTFail("Expected an oversized payload to be rejected")
+        } catch let error as WebSocketComposeError {
+            XCTAssertEqual(error, .payloadTooLarge(maximumBytes: 4))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let transmissions = await transmitter.transmissions()
+        XCTAssertTrue(transmissions.isEmpty)
+    }
+
     func testRuleEnginePublishesHostRulesToTheSharedSnapshot() async {
         let snapshot = MutableRuleSnapshot()
         let engine = RuleEngine(snapshot: snapshot)
@@ -623,6 +719,11 @@ final class ProxyLensApplicationTests: XCTestCase {
             path: "/users",
             phase: .responseHeaders
         )
+        let webSocketRule = await engine.breakpoint(
+            host: "socket.example.com",
+            path: "/events",
+            phase: .webSocketFrame
+        )
 
         XCTAssertEqual(requestRule.name, "Breakpoint request api.example.com/users")
         XCTAssertEqual(requestRule.priority, 18)
@@ -630,6 +731,11 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(requestRule.action, .breakpoint)
         XCTAssertEqual(responseRule.name, "Breakpoint response api.example.com/users")
         XCTAssertEqual(responseRule.phase, .responseHeaders)
+        XCTAssertEqual(
+            webSocketRule.name,
+            "Breakpoint WebSocket response socket.example.com/events"
+        )
+        XCTAssertEqual(webSocketRule.phase, .webSocketFrame)
 
         let matching = snapshot.currentRules().matchingRules(
             for: RuleMatchContext(
@@ -920,6 +1026,46 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(aborted, .abort)
     }
 
+    func testBreakpointCoordinatorCarriesAnEditedWebSocketResponseFrame() async throws {
+        let coordinator = BreakpointCoordinator()
+        let request = HTTPRequest(
+            method: .get,
+            url: URL(string: "wss://socket.example.com/events")!
+        )
+        let originalFrame = WebSocketBreakpointFrame(
+            sequenceNumber: 2,
+            opcode: .text,
+            isFinal: true,
+            payload: Data("before".utf8),
+            originalPayloadByteCount: 6,
+            maximumEditablePayloadBytes: 64
+        )
+        let hit = BreakpointHit(
+            flowID: FlowID(),
+            phase: .webSocketResponse,
+            request: request,
+            response: try HTTPResponse(statusCode: 101),
+            webSocketFrame: originalFrame
+        )
+
+        let paused = Task { await coordinator.pause(hit) }
+        while await coordinator.hit(for: hit.flowID) == nil {
+            await Task.yield()
+        }
+        let editedFrame = try originalFrame.replacingPayload(Data("after".utf8))
+        let editedHit = BreakpointHit(
+            flowID: hit.flowID,
+            phase: .webSocketResponse,
+            request: request,
+            response: hit.response,
+            webSocketFrame: editedFrame
+        )
+        await coordinator.resume(flowID: hit.flowID, decision: .continue(editedHit))
+
+        let decision = await paused.value
+        XCTAssertEqual(decision, .continue(editedHit))
+    }
+
     func testExportServiceWritesCURLForPOSTJSONThroughTheBodyStore() async throws {
         let body = Data(#"{"name":"ada"}"#.utf8)
         let flow = try Self.exportFlow(
@@ -1027,6 +1173,72 @@ final class ProxyLensApplicationTests: XCTestCase {
         XCTAssertEqual(frames[1]["payload"] as? String, binaryPayload.base64EncodedString())
         XCTAssertEqual(frames[1]["isTruncated"] as? Bool, true)
         XCTAssertEqual(frames[1]["reservedBits"] as? [String], ["RSV1"])
+    }
+
+    func testExportServiceWritesVersionedServerSentEventsWithPortableDataEncodings()
+        async throws
+    {
+        let flowID = FlowID(
+            rawValue: UUID(uuidString: "22222222-3333-4444-5555-666666666666")!
+        )
+        let jsonEvent = CapturedServerSentEvent(
+            id: UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-AAAAAAAAAAAA")!,
+            flowID: flowID,
+            sequenceNumber: 1,
+            eventType: "order.updated",
+            eventID: "evt-41",
+            retryMilliseconds: 1_500,
+            data: BodyReference(
+                inline: Data(#"{"orderID":41}"#.utf8),
+                metadata: BodyMetadata(contentType: "application/json")
+            ),
+            receivedAt: Date(timeIntervalSince1970: 1_786_800_000.125)
+        )
+        let binaryData = Data([0x00, 0x7F, 0xFF])
+        let binaryEvent = CapturedServerSentEvent(
+            id: UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-BBBBBBBBBBBB")!,
+            flowID: flowID,
+            sequenceNumber: 2,
+            data: BodyReference(
+                inline: binaryData,
+                metadata: BodyMetadata(
+                    contentType: "application/octet-stream",
+                    isTruncated: true
+                )
+            ),
+            receivedAt: Date(timeIntervalSince1970: 1_786_800_001.5)
+        )
+        let exporter = ExportService(bodyStore: RecordingBodyStore())
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "proxylens-sse-export-\(UUID().uuidString).json"
+        )
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        try await exporter.writeServerSentEvents(
+            [binaryEvent, jsonEvent],
+            for: flowID,
+            exportedAt: Date(timeIntervalSince1970: 1_786_800_010),
+            to: destination
+        )
+
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: destination))
+                as? [String: Any]
+        )
+        XCTAssertEqual(document["format"] as? String, "proxylens-server-sent-events")
+        XCTAssertEqual(document["version"] as? Int, 1)
+        XCTAssertEqual(document["flowID"] as? String, flowID.description)
+        let events = try XCTUnwrap(document["events"] as? [[String: Any]])
+        XCTAssertEqual(events.compactMap { $0["sequenceNumber"] as? Int }, [1, 2])
+        XCTAssertEqual(events[0]["eventType"] as? String, "order.updated")
+        XCTAssertEqual(events[0]["eventID"] as? String, "evt-41")
+        XCTAssertEqual(events[0]["retryMilliseconds"] as? Int, 1_500)
+        XCTAssertEqual(events[0]["dataEncoding"] as? String, "utf8")
+        XCTAssertEqual(events[0]["data"] as? String, #"{"orderID":41}"#)
+        XCTAssertEqual(events[1]["eventType"] as? String, "message")
+        XCTAssertEqual(events[1]["dataEncoding"] as? String, "base64")
+        XCTAssertEqual(events[1]["data"] as? String, binaryData.base64EncodedString())
+        XCTAssertEqual(events[1]["isTruncated"] as? Bool, true)
     }
 
     func testExportServiceEscapesBinaryCURLBodiesAndOmitsGETMethod() async throws {
@@ -2909,5 +3121,26 @@ private actor RecordingCertificateTrustStore: CertificateTrustStore {
 
     func exportedURLs() -> [URL] {
         exported
+    }
+}
+
+private actor RecordingWebSocketFrameTransmitter: WebSocketFrameTransmitter {
+    private let openFlowIDs: Set<FlowID>
+    private var recordedTransmissions: [WebSocketFrameTransmission] = []
+
+    init(openFlowIDs: Set<FlowID>) {
+        self.openFlowIDs = openFlowIDs
+    }
+
+    func isConnectionOpen(for flowID: FlowID) -> Bool {
+        openFlowIDs.contains(flowID)
+    }
+
+    func send(_ transmission: WebSocketFrameTransmission) {
+        recordedTransmissions.append(transmission)
+    }
+
+    func transmissions() -> [WebSocketFrameTransmission] {
+        recordedTransmissions
     }
 }

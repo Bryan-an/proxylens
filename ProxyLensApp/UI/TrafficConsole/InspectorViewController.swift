@@ -7,12 +7,15 @@ private enum MessageInspectorSection: String {
     case query = "Query"
     case cookies = "Cookies"
     case body = "Body"
+    case preview = "Preview"
     case json = "JSON"
     case jsonPath = "JSONPath"
     case tree = "Tree"
     case xml = "XML"
     case form = "Form"
     case graphql = "GraphQL"
+    case protobuf = "Protobuf"
+    case hex = "Hex"
     case raw = "Raw"
 }
 
@@ -28,7 +31,7 @@ final class InspectorViewController: NSViewController {
     private let continueButton = NSButton(title: "Continue", target: nil, action: nil)
     private let abortButton = NSButton(title: "Abort", target: nil, action: nil)
     private let modeSelector = NSSegmentedControl(
-        labels: ["Content", "Rules", "Timing", "Frames"],
+        labels: ["Content", "Rules", "Timing", "Frames", "Events"],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -37,20 +40,24 @@ final class InspectorViewController: NSViewController {
         title: "Request",
         accessibilityPrefix: "inspector.request",
         sections: [
-            .headers, .query, .cookies, .body, .json, .jsonPath, .tree, .xml, .form, .graphql,
-            .raw
+            .headers, .query, .cookies, .body, .preview, .json, .jsonPath, .tree, .xml, .form,
+            .graphql, .protobuf, .hex, .raw
         ]
     )
     private let responsePane = MessageInspectorPaneViewController(
         title: "Response",
         accessibilityPrefix: "inspector.response",
-        sections: [.headers, .cookies, .body, .json, .jsonPath, .tree, .xml, .form, .raw]
+        sections: [
+            .headers, .cookies, .body, .preview, .json, .jsonPath, .tree, .xml, .form,
+            .protobuf, .hex, .raw
+        ]
     )
     private let contentSplitViewController = NSSplitViewController()
     private let rulesTextView = NSTextView()
     private let rulesScrollView = NSScrollView()
     private let timingView = TrafficTimingView(frame: .zero)
     private let webSocketFramesController = WebSocketFramesViewController()
+    private let serverSentEventsController = ServerSentEventsViewController()
     private var inspection = TrafficFlowInspection.empty
     private var editedHeaders: [Int: String] = [:]
     private var editedBodies: [Int: String] = [:]
@@ -83,11 +90,34 @@ final class InspectorViewController: NSViewController {
         webSocketFramesController.onSearchTextChange = { [weak self] query in
             self?.viewModel?.setWebSocketSearchText(query)
         }
+        webSocketFramesController.onPayloadModeChange = { [weak self] mode in
+            self?.viewModel?.setWebSocketPayloadMode(mode)
+        }
+        webSocketFramesController.onCompose = { [weak self] in
+            self?.presentWebSocketComposer()
+        }
+        webSocketFramesController.onReconnect = { [weak self] in
+            self?.presentWebSocketReconnect()
+        }
+        webSocketFramesController.onDisconnect = { [weak self] in
+            self?.disconnectWebSocket()
+        }
         webSocketFramesController.onExport = { [weak self] in
             self?.exportWebSocketFrames()
         }
+        serverSentEventsController.onEventSelection = { [weak self] eventID in
+            self?.viewModel?.selectServerSentEvent(eventID)
+        }
+        serverSentEventsController.onSearchTextChange = { [weak self] query in
+            self?.viewModel?.setServerSentEventSearchText(query)
+        }
+        serverSentEventsController.onExport = { [weak self] in
+            self?.exportServerSentEvents()
+        }
         let webSocketFramesView = webSocketFramesController.view
         webSocketFramesView.translatesAutoresizingMaskIntoConstraints = false
+        let serverSentEventsView = serverSentEventsController.view
+        serverSentEventsView.translatesAutoresizingMaskIntoConstraints = false
 
         let breakpointStack = NSStackView(views: [continueButton, abortButton])
         breakpointStack.translatesAutoresizingMaskIntoConstraints = false
@@ -117,12 +147,14 @@ final class InspectorViewController: NSViewController {
         let container = NSView()
         addChild(contentSplitViewController)
         addChild(webSocketFramesController)
+        addChild(serverSentEventsController)
         container.addSubview(summaryStack)
         container.addSubview(annotationBar)
         container.addSubview(contentSplitView)
         container.addSubview(rulesScrollView)
         container.addSubview(timingView)
         container.addSubview(webSocketFramesView)
+        container.addSubview(serverSentEventsView)
         NSLayoutConstraint.activate([
             summaryStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
             summaryStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
@@ -154,7 +186,12 @@ final class InspectorViewController: NSViewController {
             webSocketFramesView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             webSocketFramesView.topAnchor.constraint(
                 equalTo: annotationBar.bottomAnchor, constant: 7),
-            webSocketFramesView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            webSocketFramesView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            serverSentEventsView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            serverSentEventsView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            serverSentEventsView.topAnchor.constraint(
+                equalTo: annotationBar.bottomAnchor, constant: 7),
+            serverSentEventsView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         view = container
         render(.initial)
@@ -182,14 +219,24 @@ final class InspectorViewController: NSViewController {
         abortButton.isEnabled = isPaused
         modeSelector.isEnabled = inspection.flowID != nil
         modeSelector.setEnabled(inspection.webSocket != nil, forSegment: 3)
+        modeSelector.setEnabled(inspection.serverSentEvents != nil, forSegment: 4)
         if inspection.flowID == nil {
             modeSelector.selectedSegment = 0
+        } else if inspection.breakpoint?.phase == .webSocketResponse {
+            modeSelector.selectedSegment = 3
         } else if inspection.webSocket == nil, modeSelector.selectedSegment == 3 {
+            modeSelector.selectedSegment = 0
+        } else if inspection.serverSentEvents == nil, modeSelector.selectedSegment == 4 {
             modeSelector.selectedSegment = 0
         }
         rulesTextView.string = inspection.rules
         timingView.render(inspection.timing)
-        webSocketFramesController.render(inspection.webSocket)
+        webSocketFramesController.render(
+            inspection.webSocket,
+            breakpoint: inspection.breakpoint?.webSocketFrame,
+            resetBreakpoint: previousFlowID != inspection.flowID
+        )
+        serverSentEventsController.render(inspection.serverSentEvents)
         updateModeVisibility()
 
         if hasUserEdits, previousFlowID == inspection.flowID {
@@ -337,11 +384,23 @@ final class InspectorViewController: NSViewController {
         requestPane.onTextChange = { [weak self] pane in
             self?.textChanged(in: pane, messageIndex: 0)
         }
+        requestPane.onProtobufImport = { [weak self] in
+            self?.presentProtobufDescriptorImporter()
+        }
+        requestPane.onProtobufMessageTypeChange = { [weak self] messageType in
+            self?.selectProtobufMessageType(messageType, direction: .request)
+        }
         responsePane.onSelectionChange = { [weak self] pane in
             self?.selectionChanged(in: pane, messageIndex: 1)
         }
         responsePane.onTextChange = { [weak self] pane in
             self?.textChanged(in: pane, messageIndex: 1)
+        }
+        responsePane.onProtobufImport = { [weak self] in
+            self?.presentProtobufDescriptorImporter()
+        }
+        responsePane.onProtobufMessageTypeChange = { [weak self] messageType in
+            self?.selectProtobufMessageType(messageType, direction: .response)
         }
 
         contentSplitViewController.splitView.isVertical = true
@@ -360,6 +419,60 @@ final class InspectorViewController: NSViewController {
 
         contentSplitViewController.addSplitViewItem(requestItem)
         contentSplitViewController.addSplitViewItem(responseItem)
+    }
+
+    private func presentProtobufDescriptorImporter() {
+        guard let window = view.window, let viewModel else {
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Import Protobuf Descriptor Set"
+        panel.message = "Choose a compiled FileDescriptorSet generated by protoc."
+        panel.prompt = "Import"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = ["desc", "pb", "protoset"].compactMap {
+            UTType(filenameExtension: $0)
+        }
+        panel.beginSheetModal(for: window) { [weak self, weak viewModel] response in
+            guard response == .OK, let url = panel.url, let self, let viewModel else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await viewModel.importProtobufDescriptorSet(from: url)
+                } catch {
+                    self.presentProtobufError(error)
+                }
+            }
+        }
+    }
+
+    private func selectProtobufMessageType(
+        _ messageType: String?,
+        direction: TrafficMessageDirection
+    ) {
+        guard let viewModel else {
+            return
+        }
+        Task { @MainActor [weak self, weak viewModel] in
+            do {
+                try await viewModel?.selectProtobufMessageType(
+                    messageType,
+                    direction: direction
+                )
+            } catch {
+                self?.presentProtobufError(error)
+            }
+        }
+    }
+
+    private func presentProtobufError(_ error: Error) {
+        guard let window = view.window else {
+            return
+        }
+        NSAlert(error: error).beginSheetModal(for: window)
     }
 
     private func configureRulesView() {
@@ -401,10 +514,14 @@ final class InspectorViewController: NSViewController {
         let showsRules = modeSelector.selectedSegment == 1 && hasSelection
         let showsTiming = modeSelector.selectedSegment == 2 && hasSelection
         let showsFrames = modeSelector.selectedSegment == 3 && inspection.webSocket != nil
-        contentSplitViewController.view.isHidden = showsRules || showsTiming || showsFrames
+        let showsEvents =
+            modeSelector.selectedSegment == 4 && inspection.serverSentEvents != nil
+        contentSplitViewController.view.isHidden =
+            showsRules || showsTiming || showsFrames || showsEvents
         rulesScrollView.isHidden = !showsRules
         timingView.isHidden = !showsTiming
         webSocketFramesController.view.isHidden = !showsFrames
+        serverSentEventsController.view.isHidden = !showsEvents
     }
 
     private func selectionChanged(
@@ -448,6 +565,7 @@ final class InspectorViewController: NSViewController {
         let content: String
         var syntaxLanguage = InspectorSyntaxHighlighter.Language.plainText
         var highlightedRange: NSRange?
+        var protobufSchema: TrafficProtobufSchemaInspection?
         switch pane.selectedSection {
         case .headers:
             content = editedHeaders[messageIndex] ?? message.headers
@@ -458,6 +576,9 @@ final class InspectorViewController: NSViewController {
         case .cookies:
             content = message.cookies
             syntaxLanguage = .urlEncodedForm
+        case .preview:
+            pane.displayImage(message.image, isSelectorEnabled: true)
+            return
         case .json:
             content = Self.bodyText(message.json, editable: false)
             highlightedRange = Self.bodyContentRange(message.json, editable: false)
@@ -488,6 +609,15 @@ final class InspectorViewController: NSViewController {
             if highlightedRange != nil {
                 syntaxLanguage = .graphql
             }
+        case .protobuf:
+            content = Self.bodyText(message.protobuf, editable: false)
+            highlightedRange = Self.bodyContentRange(message.protobuf, editable: false)
+            protobufSchema = message.protobufSchema
+            if highlightedRange != nil {
+                syntaxLanguage = .protobuf
+            }
+        case .hex:
+            content = Self.bodyText(message.hex, editable: false)
         case .body:
             if let editedBody = editedBodies[messageIndex] {
                 content = editedBody
@@ -526,7 +656,8 @@ final class InspectorViewController: NSViewController {
                 pane.selectedSection,
                 messageIndex: messageIndex
             ),
-            isSelectorEnabled: true
+            isSelectorEnabled: true,
+            protobufSchema: protobufSchema
         )
     }
 
@@ -550,6 +681,8 @@ final class InspectorViewController: NSViewController {
             return messageIndex == 0
         case .response:
             return messageIndex == 1
+        case .webSocketResponse:
+            return false
         }
     }
 
@@ -591,10 +724,30 @@ final class InspectorViewController: NSViewController {
     }
 
     @objc private func continueBreakpoint() {
-        saveCurrentEdits()
         guard let breakpoint = inspection.breakpoint else {
             return
         }
+        if breakpoint.phase == .webSocketResponse {
+            let payload = webSocketFramesController.pendingBreakpointPayloadText()
+            Task { @MainActor in
+                do {
+                    try await viewModel?.continueBreakpoint(
+                        headersText: "",
+                        bodyText: nil,
+                        webSocketPayloadText: payload
+                    )
+                } catch {
+                    let alert = NSAlert(error: error)
+                    if let window = view.window {
+                        await alert.beginSheetModal(for: window)
+                    } else {
+                        alert.runModal()
+                    }
+                }
+            }
+            return
+        }
+        saveCurrentEdits()
         let messageIndex = breakpoint.phase == .response ? 1 : 0
         let headersText: String
         if let edited = editedHeaders[messageIndex] {
@@ -655,6 +808,99 @@ final class InspectorViewController: NSViewController {
             panel.beginSheetModal(for: window, completionHandler: save)
         } else {
             save(panel.runModal())
+        }
+    }
+
+    private func exportServerSentEvents() {
+        guard let flowID = inspection.flowID, let viewModel else {
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Server-Sent Events"
+        panel.nameFieldStringValue = "ProxyLens Server-Sent Events.json"
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        let save: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let destination = panel.url else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await viewModel.writeServerSentEvents(
+                        flowID: flowID,
+                        to: destination
+                    )
+                } catch {
+                    self?.presentWebSocketExportError(error)
+                }
+            }
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: save)
+        } else {
+            save(panel.runModal())
+        }
+    }
+
+    private func presentWebSocketComposer() {
+        guard inspection.webSocket?.canCompose == true, let viewModel else {
+            return
+        }
+        let composer = WebSocketComposerViewController(flowTitle: inspection.title) {
+            direction,
+            encoding,
+            payload in
+            try await viewModel.sendWebSocketMessage(
+                direction: direction,
+                payloadEncoding: encoding,
+                payload: payload
+            )
+        }
+        presentAsSheet(composer)
+    }
+
+    private func presentWebSocketReconnect() {
+        guard inspection.webSocket?.canReconnect == true, let viewModel else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let draft = try await viewModel.webSocketReconnectDraft()
+                let controller = WebSocketReconnectViewController(draft: draft) {
+                    urlText,
+                    headersText,
+                    encoding,
+                    payload,
+                    replayPayload in
+                    try await viewModel.reconnectWebSocket(
+                        urlText: urlText,
+                        headersText: headersText,
+                        payloadEncoding: encoding,
+                        payload: payload,
+                        replayPayload: replayPayload
+                    )
+                }
+                presentAsSheet(controller)
+            } catch {
+                presentWebSocketExportError(error)
+            }
+        }
+    }
+
+    private func disconnectWebSocket() {
+        guard inspection.webSocket?.canDisconnect == true, let viewModel else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            do {
+                try await viewModel.disconnectSelectedWebSocket()
+            } catch {
+                self?.presentWebSocketExportError(error)
+            }
         }
     }
 
@@ -794,11 +1040,18 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
     private let titleField: NSTextField
     private let sectionPopup = NSPopUpButton()
     private let selectorHostView = NSView()
+    private let protobufToolbar = NSStackView()
+    private let protobufImportButton = NSButton(title: "Import…", target: nil, action: nil)
+    private let protobufDescriptorField = NSTextField(labelWithString: "No descriptor")
+    private let protobufMessageTypePopup = NSPopUpButton()
     let textView = NSTextView()
     let jsonTreeView: JSONTreeView
     let jsonPathView: JSONPathView
+    let imagePreviewView: ImagePreviewView
     var onSelectionChange: ((MessageInspectorPaneViewController) -> Void)?
     var onTextChange: ((MessageInspectorPaneViewController) -> Void)?
+    var onProtobufImport: (() -> Void)?
+    var onProtobufMessageTypeChange: ((String?) -> Void)?
     private(set) var displayedSection: MessageInspectorSection
     private let expandedSelectorWidth: CGFloat
     private var expandedSelectorConstraints: [NSLayoutConstraint] = []
@@ -852,6 +1105,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
             accessibilityIdentifier: "\(accessibilityPrefix).tree"
         )
         self.jsonPathView = JSONPathView(accessibilityPrefix: accessibilityPrefix)
+        self.imagePreviewView = ImagePreviewView(accessibilityPrefix: accessibilityPrefix)
         self.titleField = NSTextField(labelWithString: title)
         self.displayedSection = sections[0]
         super.init(nibName: nil, bundle: nil)
@@ -875,6 +1129,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         sectionSelector.target = self
         sectionSelector.action = #selector(selectionChanged)
         sectionSelector.setAccessibilityIdentifier("\(accessibilityPrefix).section")
+        sectionSelector.setAccessibilityLabel("\(paneTitle) inspector view")
         sectionSelector.setContentHuggingPriority(.required, for: .horizontal)
         sectionSelector.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         sectionSelector.isHidden = true
@@ -886,6 +1141,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         sectionPopup.target = self
         sectionPopup.action = #selector(compactSelectionChanged)
         sectionPopup.setAccessibilityIdentifier("\(accessibilityPrefix).section.compact")
+        sectionPopup.setAccessibilityLabel("\(paneTitle) inspector view")
         sectionPopup.setContentHuggingPriority(.required, for: .horizontal)
         sectionPopup.setContentCompressionResistancePriority(.required, for: .horizontal)
         sectionPopup.isHidden = false
@@ -911,6 +1167,63 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         headerStack.spacing = 8
         headerStack.distribution = .fill
         headerStack.alignment = .centerY
+
+        protobufImportButton.translatesAutoresizingMaskIntoConstraints = false
+        protobufImportButton.controlSize = .small
+        protobufImportButton.bezelStyle = .rounded
+        protobufImportButton.target = self
+        protobufImportButton.action = #selector(importProtobufDescriptor)
+        protobufImportButton.toolTip = "Import a compiled Protobuf FileDescriptorSet"
+        protobufImportButton.setAccessibilityIdentifier(
+            "\(accessibilityPrefix).protobuf.import"
+        )
+        protobufImportButton.setAccessibilityLabel("Import Protobuf descriptor set")
+        protobufImportButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        protobufDescriptorField.translatesAutoresizingMaskIntoConstraints = false
+        protobufDescriptorField.font = .systemFont(ofSize: 10)
+        protobufDescriptorField.textColor = .secondaryLabelColor
+        protobufDescriptorField.lineBreakMode = .byTruncatingMiddle
+        protobufDescriptorField.maximumNumberOfLines = 1
+        protobufDescriptorField.setAccessibilityIdentifier(
+            "\(accessibilityPrefix).protobuf.descriptor"
+        )
+        protobufDescriptorField.setAccessibilityLabel("Imported Protobuf descriptor")
+        protobufDescriptorField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        protobufDescriptorField.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        protobufMessageTypePopup.translatesAutoresizingMaskIntoConstraints = false
+        protobufMessageTypePopup.controlSize = .small
+        protobufMessageTypePopup.target = self
+        protobufMessageTypePopup.action = #selector(protobufMessageTypeChanged)
+        protobufMessageTypePopup.setAccessibilityIdentifier(
+            "\(accessibilityPrefix).protobuf.messageType"
+        )
+        protobufMessageTypePopup.setAccessibilityLabel("Protobuf message type")
+        protobufMessageTypePopup.toolTip = "Choose the root message type for this payload"
+        protobufMessageTypePopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        protobufMessageTypePopup.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        protobufToolbar.translatesAutoresizingMaskIntoConstraints = false
+        protobufToolbar.orientation = .horizontal
+        protobufToolbar.spacing = 6
+        protobufToolbar.alignment = .centerY
+        protobufToolbar.addArrangedSubview(protobufImportButton)
+        protobufToolbar.addArrangedSubview(protobufDescriptorField)
+        protobufToolbar.addArrangedSubview(protobufMessageTypePopup)
+        protobufToolbar.isHidden = true
+
+        let chromeStack = NSStackView(views: [headerStack, protobufToolbar])
+        chromeStack.translatesAutoresizingMaskIntoConstraints = false
+        chromeStack.orientation = .vertical
+        chromeStack.spacing = 5
+        chromeStack.alignment = .leading
 
         textView.delegate = self
         textView.isEditable = false
@@ -940,29 +1253,38 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         scrollView.borderType = .noBorder
         jsonTreeView.isHidden = true
         jsonPathView.isHidden = true
+        imagePreviewView.isHidden = true
 
         let container = NSView()
         container.setAccessibilityIdentifier(accessibilityPrefix)
-        container.addSubview(headerStack)
+        container.addSubview(chromeStack)
         container.addSubview(scrollView)
         container.addSubview(jsonTreeView)
         container.addSubview(jsonPathView)
+        container.addSubview(imagePreviewView)
         NSLayoutConstraint.activate([
-            headerStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
-            headerStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
-            headerStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            chromeStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            chromeStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            chromeStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            headerStack.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
+            protobufToolbar.widthAnchor.constraint(lessThanOrEqualTo: chromeStack.widthAnchor),
+            protobufMessageTypePopup.widthAnchor.constraint(lessThanOrEqualToConstant: 240),
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: headerStack.bottomAnchor, constant: 8),
+            scrollView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
             scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             jsonTreeView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             jsonTreeView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            jsonTreeView.topAnchor.constraint(equalTo: headerStack.bottomAnchor, constant: 8),
+            jsonTreeView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
             jsonTreeView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             jsonPathView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             jsonPathView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            jsonPathView.topAnchor.constraint(equalTo: headerStack.bottomAnchor, constant: 8),
-            jsonPathView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            jsonPathView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
+            jsonPathView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            imagePreviewView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            imagePreviewView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            imagePreviewView.topAnchor.constraint(equalTo: chromeStack.bottomAnchor, constant: 8),
+            imagePreviewView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         view = container
     }
@@ -1005,12 +1327,14 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         language: InspectorSyntaxHighlighter.Language = .plainText,
         highlightedRange: NSRange? = nil,
         isEditable: Bool,
-        isSelectorEnabled: Bool
+        isSelectorEnabled: Bool,
+        protobufSchema: TrafficProtobufSchemaInspection? = nil
     ) {
         isUpdatingContent = true
         textView.enclosingScrollView?.isHidden = false
         jsonTreeView.isHidden = true
         jsonPathView.isHidden = true
+        imagePreviewView.isHidden = true
         textView.textStorage?.setAttributedString(
             InspectorSyntaxHighlighter.highlight(
                 content,
@@ -1021,6 +1345,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         textView.isEditable = isEditable
         sectionSelector.isEnabled = isSelectorEnabled
         sectionPopup.isEnabled = isSelectorEnabled
+        updateProtobufToolbar(protobufSchema)
         displayedSection = selectedSection
         textView.scrollToBeginningOfDocument(nil)
         isUpdatingContent = false
@@ -1035,6 +1360,8 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         textView.enclosingScrollView?.isHidden = true
         jsonTreeView.isHidden = false
         jsonPathView.isHidden = true
+        imagePreviewView.isHidden = true
+        protobufToolbar.isHidden = true
         jsonTreeView.display(presentation)
         sectionSelector.isEnabled = isSelectorEnabled
         sectionPopup.isEnabled = isSelectorEnabled
@@ -1051,7 +1378,27 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         textView.enclosingScrollView?.isHidden = true
         jsonTreeView.isHidden = true
         jsonPathView.isHidden = false
+        imagePreviewView.isHidden = true
+        protobufToolbar.isHidden = true
         jsonPathView.display(presentation)
+        sectionSelector.isEnabled = isSelectorEnabled
+        sectionPopup.isEnabled = isSelectorEnabled
+        displayedSection = selectedSection
+        isUpdatingContent = false
+    }
+
+    func displayImage(
+        _ presentation: TrafficImagePresentation,
+        isSelectorEnabled: Bool
+    ) {
+        isUpdatingContent = true
+        textView.isEditable = false
+        textView.enclosingScrollView?.isHidden = true
+        jsonTreeView.isHidden = true
+        jsonPathView.isHidden = true
+        imagePreviewView.isHidden = false
+        protobufToolbar.isHidden = true
+        imagePreviewView.display(presentation)
         sectionSelector.isEnabled = isSelectorEnabled
         sectionPopup.isEnabled = isSelectorEnabled
         displayedSection = selectedSection
@@ -1066,6 +1413,41 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
     @objc private func compactSelectionChanged(_ sender: Any?) {
         sectionSelector.selectedSegment = sectionPopup.indexOfSelectedItem
         onSelectionChange?(self)
+    }
+
+    @objc private func importProtobufDescriptor(_ sender: Any?) {
+        onProtobufImport?()
+    }
+
+    @objc private func protobufMessageTypeChanged(_ sender: Any?) {
+        let index = protobufMessageTypePopup.indexOfSelectedItem
+        onProtobufMessageTypeChange?(
+            index <= 0 ? nil : protobufMessageTypePopup.titleOfSelectedItem)
+    }
+
+    private func updateProtobufToolbar(
+        _ schema: TrafficProtobufSchemaInspection?
+    ) {
+        guard let schema else {
+            protobufToolbar.isHidden = true
+            return
+        }
+
+        protobufToolbar.isHidden = false
+        protobufDescriptorField.stringValue = schema.descriptorName ?? "No descriptor"
+        protobufDescriptorField.toolTip = schema.descriptorName
+        let titles = ["Schema-less"] + schema.messageTypeNames
+        if protobufMessageTypePopup.itemTitles != titles {
+            protobufMessageTypePopup.removeAllItems()
+            protobufMessageTypePopup.addItems(withTitles: titles)
+        }
+        if let selected = schema.selectedMessageType,
+            let index = titles.firstIndex(of: selected)
+        {
+            protobufMessageTypePopup.selectItem(at: index)
+        } else {
+            protobufMessageTypePopup.selectItem(at: 0)
+        }
     }
 
     func textDidChange(_ notification: Notification) {

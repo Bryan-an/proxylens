@@ -1,19 +1,31 @@
+import Foundation
+import NIOCore
 import NIOWebSocket
 import ProxyLensCore
 
 enum WebSocketFrameRelay {
     static func forwardedFrame(
         _ frame: WebSocketFrame,
-        direction: WebSocketFrameDirection
+        direction: WebSocketFrameDirection,
+        replacingPayload replacementPayload: Data? = nil
     ) -> WebSocketFrame {
-        WebSocketFrame(
+        let data: ByteBuffer
+        if let replacementPayload {
+            var replacement = ByteBufferAllocator().buffer(capacity: replacementPayload.count)
+            replacement.writeBytes(replacementPayload)
+            data = replacement
+        } else {
+            data = frame.unmaskedData
+        }
+
+        return WebSocketFrame(
             fin: frame.fin,
             rsv1: frame.rsv1,
             rsv2: frame.rsv2,
             rsv3: frame.rsv3,
             opcode: frame.opcode,
             maskKey: direction == .clientToServer ? .random() : nil,
-            data: frame.unmaskedData,
+            data: data,
             extensionData: frame.unmaskedExtensionData
         )
     }

@@ -212,6 +212,20 @@ public actor RuleEngine {
     }
 
     @discardableResult
+    public func dnsSpoof(host: String, address: String) throws -> Rule {
+        let spec = try DNSSpoofSpec(address: address)
+        let rule = Rule(
+            name: "DNS spoof \(host)",
+            priority: 10,
+            phase: .connection,
+            matcher: .host(.exact(host)),
+            action: .dnsSpoof(spec)
+        )
+        add(rule)
+        return rule
+    }
+
+    @discardableResult
     public func disableCaching(forHost host: String) -> [Rule] {
         let requestRule = Rule(
             name: "No cache \(host) request",
@@ -512,8 +526,19 @@ public actor RuleEngine {
         phase: RulePhase
     ) -> Rule {
         let normalizedPath = Self.normalizedPath(path)
-        let resolvedPhase = phase == .responseHeaders ? RulePhase.responseHeaders : .requestHeaders
-        let phaseLabel = resolvedPhase == .responseHeaders ? "response" : "request"
+        let resolvedPhase: RulePhase
+        let phaseLabel: String
+        switch phase {
+        case .responseHeaders:
+            resolvedPhase = .responseHeaders
+            phaseLabel = "response"
+        case .webSocketFrame:
+            resolvedPhase = .webSocketFrame
+            phaseLabel = "WebSocket response"
+        case .connection, .requestHeaders, .requestBody, .responseBody:
+            resolvedPhase = .requestHeaders
+            phaseLabel = "request"
+        }
         let rule = Rule(
             name: "Breakpoint \(phaseLabel) \(host)\(normalizedPath)",
             priority: 18,

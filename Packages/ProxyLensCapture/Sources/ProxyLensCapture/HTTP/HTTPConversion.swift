@@ -23,11 +23,34 @@ enum HTTPConversion {
 
     static func coreVersion(from version: NIOHTTP1.HTTPVersion) throws -> ProxyLensCore.HTTPVersion
     {
-        guard version.major == 1, version.minor == 0 || version.minor == 1 else {
+        switch (version.major, version.minor) {
+        case (1, 0):
+            return .http10
+        case (1, 1):
+            return .http11
+        case (2, 0):
+            return .http2
+        default:
             throw ProxyLensError.unsupportedOperation("HTTP version \(version)")
         }
+    }
 
-        return version.minor == 0 ? .http10 : .http11
+    static func upstreamVersion(for downstreamVersion: NIOHTTP1.HTTPVersion) -> NIOHTTP1.HTTPVersion
+    {
+        downstreamVersion.major == 2 ? .http1_1 : downstreamVersion
+    }
+
+    static func nioVersion(from version: ProxyLensCore.HTTPVersion) -> NIOHTTP1.HTTPVersion {
+        switch version {
+        case .http10:
+            return .http1_0
+        case .http11:
+            return .http1_1
+        case .http2:
+            return NIOHTTP1.HTTPVersion(major: 2, minor: 0)
+        case .http3:
+            return NIOHTTP1.HTTPVersion(major: 3, minor: 0)
+        }
     }
 
     static func sanitizedRequestHeaders(

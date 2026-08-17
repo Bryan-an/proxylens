@@ -8,6 +8,9 @@ final class TrafficTimingView: NSView {
     private let totalField = NSTextField(labelWithString: "—")
     private let firstByteField = NSTextField(labelWithString: "—")
     private let stateField = NSTextField(labelWithString: "")
+    private let clientProtocolField = NSTextField(labelWithString: "Unknown")
+    private let upstreamProtocolField = NSTextField(labelWithString: "Unknown")
+    private let connectionReuseField = NSTextField(labelWithString: "Unknown")
     private let emptyField = NSTextField(labelWithString: "No timing milestones captured.")
     private var phaseRows: [NSView] = []
 
@@ -32,6 +35,9 @@ final class TrafficTimingView: NSView {
             totalField.stringValue = "—"
             firstByteField.stringValue = "—"
             stateField.stringValue = "No flow selected"
+            clientProtocolField.stringValue = "Unknown"
+            upstreamProtocolField.stringValue = "Unknown"
+            connectionReuseField.stringValue = "Unknown"
             emptyField.isHidden = false
             return
         }
@@ -40,6 +46,9 @@ final class TrafficTimingView: NSView {
         firstByteField.stringValue = timing.timeToFirstByte.map(Self.format) ?? "—"
         stateField.stringValue = timing.isComplete ? "Complete" : "In Progress"
         stateField.textColor = timing.isComplete ? .systemGreen : .systemOrange
+        clientProtocolField.stringValue = timing.clientProtocol
+        upstreamProtocolField.stringValue = timing.upstreamProtocol
+        connectionReuseField.stringValue = timing.connectionReuse
         emptyField.isHidden = !timing.phases.isEmpty
 
         let scale = max(timing.elapsedDuration, 0.001)
@@ -75,6 +84,34 @@ final class TrafficTimingView: NSView {
         summary.spacing = 8
         summary.alignment = .centerY
 
+        configureConnectionMetric(
+            clientProtocolField,
+            identifier: "inspector.timing.clientProtocol"
+        )
+        configureConnectionMetric(
+            upstreamProtocolField,
+            identifier: "inspector.timing.upstreamProtocol"
+        )
+        configureConnectionMetric(
+            connectionReuseField,
+            identifier: "inspector.timing.connectionReuse"
+        )
+        let connectionSummary = NSStackView(views: [
+            NSTextField(labelWithString: "Client"), clientProtocolField,
+            NSTextField(labelWithString: "Upstream"), upstreamProtocolField,
+            NSTextField(labelWithString: "Socket"), connectionReuseField,
+            NSView()
+        ])
+        connectionSummary.orientation = .horizontal
+        connectionSummary.spacing = 8
+        connectionSummary.alignment = .centerY
+        for case let label as NSTextField in connectionSummary.arrangedSubviews
+        where label !== clientProtocolField && label !== upstreamProtocolField
+            && label !== connectionReuseField
+        {
+            label.textColor = .secondaryLabelColor
+        }
+
         emptyField.font = .systemFont(ofSize: 12)
         emptyField.textColor = .secondaryLabelColor
         emptyField.alignment = .center
@@ -86,6 +123,7 @@ final class TrafficTimingView: NSView {
         contentStack.spacing = 9
         contentStack.addArrangedSubview(heading)
         contentStack.addArrangedSubview(summary)
+        contentStack.addArrangedSubview(connectionSummary)
         contentStack.addArrangedSubview(emptyField)
 
         documentView.translatesAutoresizingMaskIntoConstraints = false
@@ -115,12 +153,19 @@ final class TrafficTimingView: NSView {
             contentStack.bottomAnchor.constraint(
                 lessThanOrEqualTo: documentView.bottomAnchor, constant: -14),
             summary.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            connectionSummary.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             emptyField.widthAnchor.constraint(equalTo: contentStack.widthAnchor)
         ])
     }
 
     private func configureMetric(_ field: NSTextField, identifier: String) {
         field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        field.setAccessibilityIdentifier(identifier)
+    }
+
+    private func configureConnectionMetric(_ field: NSTextField, identifier: String) {
+        field.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
         field.setContentHuggingPriority(.required, for: .horizontal)
         field.setAccessibilityIdentifier(identifier)
     }

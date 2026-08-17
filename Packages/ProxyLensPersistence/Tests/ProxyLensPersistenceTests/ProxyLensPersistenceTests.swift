@@ -169,6 +169,69 @@ final class ProxyLensPersistenceTests: XCTestCase {
         }
     }
 
+    func testServerSentEventsPersistInSequenceAndDeleteTheirDataWithTheFlow() async throws {
+        let fixture = try PersistenceFixture(inlineBodyThreshold: 1)
+        defer { fixture.remove() }
+        let flow = Flow(
+            sessionID: SessionID(),
+            request: HTTPRequest(
+                method: .get,
+                url: URL(string: "https://example.test/events")!
+            )
+        )
+        try await fixture.sessionStore.save(flow)
+
+        let laterData = try await fixture.bodyStore.put(
+            Data(#"{"value":2}"#.utf8),
+            metadata: BodyMetadata(contentType: "application/json")
+        )
+        let earlierData = try await fixture.bodyStore.put(
+            Data("ready".utf8),
+            metadata: BodyMetadata(contentType: "text/plain; charset=utf-8")
+        )
+        let later = CapturedServerSentEvent(
+            flowID: flow.id,
+            sequenceNumber: 2,
+            eventType: "update",
+            eventID: "2",
+            data: laterData,
+            receivedAt: Date(timeIntervalSince1970: 20)
+        )
+        let earlier = CapturedServerSentEvent(
+            flowID: flow.id,
+            sequenceNumber: 1,
+            eventType: "ready",
+            eventID: "1",
+            retryMilliseconds: 1_500,
+            data: earlierData,
+            receivedAt: Date(timeIntervalSince1970: 10)
+        )
+
+        try await fixture.sessionStore.saveServerSentEvent(later)
+        try await fixture.sessionStore.saveServerSentEvent(earlier)
+
+        let reopenedDatabase = try DatabaseController(configuration: fixture.configuration)
+        let reopenedBodyStore = FileBodyStore(database: reopenedDatabase)
+        let reopened = GRDBSessionStore(
+            database: reopenedDatabase,
+            bodyStore: reopenedBodyStore
+        )
+        let restored = try await reopened.listServerSentEvents(for: flow.id)
+        XCTAssertEqual(restored, [earlier, later])
+        let restoredData = try await reopenedBodyStore.read(restored[0].data)
+        XCTAssertEqual(restoredData, Data("ready".utf8))
+
+        try await reopened.remove(flowID: flow.id)
+        let remainingEvents = try await reopened.listServerSentEvents(for: flow.id)
+        XCTAssertTrue(remainingEvents.isEmpty)
+        await assertThrowsErrorAsync(try await reopenedBodyStore.read(earlierData)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(earlierData.id))
+        }
+        await assertThrowsErrorAsync(try await reopenedBodyStore.read(laterData)) { error in
+            XCTAssertEqual(error as? PersistenceError, .bodyNotFound(laterData.id))
+        }
+    }
+
     func testOrphanCleanupPreservesReferencedBodies() async throws {
         let fixture = try PersistenceFixture(inlineBodyThreshold: 1)
         defer { fixture.remove() }

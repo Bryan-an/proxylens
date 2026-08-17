@@ -2,9 +2,17 @@ import Foundation
 import NIOHTTP1
 import ProxyLensCore
 
+struct ProxyConnectionIdentity: Equatable, Hashable, Sendable {
+    let logicalHost: String
+    let connectionHost: String
+    let port: Int
+    let usesTLS: Bool
+}
+
 struct ProxyTarget: Sendable {
     let url: URL
     let host: String
+    let connectionHost: String
     let port: Int
     let originForm: String
     let usesTLS: Bool
@@ -18,13 +26,34 @@ struct ProxyTarget: Sendable {
         return "\(formattedHost):\(port)"
     }
 
+    var connectionIdentity: ProxyConnectionIdentity {
+        ProxyConnectionIdentity(
+            logicalHost: host.lowercased(),
+            connectionHost: connectionHost.lowercased(),
+            port: port,
+            usesTLS: usesTLS
+        )
+    }
+
+    func connecting(to address: String) -> ProxyTarget {
+        ProxyTarget(
+            url: url,
+            host: host,
+            connectionHost: address,
+            port: port,
+            originForm: originForm,
+            usesTLS: usesTLS
+        )
+    }
+
     init(
         uri: String,
         headers: NIOHTTP1.HTTPHeaders,
-        tunnelTarget: ConnectTarget? = nil
+        tunnelTarget: ConnectTarget? = nil,
+        tunnelUsesTLS: Bool = true
     ) throws {
         if let tunnelTarget {
-            try self.init(tunneledURI: uri, target: tunnelTarget)
+            try self.init(tunneledURI: uri, target: tunnelTarget, usesTLS: tunnelUsesTLS)
             return
         }
 
@@ -117,7 +146,7 @@ struct ProxyTarget: Sendable {
         )
     }
 
-    private init(tunneledURI uri: String, target: ConnectTarget) throws {
+    private init(tunneledURI uri: String, target: ConnectTarget, usesTLS: Bool) throws {
         guard uri == "*" || uri.hasPrefix("/"),
             let relativeComponents = URLComponents(string: uri == "*" ? "/" : uri),
             relativeComponents.scheme == nil,
@@ -130,9 +159,9 @@ struct ProxyTarget: Sendable {
         }
 
         var components = URLComponents()
-        components.scheme = "https"
+        components.scheme = usesTLS ? "https" : "http"
         components.host = target.host
-        if target.port != 443 {
+        if target.port != (usesTLS ? 443 : 80) {
             components.port = target.port
         }
         components.percentEncodedPath =
@@ -150,19 +179,21 @@ struct ProxyTarget: Sendable {
             host: target.host,
             port: target.port,
             originForm: uri == "*" ? "*" : uri,
-            usesTLS: true
+            usesTLS: usesTLS
         )
     }
 
     private init(
         url: URL,
         host: String,
+        connectionHost: String? = nil,
         port: Int,
         originForm: String,
         usesTLS: Bool
     ) {
         self.url = url
         self.host = host
+        self.connectionHost = connectionHost ?? host
         self.port = port
         self.originForm = originForm
         self.usesTLS = usesTLS

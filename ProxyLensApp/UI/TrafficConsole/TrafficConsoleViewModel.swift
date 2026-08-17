@@ -35,9 +35,35 @@ protocol TrafficWebSocketFrameEventStreaming: Sendable {
     func makeWebSocketFrameStream() async -> AsyncStream<CapturedWebSocketFrame>
 }
 
+protocol TrafficWebSocketComposing: Sendable {
+    func isConnectionOpen(for flowID: FlowID) async -> Bool
+    func send(_ request: WebSocketComposeRequest) async throws
+    func reconnect(
+        _ request: WebSocketReconnectRequest,
+        sessionID: SessionID
+    ) async throws -> Flow
+    func disconnect(flowID: FlowID) async
+}
+
+extension WebSocketComposeService: TrafficWebSocketComposing {}
+
 extension WebSocketFrameEventBus: TrafficWebSocketFrameEventStreaming {
     func makeWebSocketFrameStream() async -> AsyncStream<CapturedWebSocketFrame> {
         frames()
+    }
+}
+
+protocol TrafficServerSentEventLoading: Sendable {
+    func listServerSentEvents(for flowID: FlowID) async throws -> [CapturedServerSentEvent]
+}
+
+protocol TrafficServerSentEventEventStreaming: Sendable {
+    func makeServerSentEventStream() async -> AsyncStream<CapturedServerSentEvent>
+}
+
+extension ServerSentEventEventBus: TrafficServerSentEventEventStreaming {
+    func makeServerSentEventStream() async -> AsyncStream<CapturedServerSentEvent> {
+        events()
     }
 }
 
@@ -52,6 +78,14 @@ struct TrafficRequestEditDraft: Equatable, Sendable {
     let bodyText: String
     let canEditBody: Bool
     let bodyMessage: String?
+}
+
+struct TrafficWebSocketReconnectDraft: Equatable, Sendable {
+    let urlText: String
+    let headersText: String
+    let payloadEncoding: WebSocketComposePayloadEncoding
+    let payload: String
+    let payloadStatusMessage: String?
 }
 
 protocol TrafficSessionLoading: Sendable {
@@ -95,6 +129,17 @@ protocol TrafficCertificateTrusting: Sendable {
 
 extension CertificateTrustService: TrafficCertificateTrusting {}
 
+private enum WebSocketMessagePayloadLoadingError: Error, LocalizedError {
+    case exceedsInputLimit
+
+    var errorDescription: String? {
+        switch self {
+        case .exceedsInputLimit:
+            "WebSocket reconstruction exceeds the input limit. Use Hex to inspect the selected frame."
+        }
+    }
+}
+
 @MainActor
 final class TrafficConsoleViewModel: ObservableObject {
     @Published private(set) var snapshot = TrafficConsoleSnapshot.initial
@@ -104,11 +149,22 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let bodyReader: any TrafficBodyReading
     private let webSocketFrameLoader: (any TrafficWebSocketFrameLoading)?
     private let webSocketFrameEventSource: (any TrafficWebSocketFrameEventStreaming)?
+    private let webSocketComposer: (any TrafficWebSocketComposing)?
+    private let serverSentEventLoader: (any TrafficServerSentEventLoading)?
+    private let serverSentEventEventSource: (any TrafficServerSentEventEventStreaming)?
     private let captureConfiguration: CaptureConfiguration
     private let eventBatchDelay: Duration
     private let maximumVisibleWebSocketFrames: Int
+    private let maximumWebSocketReconstructionFrames: Int
+    private let maximumWebSocketReconstructionBytes: Int64
     private let maximumWebSocketSearchBytes: Int64
     private let maximumWebSocketSearchBytesPerFrame: Int64
+    private let maximumVisibleServerSentEvents: Int
+    private let maximumServerSentEventSearchBytes: Int64
+    private let maximumServerSentEventSearchBytesPerEvent: Int64
+    private let maximumServerSentEventAccumulationBytes: Int64
+    private let maximumServerSentEventAccumulationBytesPerEvent: Int64
+    private let maximumServerSentEventAccumulatedOutputBytes: Int
     private let maximumEditableRequestBodyBytes: Int64
     private let maximumComparableBodyBytes: Int64
     private let maximumCopiedBodyBytes: Int64
@@ -123,6 +179,12 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let ruleProfileStore: (any RuleProfileStoring)?
     private let ruleProfileArchive: any TrafficRuleProfileArchiving
     private let pinnedDomainsStore: any TrafficPinnedDomainsStoring
+    private let protobufDescriptorStore: any TrafficProtobufDescriptorStoring
+    private let reverseProxyRouteStore: any TrafficReverseProxyRouteStoring
+    private let socks5ListenerStore: any TrafficSOCKS5ListenerStoring
+    private let externalHTTPProxyStore: any TrafficExternalHTTPProxyStoring
+    private let externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)?
+    private let customFilterPresetStore: any TrafficCustomFilterPresetStoring
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -135,17 +197,36 @@ final class TrafficConsoleViewModel: ObservableObject {
     private var eventTask: Task<Void, Never>?
     private var eventBatchTask: Task<Void, Never>?
     private var bodyTask: Task<Void, Never>?
+    private var breakpointPresentationTask: Task<Void, Never>?
     private var webSocketFrameEventTask: Task<Void, Never>?
     private var webSocketFrameTask: Task<Void, Never>?
     private var webSocketPayloadTask: Task<Void, Never>?
     private var webSocketSearchTask: Task<Void, Never>?
+    private var webSocketComposeTask: Task<Void, Never>?
+    private var serverSentEventEventTask: Task<Void, Never>?
+    private var serverSentEventTask: Task<Void, Never>?
+    private var serverSentEventPayloadTask: Task<Void, Never>?
+    private var serverSentEventSearchTask: Task<Void, Never>?
+    private var serverSentEventAccumulationTask: Task<Void, Never>?
     private var captureTask: Task<Void, Never>?
     private var currentWebSocketFrames: [CapturedWebSocketFrame] = []
+    private var currentWebSocketReconstructionFrames: [CapturedWebSocketFrame] = []
     private var omittedWebSocketFrameCount = 0
     private var webSocketDirectionFilter: TrafficWebSocketDirectionFilter = .all
+    private var webSocketPayloadMode: TrafficWebSocketPayloadMode = .automatic
+    private var preferredWebSocketFrameID: UUID?
     private var webSocketSearchText = ""
     private var webSocketSearchMatchIDs: Set<UUID>?
     private var skippedLargeWebSocketSearchPayloadCount = 0
+    private var currentServerSentEvents: [CapturedServerSentEvent] = []
+    private var omittedServerSentEventCount = 0
+    private var serverSentEventSearchText = ""
+    private var serverSentEventSearchMatchIDs: Set<UUID>?
+    private var skippedLargeServerSentEventSearchPayloadCount = 0
+    private var protobufCatalog: ProtobufSchemaCatalog?
+    private var protobufDescriptorName: String?
+    private var requestProtobufMessageType: String?
+    private var responseProtobufMessageType: String?
 
     init(
         captureController: any TrafficCaptureControlling,
@@ -155,9 +236,20 @@ final class TrafficConsoleViewModel: ObservableObject {
         eventBatchDelay: Duration = .milliseconds(40),
         webSocketFrameLoader: (any TrafficWebSocketFrameLoading)? = nil,
         webSocketFrameEventSource: (any TrafficWebSocketFrameEventStreaming)? = nil,
+        webSocketComposer: (any TrafficWebSocketComposing)? = nil,
+        serverSentEventLoader: (any TrafficServerSentEventLoading)? = nil,
+        serverSentEventEventSource: (any TrafficServerSentEventEventStreaming)? = nil,
         maximumVisibleWebSocketFrames: Int = 500,
+        maximumWebSocketReconstructionFrames: Int = 10_000,
+        maximumWebSocketReconstructionBytes: Int64 = 8 * 1_024 * 1_024,
         maximumWebSocketSearchBytes: Int64 = 8 * 1_024 * 1_024,
         maximumWebSocketSearchBytesPerFrame: Int64 = 256 * 1_024,
+        maximumVisibleServerSentEvents: Int = 500,
+        maximumServerSentEventSearchBytes: Int64 = 8 * 1_024 * 1_024,
+        maximumServerSentEventSearchBytesPerEvent: Int64 = 256 * 1_024,
+        maximumServerSentEventAccumulationBytes: Int64 = 8 * 1_024 * 1_024,
+        maximumServerSentEventAccumulationBytesPerEvent: Int64 = 256 * 1_024,
+        maximumServerSentEventAccumulatedOutputBytes: Int = 1_024 * 1_024,
         maximumEditableRequestBodyBytes: Int64 = 1_024 * 1_024,
         maximumComparableBodyBytes: Int64 = 1_024 * 1_024,
         maximumCopiedBodyBytes: Int64 = 8 * 1_024 * 1_024,
@@ -171,20 +263,60 @@ final class TrafficConsoleViewModel: ObservableObject {
         certificateTrust: (any TrafficCertificateTrusting)? = nil,
         ruleProfileStore: (any RuleProfileStoring)? = nil,
         ruleProfileArchive: any TrafficRuleProfileArchiving = RuleProfileArchiveService(),
-        pinnedDomainsStore: any TrafficPinnedDomainsStoring = InMemoryTrafficPinnedDomainsStore()
+        pinnedDomainsStore: any TrafficPinnedDomainsStoring = InMemoryTrafficPinnedDomainsStore(),
+        protobufDescriptorStore: any TrafficProtobufDescriptorStoring =
+            InMemoryTrafficProtobufDescriptorStore(),
+        reverseProxyRouteStore: any TrafficReverseProxyRouteStoring =
+            InMemoryTrafficReverseProxyRouteStore(),
+        socks5ListenerStore: any TrafficSOCKS5ListenerStoring =
+            InMemoryTrafficSOCKS5ListenerStore(),
+        externalHTTPProxyStore: any TrafficExternalHTTPProxyStoring =
+            InMemoryTrafficExternalHTTPProxyStore(),
+        externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)? = nil,
+        customFilterPresetStore: any TrafficCustomFilterPresetStoring =
+            InMemoryTrafficCustomFilterPresetStore()
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
         self.bodyReader = bodyReader
         self.webSocketFrameLoader = webSocketFrameLoader
         self.webSocketFrameEventSource = webSocketFrameEventSource
+        self.webSocketComposer = webSocketComposer
+        self.serverSentEventLoader = serverSentEventLoader
+        self.serverSentEventEventSource = serverSentEventEventSource
         self.captureConfiguration = captureConfiguration
         self.eventBatchDelay = eventBatchDelay
         self.maximumVisibleWebSocketFrames = max(1, maximumVisibleWebSocketFrames)
+        self.maximumWebSocketReconstructionFrames = max(
+            1,
+            maximumWebSocketReconstructionFrames
+        )
+        self.maximumWebSocketReconstructionBytes = max(
+            0,
+            maximumWebSocketReconstructionBytes
+        )
         self.maximumWebSocketSearchBytes = max(0, maximumWebSocketSearchBytes)
         self.maximumWebSocketSearchBytesPerFrame = max(
             0,
             maximumWebSocketSearchBytesPerFrame
+        )
+        self.maximumVisibleServerSentEvents = max(1, maximumVisibleServerSentEvents)
+        self.maximumServerSentEventSearchBytes = max(0, maximumServerSentEventSearchBytes)
+        self.maximumServerSentEventSearchBytesPerEvent = max(
+            0,
+            maximumServerSentEventSearchBytesPerEvent
+        )
+        self.maximumServerSentEventAccumulationBytes = max(
+            0,
+            maximumServerSentEventAccumulationBytes
+        )
+        self.maximumServerSentEventAccumulationBytesPerEvent = max(
+            0,
+            maximumServerSentEventAccumulationBytesPerEvent
+        )
+        self.maximumServerSentEventAccumulatedOutputBytes = max(
+            0,
+            maximumServerSentEventAccumulatedOutputBytes
         )
         self.maximumEditableRequestBodyBytes = max(0, maximumEditableRequestBodyBytes)
         self.maximumComparableBodyBytes = max(0, maximumComparableBodyBytes)
@@ -200,6 +332,12 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.ruleProfileStore = ruleProfileStore
         self.ruleProfileArchive = ruleProfileArchive
         self.pinnedDomainsStore = pinnedDomainsStore
+        self.protobufDescriptorStore = protobufDescriptorStore
+        self.reverseProxyRouteStore = reverseProxyRouteStore
+        self.socks5ListenerStore = socks5ListenerStore
+        self.externalHTTPProxyStore = externalHTTPProxyStore
+        self.externalHTTPProxyCredentialStore = externalHTTPProxyCredentialStore
+        self.customFilterPresetStore = customFilterPresetStore
         for domain in pinnedDomainsStore.domains {
             store.setPinnedDomain(domain, isPinned: true)
         }
@@ -209,10 +347,17 @@ final class TrafficConsoleViewModel: ObservableObject {
         eventTask?.cancel()
         eventBatchTask?.cancel()
         bodyTask?.cancel()
+        breakpointPresentationTask?.cancel()
         webSocketFrameEventTask?.cancel()
         webSocketFrameTask?.cancel()
         webSocketPayloadTask?.cancel()
         webSocketSearchTask?.cancel()
+        webSocketComposeTask?.cancel()
+        serverSentEventEventTask?.cancel()
+        serverSentEventTask?.cancel()
+        serverSentEventPayloadTask?.cancel()
+        serverSentEventSearchTask?.cancel()
+        serverSentEventAccumulationTask?.cancel()
         captureTask?.cancel()
     }
 
@@ -231,10 +376,107 @@ final class TrafficConsoleViewModel: ObservableObject {
             capturePresentation = .failed(error.localizedDescription)
         }
         await hydrateWorkspace()
+        await hydrateProtobufDescriptor()
         await refreshCertificateTrust()
         publishSnapshot()
         subscribeToFlowEvents()
         subscribeToWebSocketFrameEvents()
+        subscribeToServerSentEventEvents()
+    }
+
+    func importProtobufDescriptorSet(from url: URL) async throws {
+        let (data, sourceName) = try await Task.detached(priority: .utility) {
+            let hasSecurityScope = url.startAccessingSecurityScopedResource()
+            defer {
+                if hasSecurityScope {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            let file = try FileHandle(forReadingFrom: url)
+            defer { try? file.close() }
+            let maximumByteCount = ProtobufDescriptorSetParser.maximumByteCount
+            let data = try file.read(upToCount: maximumByteCount + 1) ?? Data()
+            guard data.count <= maximumByteCount else {
+                throw ProtobufDescriptorSetError.exceedsByteLimit(
+                    maximum: maximumByteCount
+                )
+            }
+            return (data, url.lastPathComponent)
+        }.value
+        try await importProtobufDescriptorSet(data: data, sourceName: sourceName)
+    }
+
+    func importProtobufDescriptorSet(data: Data, sourceName: String) async throws {
+        let catalog = try await Task.detached(priority: .utility) {
+            try ProtobufDescriptorSetParser.parse(data)
+        }.value
+        let normalizedName = URL(fileURLWithPath: sourceName).lastPathComponent
+        let displayName = normalizedName.isEmpty ? "Descriptor.desc" : normalizedName
+        try await protobufDescriptorStore.saveDescriptor(
+            data: data,
+            sourceName: displayName
+        )
+
+        protobufCatalog = catalog
+        protobufDescriptorName = displayName
+        requestProtobufMessageType = nil
+        responseProtobufMessageType = nil
+        refreshInspection(preservingWebSocketSelection: true)
+    }
+
+    func selectProtobufMessageType(
+        _ messageType: String?,
+        direction: TrafficMessageDirection
+    ) async throws {
+        if let messageType, protobufCatalog?.message(named: messageType) == nil {
+            throw ProxyLensError.unsupportedOperation(
+                "The imported descriptor does not contain message type \(messageType)"
+            )
+        }
+
+        let requestType = direction == .request ? messageType : requestProtobufMessageType
+        let responseType = direction == .response ? messageType : responseProtobufMessageType
+        try await protobufDescriptorStore.saveSelections(
+            requestMessageType: requestType,
+            responseMessageType: responseType
+        )
+        requestProtobufMessageType = requestType
+        responseProtobufMessageType = responseType
+        refreshInspection(preservingWebSocketSelection: true)
+    }
+
+    private func hydrateProtobufDescriptor() async {
+        do {
+            guard let stored = try await protobufDescriptorStore.load() else {
+                return
+            }
+            let catalog = try await Task.detached(priority: .utility) {
+                try ProtobufDescriptorSetParser.parse(stored.data)
+            }.value
+            protobufCatalog = catalog
+            protobufDescriptorName = stored.sourceName
+            requestProtobufMessageType = Self.validMessageType(
+                stored.requestMessageType,
+                in: catalog
+            )
+            responseProtobufMessageType = Self.validMessageType(
+                stored.responseMessageType,
+                in: catalog
+            )
+        } catch {
+            workspaceWarning =
+                "Could not restore the Protobuf descriptor: \(error.localizedDescription)"
+        }
+    }
+
+    nonisolated private static func validMessageType(
+        _ messageType: String?,
+        in catalog: ProtobufSchemaCatalog
+    ) -> String? {
+        guard let messageType, catalog.message(named: messageType) != nil else {
+            return nil
+        }
+        return messageType
     }
 
     func toggleCapture() {
@@ -259,10 +501,19 @@ final class TrafficConsoleViewModel: ObservableObject {
         store.selectSource(source)
         if store.selectedFlowID == nil {
             bodyTask?.cancel()
+            breakpointPresentationTask?.cancel()
             webSocketFrameTask?.cancel()
             webSocketPayloadTask?.cancel()
+            webSocketComposeTask?.cancel()
+            serverSentEventTask?.cancel()
+            serverSentEventPayloadTask?.cancel()
+            serverSentEventSearchTask?.cancel()
+            serverSentEventAccumulationTask?.cancel()
             currentWebSocketFrames.removeAll(keepingCapacity: true)
+            currentWebSocketReconstructionFrames.removeAll(keepingCapacity: true)
             omittedWebSocketFrameCount = 0
+            currentServerSentEvents.removeAll(keepingCapacity: true)
+            omittedServerSentEventCount = 0
             inspection = .empty
         }
         publishSnapshot()
@@ -272,6 +523,176 @@ final class TrafficConsoleViewModel: ObservableObject {
         store.setPinnedDomain(host, isPinned: isPinned)
         pinnedDomainsStore.save(store.pinnedDomainHosts)
         publishSnapshot()
+    }
+
+    var canEditListenerConfiguration: Bool {
+        switch capturePresentation {
+        case .stopped, .failed:
+            true
+        case .recovering, .starting, .running, .stopping:
+            false
+        }
+    }
+
+    var canEditReverseProxyRoutes: Bool { canEditListenerConfiguration }
+
+    func currentSOCKS5ListenerConfiguration() -> SOCKS5ListenerConfiguration {
+        socks5ListenerStore.configuration
+    }
+
+    func saveSOCKS5ListenerConfiguration(
+        _ configuration: SOCKS5ListenerConfiguration
+    ) throws {
+        guard canEditListenerConfiguration else {
+            throw TrafficSOCKS5ListenerStoreError.captureMustBeStopped
+        }
+        _ = try captureConfiguration(
+            with: reverseProxyRouteStore.routes,
+            socks5Listener: configuration
+        )
+        try socks5ListenerStore.save(configuration)
+    }
+
+    func currentExternalHTTPProxyConfiguration() -> ExternalHTTPProxyConfiguration {
+        externalHTTPProxyStore.configuration
+    }
+
+    func saveExternalHTTPProxyConfiguration(
+        _ configuration: ExternalHTTPProxyConfiguration,
+        password: String
+    ) async throws {
+        guard canEditListenerConfiguration else {
+            throw TrafficExternalHTTPProxyStoreError.captureMustBeStopped
+        }
+        _ = try captureConfiguration(
+            with: reverseProxyRouteStore.routes,
+            externalHTTPProxy: configuration
+        )
+        let previous = externalHTTPProxyStore.configuration
+        guard let externalHTTPProxyCredentialStore else {
+            if configuration.username != nil || previous.username != nil {
+                throw TrafficExternalHTTPProxyStoreError.credentialStoreUnavailable
+            }
+            try externalHTTPProxyStore.save(configuration)
+            return
+        }
+
+        if let username = configuration.username {
+            let credentials: ExternalHTTPProxyCredentials
+            if !password.isEmpty {
+                credentials = try ExternalHTTPProxyCredentials(
+                    username: username,
+                    password: password
+                )
+            } else if let existing = try await externalHTTPProxyCredentialStore.credentials(
+                for: previous.endpoint,
+                username: username
+            ) {
+                credentials = existing
+            } else {
+                throw TrafficExternalHTTPProxyStoreError.credentialsRequired
+            }
+            try await externalHTTPProxyCredentialStore.save(
+                credentials,
+                for: configuration.endpoint
+            )
+            if previous.endpoint != configuration.endpoint {
+                try await externalHTTPProxyCredentialStore.removeCredentials(
+                    for: previous.endpoint
+                )
+            }
+        } else {
+            try await externalHTTPProxyCredentialStore.removeCredentials(
+                for: previous.endpoint
+            )
+            if previous.endpoint != configuration.endpoint {
+                try await externalHTTPProxyCredentialStore.removeCredentials(
+                    for: configuration.endpoint
+                )
+            }
+        }
+        try externalHTTPProxyStore.save(configuration)
+    }
+
+    func clearExternalHTTPProxyCredentials() async throws {
+        guard canEditListenerConfiguration else {
+            throw TrafficExternalHTTPProxyStoreError.captureMustBeStopped
+        }
+        guard let externalHTTPProxyCredentialStore else {
+            throw TrafficExternalHTTPProxyStoreError.credentialStoreUnavailable
+        }
+        let current = externalHTTPProxyStore.configuration
+        try await externalHTTPProxyCredentialStore.removeCredentials(for: current.endpoint)
+        let updated = try ExternalHTTPProxyConfiguration(
+            endpoint: current.endpoint,
+            bypassHosts: current.bypassHosts,
+            username: nil,
+            isEnabled: current.isEnabled
+        )
+        try externalHTTPProxyStore.save(updated)
+    }
+
+    func currentReverseProxyRoutes() -> [ReverseProxyRoute] {
+        reverseProxyRouteStore.routes
+    }
+
+    func saveReverseProxyRoute(_ route: ReverseProxyRoute) throws {
+        try requireStoppedCaptureForReverseProxyChanges()
+        var routes = reverseProxyRouteStore.routes
+        if let index = routes.firstIndex(where: { $0.id == route.id }) {
+            routes[index] = route
+        } else {
+            routes.append(route)
+        }
+        _ = try captureConfiguration(with: routes)
+        try reverseProxyRouteStore.save(route)
+    }
+
+    func removeReverseProxyRoute(id: UUID) throws {
+        try requireStoppedCaptureForReverseProxyChanges()
+        reverseProxyRouteStore.remove(id: id)
+    }
+
+    func setReverseProxyRouteEnabled(id: UUID, isEnabled: Bool) throws {
+        try requireStoppedCaptureForReverseProxyChanges()
+        guard let route = reverseProxyRouteStore.routes.first(where: { $0.id == id }) else {
+            return
+        }
+        try saveReverseProxyRoute(
+            ReverseProxyRoute(
+                id: route.id,
+                name: route.name,
+                listenEndpoint: route.listenEndpoint,
+                upstreamURL: route.upstreamURL,
+                isEnabled: isEnabled
+            )
+        )
+    }
+
+    private func requireStoppedCaptureForReverseProxyChanges() throws {
+        guard canEditReverseProxyRoutes else {
+            throw TrafficReverseProxyRouteStoreError.captureMustBeStopped
+        }
+    }
+
+    private func captureConfiguration(
+        with reverseProxyRoutes: [ReverseProxyRoute],
+        socks5Listener: SOCKS5ListenerConfiguration? = nil,
+        externalHTTPProxy: ExternalHTTPProxyConfiguration? = nil
+    ) throws -> CaptureConfiguration {
+        let proxy = ProxyConfiguration(
+            listenEndpoint: captureConfiguration.proxy.listenEndpoint,
+            interceptHTTPS: captureConfiguration.proxy.interceptHTTPS,
+            reverseProxyRoutes: reverseProxyRoutes,
+            socks5Listener: socks5Listener ?? socks5ListenerStore.configuration,
+            externalHTTPProxy: externalHTTPProxy ?? externalHTTPProxyStore.configuration
+        )
+        try proxy.validateListeners()
+        return CaptureConfiguration(
+            proxy: proxy,
+            configuresSystemProxy: captureConfiguration.configuresSystemProxy,
+            bypassDomains: captureConfiguration.bypassDomains
+        )
     }
 
     func renameSession(_ sessionID: SessionID, to name: String?) async throws {
@@ -294,10 +715,19 @@ final class TrafficConsoleViewModel: ObservableObject {
         store.removeSession(sessionID)
         if store.selectedFlowID == nil {
             bodyTask?.cancel()
+            breakpointPresentationTask?.cancel()
             webSocketFrameTask?.cancel()
             webSocketPayloadTask?.cancel()
+            webSocketComposeTask?.cancel()
+            serverSentEventTask?.cancel()
+            serverSentEventPayloadTask?.cancel()
+            serverSentEventSearchTask?.cancel()
+            serverSentEventAccumulationTask?.cancel()
             currentWebSocketFrames.removeAll(keepingCapacity: true)
+            currentWebSocketReconstructionFrames.removeAll(keepingCapacity: true)
             omittedWebSocketFrameCount = 0
+            currentServerSentEvents.removeAll(keepingCapacity: true)
+            omittedServerSentEventCount = 0
             inspection = .empty
         } else {
             refreshInspection()
@@ -366,6 +796,40 @@ final class TrafficConsoleViewModel: ObservableObject {
 
     func setAnnotationFilter(_ annotation: TrafficAnnotationFilter) {
         updateDisplayFilter { $0.annotation = annotation }
+    }
+
+    var customFilterPresets: [TrafficCustomFilterPreset] {
+        customFilterPresetStore.presets
+    }
+
+    var matchingCustomFilterPreset: TrafficCustomFilterPreset? {
+        customFilterPresetStore.presets.first { $0.filter == store.displayFilter }
+    }
+
+    @discardableResult
+    func saveCustomFilterPreset(named name: String) throws -> TrafficCustomFilterPreset {
+        let preset = try customFilterPresetStore.save(name: name, filter: store.displayFilter)
+        publishSnapshot()
+        return preset
+    }
+
+    func applyCustomFilterPreset(id: UUID) throws {
+        guard let preset = customFilterPresetStore.presets.first(where: { $0.id == id }) else {
+            throw TrafficCustomFilterPresetError.presetNotFound
+        }
+        updateDisplayFilter { $0 = preset.filter }
+    }
+
+    @discardableResult
+    func renameCustomFilterPreset(id: UUID, name: String) throws -> TrafficCustomFilterPreset {
+        let preset = try customFilterPresetStore.rename(id: id, name: name)
+        publishSnapshot()
+        return preset
+    }
+
+    func removeCustomFilterPreset(id: UUID) {
+        customFilterPresetStore.remove(id: id)
+        publishSnapshot()
     }
 
     func updateAnnotation(_ annotation: FlowAnnotation?, for flowID: FlowID) async throws {
@@ -586,6 +1050,13 @@ final class TrafficConsoleViewModel: ObservableObject {
 
     func disableCaching(forHost host: String) {
         Task { await ruleEngine?.disableCaching(forHost: host) }
+    }
+
+    func dnsSpoof(host: String, address: String) async throws {
+        guard let ruleEngine else {
+            return
+        }
+        try await ruleEngine.dnsSpoof(host: host, address: address)
     }
 
     func throttle(host: String, latency: TimeInterval) async throws {
@@ -851,6 +1322,28 @@ final class TrafficConsoleViewModel: ObservableObject {
         try await exportService.writeWebSocketFrames(frames, for: flowID, to: fileURL)
     }
 
+    func writeServerSentEvents(flowID: FlowID, to fileURL: URL) async throws {
+        guard let exportService else {
+            throw ProxyLensError.unsupportedOperation("Export is not available")
+        }
+        guard let serverSentEventLoader else {
+            throw ProxyLensError.unsupportedOperation(
+                "Server-Sent Event history is not available"
+            )
+        }
+        guard let flow = store.flow(id: flowID) else {
+            throw ProxyLensError.unsupportedOperation("The flow is no longer available")
+        }
+        guard Self.isServerSentEventStream(flow) else {
+            throw ProxyLensError.unsupportedOperation(
+                "The selected flow is not a Server-Sent Event stream"
+            )
+        }
+
+        let events = try await serverSentEventLoader.listServerSentEvents(for: flowID)
+        try await exportService.writeServerSentEvents(events, for: flowID, to: fileURL)
+    }
+
     @discardableResult
     func repeatRequest(flowID: FlowID) async throws -> FlowID {
         guard let requestReplayer else {
@@ -1065,7 +1558,11 @@ final class TrafficConsoleViewModel: ObservableObject {
     }
 
     private func applyReplayedFlow(_ replayedFlow: Flow) {
-        store.apply([.finished(replayedFlow)])
+        store.apply([
+            replayedFlow.state.isTerminal
+                ? .finished(replayedFlow)
+                : .updated(replayedFlow)
+        ])
         store.selectFlow(replayedFlow.id)
         if store.selectedFlowID == nil {
             store.clearFilters()
@@ -1099,21 +1596,37 @@ final class TrafficConsoleViewModel: ObservableObject {
         store.replaceSessions([])
         store.replaceAll([])
         bodyTask?.cancel()
+        breakpointPresentationTask?.cancel()
         webSocketFrameTask?.cancel()
         webSocketPayloadTask?.cancel()
         webSocketSearchTask?.cancel()
+        webSocketComposeTask?.cancel()
+        serverSentEventTask?.cancel()
+        serverSentEventPayloadTask?.cancel()
+        serverSentEventSearchTask?.cancel()
+        serverSentEventAccumulationTask?.cancel()
         currentWebSocketFrames.removeAll(keepingCapacity: true)
+        currentWebSocketReconstructionFrames.removeAll(keepingCapacity: true)
         omittedWebSocketFrameCount = 0
         webSocketDirectionFilter = .all
         webSocketSearchText = ""
         webSocketSearchMatchIDs = nil
         skippedLargeWebSocketSearchPayloadCount = 0
+        currentServerSentEvents.removeAll(keepingCapacity: true)
+        omittedServerSentEventCount = 0
+        serverSentEventSearchText = ""
+        serverSentEventSearchMatchIDs = nil
+        skippedLargeServerSentEventSearchPayloadCount = 0
         inspection = .empty
         workspaceWarning = nil
         publishSnapshot()
     }
 
-    func continueBreakpoint(headersText: String, bodyText: String?) async throws {
+    func continueBreakpoint(
+        headersText: String,
+        bodyText: String?,
+        webSocketPayloadText: String? = nil
+    ) async throws {
         guard let flow = store.selectedFlow,
             let coordinator = breakpointCoordinator,
             let hit = await coordinator.hit(for: flow.id)
@@ -1155,6 +1668,30 @@ final class TrafficConsoleViewModel: ObservableObject {
                         phase: .response,
                         request: hit.request,
                         response: response
+                    )
+                )
+            )
+        case .webSocketResponse:
+            guard let originalFrame = hit.webSocketFrame else {
+                throw ProxyLensError.unsupportedOperation(
+                    "The paused WebSocket response frame is unavailable"
+                )
+            }
+            let decidedFrame: WebSocketBreakpointFrame
+            if originalFrame.canEditPayload, let webSocketPayloadText {
+                decidedFrame = try originalFrame.replacingPayload(Data(webSocketPayloadText.utf8))
+            } else {
+                decidedFrame = originalFrame
+            }
+            await coordinator.resume(
+                flowID: hit.flowID,
+                decision: .continue(
+                    BreakpointHit(
+                        flowID: hit.flowID,
+                        phase: .webSocketResponse,
+                        request: hit.request,
+                        response: hit.response,
+                        webSocketFrame: decidedFrame
                     )
                 )
             )
@@ -1207,10 +1744,19 @@ final class TrafficConsoleViewModel: ObservableObject {
         store.setDisplayFilter(filter)
         if store.selectedFlowID == nil {
             bodyTask?.cancel()
+            breakpointPresentationTask?.cancel()
             webSocketFrameTask?.cancel()
             webSocketPayloadTask?.cancel()
+            webSocketComposeTask?.cancel()
+            serverSentEventTask?.cancel()
+            serverSentEventPayloadTask?.cancel()
+            serverSentEventSearchTask?.cancel()
+            serverSentEventAccumulationTask?.cancel()
             currentWebSocketFrames.removeAll(keepingCapacity: true)
+            currentWebSocketReconstructionFrames.removeAll(keepingCapacity: true)
             omittedWebSocketFrameCount = 0
+            currentServerSentEvents.removeAll(keepingCapacity: true)
+            omittedServerSentEventCount = 0
             inspection = .empty
         }
         publishSnapshot()
@@ -1339,11 +1885,29 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
     }
 
+    private func subscribeToServerSentEventEvents() {
+        guard serverSentEventEventTask == nil, let serverSentEventEventSource else {
+            return
+        }
+        serverSentEventEventTask = Task { [weak self] in
+            let stream = await serverSentEventEventSource.makeServerSentEventStream()
+            for await event in stream {
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.receiveServerSentEvent(event)
+            }
+        }
+    }
+
     private func startCapture() async {
         capturePresentation = .starting
         publishSnapshot()
         do {
-            let context = try await captureController.start(configuration: captureConfiguration)
+            let configuration = try captureConfiguration(
+                with: reverseProxyRouteStore.routes
+            )
+            let context = try await captureController.start(configuration: configuration)
             capturePresentation = .running(context, warning: nil)
         } catch {
             capturePresentation = .failed(error.localizedDescription)
@@ -1399,30 +1963,68 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
     }
 
-    private func refreshInspection() {
+    private func refreshInspection(preservingWebSocketSelection: Bool = false) {
+        if preservingWebSocketSelection {
+            preferredWebSocketFrameID = inspection.webSocket?.selectedFrameID
+        } else {
+            preferredWebSocketFrameID = nil
+            webSocketPayloadMode = .automatic
+        }
         bodyTask?.cancel()
+        breakpointPresentationTask?.cancel()
         webSocketFrameTask?.cancel()
         webSocketPayloadTask?.cancel()
         webSocketSearchTask?.cancel()
+        webSocketComposeTask?.cancel()
+        serverSentEventTask?.cancel()
+        serverSentEventPayloadTask?.cancel()
+        serverSentEventSearchTask?.cancel()
+        serverSentEventAccumulationTask?.cancel()
         currentWebSocketFrames.removeAll(keepingCapacity: true)
+        currentWebSocketReconstructionFrames.removeAll(keepingCapacity: true)
         omittedWebSocketFrameCount = 0
         webSocketDirectionFilter = .all
         webSocketSearchText = ""
         webSocketSearchMatchIDs = nil
         skippedLargeWebSocketSearchPayloadCount = 0
+        currentServerSentEvents.removeAll(keepingCapacity: true)
+        omittedServerSentEventCount = 0
+        serverSentEventSearchText = ""
+        serverSentEventSearchMatchIDs = nil
+        skippedLargeServerSentEventSearchPayloadCount = 0
         guard let flow = store.selectedFlow else {
             inspection = .empty
             publishSnapshot()
             return
         }
 
-        inspection = Self.initialInspection(for: flow)
+        let requestProtobufSchema = protobufMessageSchema(for: .request)
+        let responseProtobufSchema = protobufMessageSchema(for: .response)
+        let loadedProtobufCatalog = protobufCatalog
+        inspection = Self.initialInspection(
+            for: flow,
+            requestProtobufInspection: protobufSchemaInspection(for: .request),
+            responseProtobufInspection: protobufSchemaInspection(for: .response)
+        )
         publishSnapshot()
+        refreshBreakpointPresentation(for: flow)
 
         let bodyReader = bodyReader
         bodyTask = Task { [weak self] in
-            async let requestBodies = Self.loadBodies(flow.request.body, reader: bodyReader)
-            async let responseBodies = Self.loadBodies(flow.response?.body, reader: bodyReader)
+            async let requestBodies = Self.loadBodies(
+                flow.request.body,
+                grpcEncoding: flow.request.headers.firstValue(for: "grpc-encoding"),
+                protobufSchema: requestProtobufSchema,
+                protobufCatalog: loadedProtobufCatalog,
+                reader: bodyReader
+            )
+            async let responseBodies = Self.loadBodies(
+                flow.response?.body,
+                grpcEncoding: flow.response?.headers.firstValue(for: "grpc-encoding"),
+                protobufSchema: responseProtobufSchema,
+                protobufCatalog: loadedProtobufCatalog,
+                reader: bodyReader
+            )
             let loadedRequestBodies = await requestBodies
             let loadedResponseBodies = await responseBodies
             guard !Task.isCancelled, self?.store.selectedFlowID == flow.id else {
@@ -1435,6 +2037,282 @@ final class TrafficConsoleViewModel: ObservableObject {
             )
         }
         refreshWebSocketFrames(for: flow)
+        refreshWebSocketComposeAvailability(for: flow)
+        refreshServerSentEvents(for: flow)
+    }
+
+    private func protobufSchemaInspection(
+        for direction: TrafficMessageDirection
+    ) -> TrafficProtobufSchemaInspection {
+        TrafficProtobufSchemaInspection(
+            descriptorName: protobufDescriptorName,
+            messageTypeNames: protobufCatalog?.messageTypeNames ?? [],
+            selectedMessageType: direction == .request
+                ? requestProtobufMessageType
+                : responseProtobufMessageType
+        )
+    }
+
+    private func protobufMessageSchema(
+        for direction: TrafficMessageDirection
+    ) -> ProtobufMessageSchema? {
+        let messageType =
+            direction == .request
+            ? requestProtobufMessageType
+            : responseProtobufMessageType
+        guard let messageType else {
+            return nil
+        }
+        return protobufCatalog?.message(named: messageType)
+    }
+
+    func sendWebSocketMessage(
+        direction: WebSocketFrameDirection,
+        payloadEncoding: WebSocketComposePayloadEncoding,
+        payload: String
+    ) async throws {
+        guard let flow = store.selectedFlow, Self.isWebSocket(flow) else {
+            throw ProxyLensError.unsupportedOperation(
+                "Select a WebSocket flow before composing a message"
+            )
+        }
+        guard inspection.webSocket?.canCompose == true, let webSocketComposer else {
+            throw ProxyLensError.unsupportedOperation(
+                "The selected WebSocket connection is no longer open"
+            )
+        }
+        try await webSocketComposer.send(
+            WebSocketComposeRequest(
+                flowID: flow.id,
+                direction: direction,
+                payloadEncoding: payloadEncoding,
+                payload: payload
+            )
+        )
+        refreshWebSocketComposeAvailability(for: flow)
+    }
+
+    func webSocketReconnectDraft() async throws -> TrafficWebSocketReconnectDraft {
+        guard let flow = store.selectedFlow, Self.isWebSocket(flow) else {
+            throw ProxyLensError.unsupportedOperation(
+                "Select a WebSocket flow before reconnecting"
+            )
+        }
+
+        let urlText = Self.webSocketURL(for: flow).absoluteString
+        let headersText = flow.request.headers
+            .map { "\($0.name): \($0.value)" }
+            .joined(separator: "\n")
+        guard let selectedFrameID = inspection.webSocket?.selectedFrameID,
+            let selectedFrame = currentWebSocketReconstructionFrames.first(where: {
+                $0.id == selectedFrameID
+            }),
+            Self.isWebSocketDataFrame(selectedFrame.opcode)
+        else {
+            return TrafficWebSocketReconnectDraft(
+                urlText: urlText,
+                headersText: headersText,
+                payloadEncoding: .text,
+                payload: "",
+                payloadStatusMessage:
+                    "Select a complete text or binary message to prefill a replay payload."
+            )
+        }
+
+        let inputs = try await Self.loadWebSocketMessageInputs(
+            currentWebSocketReconstructionFrames,
+            direction: selectedFrame.direction,
+            reader: bodyReader,
+            maximumByteCount: maximumWebSocketReconstructionBytes
+        )
+        let result = WebSocketMessageDecoder.decode(
+            selectedFrameID: selectedFrameID,
+            frames: inputs,
+            acceptedExtensions: acceptedWebSocketExtensions(),
+            limits: WebSocketMessageDecoder.Limits(
+                maximumFrameCount: currentWebSocketReconstructionFrames.count,
+                maximumInputByteCount: Int(
+                    min(maximumWebSocketReconstructionBytes, Int64(Int.max))
+                ),
+                maximumMessageOutputByteCount: WebSocketComposeService.defaultMaximumPayloadBytes,
+                maximumHistoryOutputByteCount: Int(
+                    min(maximumWebSocketReconstructionBytes, Int64(Int.max))
+                )
+            )
+        )
+        guard case .decoded(let message) = result else {
+            let reason: String
+            if case .unavailable(let unavailableReason) = result {
+                reason = unavailableReason
+            } else {
+                reason = "The selected WebSocket message is unavailable."
+            }
+            return TrafficWebSocketReconnectDraft(
+                urlText: urlText,
+                headersText: headersText,
+                payloadEncoding: .text,
+                payload: "",
+                payloadStatusMessage: reason
+            )
+        }
+
+        switch message.opcode {
+        case .text:
+            guard let payload = String(data: message.payload, encoding: .utf8) else {
+                return TrafficWebSocketReconnectDraft(
+                    urlText: urlText,
+                    headersText: headersText,
+                    payloadEncoding: .text,
+                    payload: "",
+                    payloadStatusMessage: "The selected text message is not valid UTF-8."
+                )
+            }
+            return TrafficWebSocketReconnectDraft(
+                urlText: urlText,
+                headersText: headersText,
+                payloadEncoding: .text,
+                payload: payload,
+                payloadStatusMessage: "Prefilled from the selected complete text message."
+            )
+        case .binary:
+            return TrafficWebSocketReconnectDraft(
+                urlText: urlText,
+                headersText: headersText,
+                payloadEncoding: .base64,
+                payload: message.payload.base64EncodedString(),
+                payloadStatusMessage: "Prefilled from the selected complete binary message."
+            )
+        case .continuation, .close, .ping, .pong, .unknown:
+            return TrafficWebSocketReconnectDraft(
+                urlText: urlText,
+                headersText: headersText,
+                payloadEncoding: .text,
+                payload: "",
+                payloadStatusMessage: "The selected WebSocket message cannot be replayed."
+            )
+        }
+    }
+
+    @discardableResult
+    func reconnectWebSocket(
+        urlText: String,
+        headersText: String,
+        payloadEncoding: WebSocketComposePayloadEncoding,
+        payload: String,
+        replayPayload: Bool
+    ) async throws -> FlowID {
+        guard let originalFlow = store.selectedFlow, Self.isWebSocket(originalFlow) else {
+            throw ProxyLensError.unsupportedOperation(
+                "Select a WebSocket flow before reconnecting"
+            )
+        }
+        guard let webSocketComposer else {
+            throw WebSocketReconnectError.unavailable
+        }
+        guard
+            let url = URL(
+                string: urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        else {
+            throw WebSocketReconnectError.invalidURL
+        }
+        let headers = try Self.parseWebSocketHeaders(headersText)
+        let replay =
+            replayPayload
+            ? WebSocketReplayPayload(encoding: payloadEncoding, payload: payload)
+            : nil
+        let replayedFlow = try await webSocketComposer.reconnect(
+            WebSocketReconnectRequest(url: url, headers: headers, replayPayload: replay),
+            sessionID: originalFlow.sessionID
+        )
+        applyReplayedFlow(replayedFlow)
+        return replayedFlow.id
+    }
+
+    func disconnectSelectedWebSocket() async throws {
+        guard let flow = store.selectedFlow, Self.isWebSocket(flow),
+            flow.source.kind == .replay,
+            inspection.webSocket?.canDisconnect == true,
+            let webSocketComposer
+        else {
+            throw ProxyLensError.unsupportedOperation(
+                "Select a live replay WebSocket before disconnecting"
+            )
+        }
+        await webSocketComposer.disconnect(flowID: flow.id)
+        updateWebSocketComposeAvailability(
+            false,
+            message: "Disconnecting this WebSocket connection…",
+            for: flow.id
+        )
+    }
+
+    private func refreshWebSocketComposeAvailability(for flow: Flow) {
+        guard Self.isWebSocket(flow) else {
+            return
+        }
+        webSocketComposeTask?.cancel()
+        guard !flow.state.isTerminal else {
+            updateWebSocketComposeAvailability(
+                false,
+                message: "This WebSocket connection is closed. Captured frames remain available.",
+                for: flow.id
+            )
+            return
+        }
+        guard let webSocketComposer else {
+            updateWebSocketComposeAvailability(
+                false,
+                message: "WebSocket composition is unavailable.",
+                for: flow.id
+            )
+            return
+        }
+
+        webSocketComposeTask = Task { [weak self] in
+            let isOpen = await webSocketComposer.isConnectionOpen(for: flow.id)
+            guard !Task.isCancelled, self?.store.selectedFlowID == flow.id else {
+                return
+            }
+            self?.updateWebSocketComposeAvailability(
+                isOpen,
+                message: isOpen
+                    ? nil
+                    : "This WebSocket connection is closed. Captured frames remain available.",
+                for: flow.id
+            )
+        }
+    }
+
+    private func updateWebSocketComposeAvailability(
+        _ canCompose: Bool,
+        message: String?,
+        for flowID: FlowID
+    ) {
+        guard let webSocket = inspection.webSocket else {
+            return
+        }
+        replaceWebSocketInspection(
+            TrafficWebSocketInspection(
+                frames: webSocket.frames,
+                capturedFrameCount: webSocket.capturedFrameCount,
+                selectedFrameID: webSocket.selectedFrameID,
+                payload: webSocket.payload,
+                payloadSyntax: webSocket.payloadSyntax,
+                payloadMode: webSocket.payloadMode,
+                canDecodePayloadAsProtobuf: webSocket.canDecodePayloadAsProtobuf,
+                omittedFrameCount: webSocket.omittedFrameCount,
+                statusMessage: webSocket.statusMessage,
+                directionFilter: webSocket.directionFilter,
+                searchText: webSocket.searchText,
+                isSearching: webSocket.isSearching,
+                canCompose: canCompose,
+                canReconnect: !canCompose && webSocketComposer != nil,
+                canDisconnect: canCompose && store.flow(id: flowID)?.source.kind == .replay,
+                composeStatusMessage: message
+            ),
+            for: flowID
+        )
     }
 
     private func refreshWebSocketFrames(for flow: Flow) {
@@ -1547,8 +2425,13 @@ final class TrafficConsoleViewModel: ObservableObject {
         guard inspection.flowID == flowID else {
             return
         }
-        let orderedFrames = Self.orderedUniqueWebSocketFrames(frames + currentWebSocketFrames)
+        let orderedFrames = Self.orderedUniqueWebSocketFrames(
+            frames + currentWebSocketReconstructionFrames
+        )
         omittedWebSocketFrameCount = max(0, orderedFrames.count - maximumVisibleWebSocketFrames)
+        currentWebSocketReconstructionFrames = Array(
+            orderedFrames.suffix(maximumWebSocketReconstructionFrames)
+        )
         currentWebSocketFrames = Array(orderedFrames.suffix(maximumVisibleWebSocketFrames))
         refreshWebSocketFramePresentation(for: flowID)
     }
@@ -1557,10 +2440,20 @@ final class TrafficConsoleViewModel: ObservableObject {
         guard inspection.flowID == frame.flowID, inspection.webSocket != nil else {
             return
         }
-        guard !currentWebSocketFrames.contains(where: { $0.id == frame.id }) else {
+        guard !currentWebSocketReconstructionFrames.contains(where: { $0.id == frame.id }) else {
             return
         }
 
+        currentWebSocketReconstructionFrames.append(frame)
+        currentWebSocketReconstructionFrames = Self.orderedUniqueWebSocketFrames(
+            currentWebSocketReconstructionFrames
+        )
+        if currentWebSocketReconstructionFrames.count > maximumWebSocketReconstructionFrames {
+            currentWebSocketReconstructionFrames.removeFirst(
+                currentWebSocketReconstructionFrames.count
+                    - maximumWebSocketReconstructionFrames
+            )
+        }
         currentWebSocketFrames.append(frame)
         currentWebSocketFrames = Self.orderedUniqueWebSocketFrames(currentWebSocketFrames)
         if currentWebSocketFrames.count > maximumVisibleWebSocketFrames {
@@ -1581,10 +2474,12 @@ final class TrafficConsoleViewModel: ObservableObject {
             return
         }
         let visibleFrames = visibleWebSocketFrames()
+        let preferredSelection = previous.selectedFrameID ?? preferredWebSocketFrameID
         let selectedFrameID =
-            previous.selectedFrameID.flatMap { selectedID in
+            preferredSelection.flatMap { selectedID in
                 visibleFrames.contains(where: { $0.id == selectedID }) ? selectedID : nil
             } ?? visibleFrames.first?.id
+        preferredWebSocketFrameID = selectedFrameID
         let selectionChanged = previous.selectedFrameID != selectedFrameID
         let isSearching = !webSocketSearchText.isEmpty && webSocketSearchMatchIDs == nil
         let payload: TrafficBodyPresentation
@@ -1595,7 +2490,7 @@ final class TrafficConsoleViewModel: ObservableObject {
                     : "No WebSocket frame matches the current filters."
             )
         } else if selectionChanged {
-            payload = .loading("Loading WebSocket frame payload…")
+            payload = .loading("Loading WebSocket payload…")
         } else {
             payload = previous.payload
         }
@@ -1622,29 +2517,98 @@ final class TrafficConsoleViewModel: ObservableObject {
             return
         }
 
+        let acceptedExtensions = acceptedWebSocketExtensions()
+        let messageOpcode = Self.webSocketMessageOpcode(
+            containing: frame.id,
+            frames: currentWebSocketReconstructionFrames,
+            acceptedExtensions: acceptedExtensions
+        )
+        preferredWebSocketFrameID = frame.id
+        webSocketPayloadMode = Self.normalizedWebSocketPayloadMode(
+            webSocketPayloadMode,
+            messageOpcode: messageOpcode
+        )
         webSocketPayloadTask?.cancel()
         replaceWebSocketInspection(
             makeWebSocketInspection(
                 frames: visibleWebSocketFrames(),
                 selectedFrameID: frame.id,
                 payload: .loading(BodyDisplayFormatter.metadata(for: frame.payload)),
-                payloadSyntax: frame.opcode == .binary ? .binary : .plainText,
+                payloadSyntax: Self.loadingWebSocketPayloadSyntax(
+                    mode: webSocketPayloadMode,
+                    messageOpcode: messageOpcode
+                ),
                 isSearching: false
             ),
             for: flowID
         )
 
         let bodyReader = bodyReader
+        let payloadMode = webSocketPayloadMode
+        let protobufDirection: TrafficMessageDirection =
+            frame.direction == .clientToServer ? .request : .response
+        let protobufSchema = protobufMessageSchema(for: protobufDirection)
+        let loadedProtobufCatalog = protobufCatalog
+        let reconstructionFrames = currentWebSocketReconstructionFrames
+        let maximumReconstructionBytes = maximumWebSocketReconstructionBytes
         webSocketPayloadTask = Task { [weak self] in
             do {
-                let data = try await bodyReader.read(frame.payload)
+                let presentation:
+                    (
+                        body: TrafficBodyPresentation,
+                        syntax: TrafficWebSocketPayloadSyntax
+                    )
+                if payloadMode == .hex || !Self.isWebSocketDataFrame(frame.opcode) {
+                    let data = try await bodyReader.read(frame.payload)
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    presentation = await Task.detached(priority: .utility) {
+                        Self.webSocketFramePayloadPresentation(
+                            data,
+                            frame: frame,
+                            mode: payloadMode,
+                            protobufSchema: protobufSchema,
+                            protobufCatalog: loadedProtobufCatalog
+                        )
+                    }.value
+                } else {
+                    let inputs = try await Self.loadWebSocketMessageInputs(
+                        reconstructionFrames,
+                        direction: frame.direction,
+                        reader: bodyReader,
+                        maximumByteCount: maximumReconstructionBytes
+                    )
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    presentation = await Task.detached(priority: .utility) {
+                        let result = WebSocketMessageDecoder.decode(
+                            selectedFrameID: frame.id,
+                            frames: inputs,
+                            acceptedExtensions: acceptedExtensions,
+                            limits: WebSocketMessageDecoder.Limits(
+                                maximumFrameCount: reconstructionFrames.count,
+                                maximumInputByteCount: Int(
+                                    min(maximumReconstructionBytes, Int64(Int.max))
+                                )
+                            )
+                        )
+                        return Self.webSocketMessagePayloadPresentation(
+                            result,
+                            mode: payloadMode,
+                            protobufSchema: protobufSchema,
+                            protobufCatalog: loadedProtobufCatalog
+                        )
+                    }.value
+                }
                 guard !Task.isCancelled,
                     self?.inspection.flowID == flowID,
-                    self?.inspection.webSocket?.selectedFrameID == frame.id
+                    self?.inspection.webSocket?.selectedFrameID == frame.id,
+                    self?.webSocketPayloadMode == payloadMode
                 else {
                     return
                 }
-                let presentation = Self.webSocketPayloadPresentation(data, frame: frame)
                 self?.applyWebSocketPayload(
                     presentation.body,
                     syntax: presentation.syntax,
@@ -1652,20 +2616,51 @@ final class TrafficConsoleViewModel: ObservableObject {
                     flowID: flowID
                 )
             } catch {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled,
+                    self?.inspection.flowID == flowID,
+                    self?.inspection.webSocket?.selectedFrameID == frame.id,
+                    self?.webSocketPayloadMode == payloadMode
+                else {
                     return
                 }
+                let message =
+                    error is WebSocketMessagePayloadLoadingError
+                    ? error.localizedDescription
+                    : "Could not load frame payload: \(error.localizedDescription)"
                 self?.applyWebSocketPayload(
-                    .failed(
-                        metadata: BodyDisplayFormatter.metadata(for: frame.payload),
-                        message: "Could not load frame payload: \(error.localizedDescription)"
-                    ),
+                    error is WebSocketMessagePayloadLoadingError
+                        ? .none(message)
+                        : .failed(
+                            metadata: BodyDisplayFormatter.metadata(for: frame.payload),
+                            message: message
+                        ),
                     syntax: .plainText,
                     frameID: frame.id,
                     flowID: flowID
                 )
             }
         }
+    }
+
+    func setWebSocketPayloadMode(_ mode: TrafficWebSocketPayloadMode) {
+        guard let selectedFrameID = inspection.webSocket?.selectedFrameID,
+            let frame = visibleWebSocketFrames().first(where: { $0.id == selectedFrameID })
+        else {
+            return
+        }
+        let messageOpcode = Self.webSocketMessageOpcode(
+            containing: frame.id,
+            frames: currentWebSocketReconstructionFrames,
+            acceptedExtensions: acceptedWebSocketExtensions()
+        )
+        guard mode != .protobuf || messageOpcode == .binary else {
+            return
+        }
+        guard mode != webSocketPayloadMode else {
+            return
+        }
+        webSocketPayloadMode = mode
+        selectWebSocketFrame(selectedFrameID)
     }
 
     private func applyWebSocketPayload(
@@ -1707,6 +2702,10 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
     }
 
+    private func acceptedWebSocketExtensions() -> [String] {
+        store.selectedFlow?.response?.headers.values(for: "Sec-WebSocket-Extensions") ?? []
+    }
+
     private func makeWebSocketInspection(
         frames: [CapturedWebSocketFrame],
         selectedFrameID: UUID?,
@@ -1720,6 +2719,14 @@ final class TrafficConsoleViewModel: ObservableObject {
             selectedFrameID: selectedFrameID,
             payload: payload,
             payloadSyntax: payloadSyntax,
+            payloadMode: webSocketPayloadMode,
+            canDecodePayloadAsProtobuf: selectedFrameID.flatMap { selectedID in
+                Self.webSocketMessageOpcode(
+                    containing: selectedID,
+                    frames: currentWebSocketReconstructionFrames,
+                    acceptedExtensions: acceptedWebSocketExtensions()
+                )
+            } == .binary,
             omittedFrameCount: omittedWebSocketFrameCount,
             statusMessage: currentWebSocketStatusMessage(
                 visibleCount: frames.count,
@@ -1727,8 +2734,60 @@ final class TrafficConsoleViewModel: ObservableObject {
             ),
             directionFilter: webSocketDirectionFilter,
             searchText: webSocketSearchText,
-            isSearching: isSearching
+            isSearching: isSearching,
+            canCompose: inspection.webSocket?.canCompose ?? false,
+            canReconnect: inspection.webSocket?.canReconnect ?? false,
+            canDisconnect: inspection.webSocket?.canDisconnect ?? false,
+            composeStatusMessage: inspection.webSocket?.composeStatusMessage
         )
+    }
+
+    private static func webSocketURL(for flow: Flow) -> URL {
+        guard
+            var components = URLComponents(
+                url: flow.request.url,
+                resolvingAgainstBaseURL: false
+            )
+        else {
+            return flow.request.url
+        }
+        switch components.scheme?.lowercased() {
+        case "http":
+            components.scheme = "ws"
+        case "https":
+            components.scheme = "wss"
+        default:
+            break
+        }
+        return components.url ?? flow.request.url
+    }
+
+    private static func parseWebSocketHeaders(_ text: String) throws -> HTTPHeaders {
+        guard text.utf8.count <= WebSocketComposeService.defaultMaximumReconnectHeaderBytes else {
+            throw WebSocketReconnectError.headersTooLarge(
+                maximumBytes: WebSocketComposeService.defaultMaximumReconnectHeaderBytes
+            )
+        }
+        let lines =
+            text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+        var headers = HTTPHeaders()
+        for rawLine in lines {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else {
+                continue
+            }
+            guard let separator = line.firstIndex(of: ":") else {
+                throw ProxyLensError.invalidHTTPMessage("Invalid header line: \(line)")
+            }
+            let name = String(line[..<separator]).trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: separator)...])
+                .trimmingCharacters(in: .whitespaces)
+            try headers.append(name: name, value: value)
+        }
+        return headers
     }
 
     private func replaceWebSocketInspection(
@@ -1748,7 +2807,8 @@ final class TrafficConsoleViewModel: ObservableObject {
             timing: inspection.timing,
             breakpoint: inspection.breakpoint,
             annotation: inspection.annotation,
-            webSocket: webSocket
+            webSocket: webSocket,
+            serverSentEvents: inspection.serverSentEvents
         )
         publishSnapshot()
     }
@@ -1868,11 +2928,67 @@ final class TrafficConsoleViewModel: ObservableObject {
             "Showing the latest \(visibleCount) frames; \(omittedCount) earlier frames are hidden."
     }
 
-    nonisolated private static func webSocketPayloadPresentation(
+    nonisolated private static func loadWebSocketMessageInputs(
+        _ frames: [CapturedWebSocketFrame],
+        direction: WebSocketFrameDirection,
+        reader: any TrafficBodyReading,
+        maximumByteCount: Int64
+    ) async throws -> [WebSocketMessageFrameInput] {
+        var remainingByteCount = maximumByteCount
+        var inputs: [WebSocketMessageFrameInput] = []
+        inputs.reserveCapacity(frames.count)
+
+        for frame in frames where frame.direction == direction {
+            guard !Task.isCancelled else {
+                return []
+            }
+            guard frame.payload.byteCount <= remainingByteCount else {
+                throw WebSocketMessagePayloadLoadingError.exceedsInputLimit
+            }
+            let data = try await reader.read(frame.payload)
+            guard Int64(data.count) <= remainingByteCount else {
+                throw WebSocketMessagePayloadLoadingError.exceedsInputLimit
+            }
+            remainingByteCount -= Int64(data.count)
+            inputs.append(
+                WebSocketMessageFrameInput(
+                    id: frame.id,
+                    sequenceNumber: frame.sequenceNumber,
+                    direction: frame.direction,
+                    opcode: frame.opcode,
+                    isFinal: frame.isFinal,
+                    reservedBits: frame.reservedBits,
+                    payload: data,
+                    isPayloadTruncated: frame.payload.isTruncated
+                )
+            )
+        }
+        return inputs
+    }
+
+    nonisolated private static func webSocketFramePayloadPresentation(
         _ data: Data,
-        frame: CapturedWebSocketFrame
+        frame: CapturedWebSocketFrame,
+        mode: TrafficWebSocketPayloadMode,
+        protobufSchema: ProtobufMessageSchema?,
+        protobufCatalog: ProtobufSchemaCatalog?
     ) -> (body: TrafficBodyPresentation, syntax: TrafficWebSocketPayloadSyntax) {
         let metadata = BodyDisplayFormatter.metadata(for: frame.payload)
+        switch mode {
+        case .protobuf:
+            return webSocketFramePayloadPresentation(
+                data,
+                frame: frame,
+                mode: .automatic,
+                protobufSchema: protobufSchema,
+                protobufCatalog: protobufCatalog
+            )
+        case .hex:
+            return (.content(metadata: metadata, value: HexBodyView.render(data)), .binary)
+        case .automatic:
+            break
+        }
+
         if frame.opcode == .text {
             switch JSONBodyView.render(
                 data: data,
@@ -1901,6 +3017,202 @@ final class TrafficConsoleViewModel: ObservableObject {
         )
     }
 
+    nonisolated private static func webSocketMessagePayloadPresentation(
+        _ result: WebSocketMessageDecodingResult,
+        mode: TrafficWebSocketPayloadMode,
+        protobufSchema: ProtobufMessageSchema?,
+        protobufCatalog: ProtobufSchemaCatalog?
+    ) -> (body: TrafficBodyPresentation, syntax: TrafficWebSocketPayloadSyntax) {
+        guard case .decoded(let message) = result else {
+            if case .unavailable(let reason) = result {
+                return (.none(reason), mode == .protobuf ? .protobuf : .plainText)
+            }
+            return (.none("The WebSocket message is unavailable."), .plainText)
+        }
+
+        let reference = BodyReference(inline: message.payload)
+        let metadata = webSocketMessageMetadata(message, reference: reference)
+        switch mode {
+        case .protobuf:
+            guard message.opcode == .binary else {
+                return webSocketMessagePayloadPresentation(
+                    result,
+                    mode: .automatic,
+                    protobufSchema: protobufSchema,
+                    protobufCatalog: protobufCatalog
+                )
+            }
+            switch ProtobufBodyView.renderMessage(
+                data: message.payload,
+                isTruncated: false,
+                schema: protobufSchema,
+                catalog: protobufCatalog
+            ) {
+            case .decoded(let text):
+                return (.content(metadata: metadata, value: text), .protobuf)
+            case .unavailable(let reason):
+                return (.none(reason), .protobuf)
+            }
+        case .hex:
+            return (
+                .content(metadata: metadata, value: HexBodyView.render(message.payload)), .binary
+            )
+        case .automatic:
+            break
+        }
+
+        if message.opcode == .text {
+            switch JSONBodyView.render(
+                data: message.payload,
+                contentType: nil,
+                contentEncoding: nil,
+                isTruncated: false
+            ) {
+            case .prettyPrinted(let value):
+                return (.content(metadata: metadata, value: value), .json)
+            case .unavailable:
+                return (
+                    .content(
+                        metadata: metadata,
+                        value: BodyDisplayFormatter.render(
+                            message.payload,
+                            reference: reference
+                        )
+                    ),
+                    .plainText
+                )
+            }
+        }
+        return (
+            .content(
+                metadata: metadata,
+                value: BodyDisplayFormatter.render(message.payload, reference: reference)
+            ),
+            .binary
+        )
+    }
+
+    nonisolated private static func webSocketMessageMetadata(
+        _ message: DecodedWebSocketMessage,
+        reference: BodyReference
+    ) -> String {
+        let frameDescription =
+            message.frameIDs.count == 1
+            ? "1 frame (#\(message.firstSequenceNumber))"
+            : "\(message.frameIDs.count) frames (#\(message.firstSequenceNumber)–#\(message.lastSequenceNumber))"
+        var components = [BodyDisplayFormatter.metadata(for: reference), frameDescription]
+        if message.isCompressed {
+            components.append("permessage-deflate")
+            components.append("\(message.wirePayloadByteCount) B on wire")
+        }
+        return components.joined(separator: " • ")
+    }
+
+    nonisolated private static func normalizedWebSocketPayloadMode(
+        _ mode: TrafficWebSocketPayloadMode,
+        messageOpcode: WebSocketFrameOpcode?
+    ) -> TrafficWebSocketPayloadMode {
+        if mode == .protobuf, messageOpcode != .binary {
+            return .automatic
+        }
+        return mode
+    }
+
+    nonisolated private static func loadingWebSocketPayloadSyntax(
+        mode: TrafficWebSocketPayloadMode,
+        messageOpcode: WebSocketFrameOpcode?
+    ) -> TrafficWebSocketPayloadSyntax {
+        switch mode {
+        case .protobuf:
+            .protobuf
+        case .hex:
+            .binary
+        case .automatic:
+            messageOpcode == .binary ? .binary : .plainText
+        }
+    }
+
+    nonisolated private static func webSocketMessageOpcode(
+        containing selectedFrameID: UUID,
+        frames: [CapturedWebSocketFrame],
+        acceptedExtensions: [String]
+    ) -> WebSocketFrameOpcode? {
+        guard let selected = frames.first(where: { $0.id == selectedFrameID }),
+            isWebSocketDataFrame(selected.opcode)
+        else {
+            return nil
+        }
+        let compressionConfiguration: WebSocketPerMessageDeflateConfiguration?
+        do {
+            compressionConfiguration = try WebSocketPerMessageDeflateConfiguration.parse(
+                acceptedExtensions: acceptedExtensions
+            )
+        } catch {
+            return nil
+        }
+
+        var seen: Set<UUID> = []
+        let orderedFrames =
+            frames
+            .filter { $0.direction == selected.direction && seen.insert($0.id).inserted }
+            .sorted {
+                if $0.sequenceNumber == $1.sequenceNumber {
+                    return $0.id.uuidString < $1.id.uuidString
+                }
+                return $0.sequenceNumber < $1.sequenceNumber
+            }
+        var messageOpcode: WebSocketFrameOpcode?
+        var containsSelection = false
+        for frame in orderedFrames {
+            switch frame.opcode {
+            case .close, .ping, .pong:
+                guard frame.isFinal,
+                    frame.reservedBits.isEmpty,
+                    frame.payloadByteCount <= 125
+                else {
+                    return nil
+                }
+                continue
+            case .unknown:
+                return nil
+            case .text, .binary:
+                guard messageOpcode == nil,
+                    frame.reservedBits.intersection([.rsv2, .rsv3]).isEmpty,
+                    !frame.reservedBits.contains(.rsv1) || compressionConfiguration != nil
+                else {
+                    return nil
+                }
+                messageOpcode = frame.opcode
+                containsSelection = frame.id == selectedFrameID
+            case .continuation:
+                guard messageOpcode != nil, frame.reservedBits.isEmpty else {
+                    return nil
+                }
+                containsSelection = containsSelection || frame.id == selectedFrameID
+            }
+
+            if frame.isFinal, let completedOpcode = messageOpcode {
+                if containsSelection {
+                    return completedOpcode
+                }
+                messageOpcode = nil
+                containsSelection = false
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func isWebSocketDataFrame(
+        _ opcode: WebSocketFrameOpcode
+    ) -> Bool {
+        switch opcode {
+        case .continuation, .text, .binary:
+            true
+        case .close, .ping, .pong, .unknown:
+            false
+        }
+    }
+
     private static func isWebSocket(_ flow: Flow) -> Bool {
         switch flow.connection?.protocolKind {
         case .webSocket, .secureWebSocket:
@@ -1910,22 +3222,638 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
     }
 
+    private func refreshServerSentEvents(for flow: Flow) {
+        guard Self.isServerSentEventStream(flow) else {
+            return
+        }
+        guard let serverSentEventLoader else {
+            replaceServerSentEventInspection(
+                TrafficServerSentEventInspection(
+                    events: [],
+                    selectedEventID: nil,
+                    payload: .none("Select a Server-Sent Event to inspect its data."),
+                    payloadSyntax: .plainText,
+                    omittedEventCount: 0,
+                    statusMessage: "Server-Sent Event storage is unavailable."
+                ),
+                for: flow.id
+            )
+            return
+        }
+
+        serverSentEventTask = Task { [weak self] in
+            do {
+                let events = try await serverSentEventLoader.listServerSentEvents(for: flow.id)
+                guard !Task.isCancelled, self?.store.selectedFlowID == flow.id else {
+                    return
+                }
+                self?.applyLoadedServerSentEvents(events, to: flow.id)
+            } catch {
+                guard !Task.isCancelled, self?.store.selectedFlowID == flow.id else {
+                    return
+                }
+                self?.replaceServerSentEventInspection(
+                    TrafficServerSentEventInspection(
+                        events: [],
+                        selectedEventID: nil,
+                        payload: .none("Select a Server-Sent Event to inspect its data."),
+                        payloadSyntax: .plainText,
+                        omittedEventCount: 0,
+                        statusMessage:
+                            "Could not load Server-Sent Events: \(error.localizedDescription)"
+                    ),
+                    for: flow.id
+                )
+            }
+        }
+    }
+
+    func setServerSentEventSearchText(_ text: String) {
+        guard let flowID = inspection.flowID, inspection.serverSentEvents != nil else {
+            return
+        }
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query != serverSentEventSearchText || serverSentEventSearchMatchIDs == nil else {
+            return
+        }
+        serverSentEventSearchTask?.cancel()
+        serverSentEventSearchText = query
+        serverSentEventSearchMatchIDs = query.isEmpty ? nil : []
+        skippedLargeServerSentEventSearchPayloadCount = 0
+        if query.isEmpty {
+            refreshServerSentEventPresentation(for: flowID)
+        } else {
+            beginServerSentEventSearch(query, flowID: flowID)
+        }
+    }
+
+    private func beginServerSentEventSearch(_ query: String, flowID: FlowID) {
+        serverSentEventSearchTask?.cancel()
+        serverSentEventSearchMatchIDs = nil
+        skippedLargeServerSentEventSearchPayloadCount = 0
+        refreshServerSentEventPresentation(for: flowID)
+
+        let events = currentServerSentEvents
+        let bodyReader = bodyReader
+        let maximumBytes = maximumServerSentEventSearchBytes
+        let maximumBytesPerEvent = maximumServerSentEventSearchBytesPerEvent
+        serverSentEventSearchTask = Task { [weak self] in
+            let result = await Self.searchServerSentEvents(
+                events,
+                query: query,
+                reader: bodyReader,
+                maximumBytes: maximumBytes,
+                maximumBytesPerEvent: maximumBytesPerEvent
+            )
+            guard !Task.isCancelled,
+                self?.inspection.flowID == flowID,
+                self?.serverSentEventSearchText == query
+            else {
+                return
+            }
+            self?.serverSentEventSearchMatchIDs = result.matchIDs
+            self?.skippedLargeServerSentEventSearchPayloadCount = result.skippedLargePayloadCount
+            self?.refreshServerSentEventPresentation(for: flowID)
+        }
+    }
+
+    private func applyLoadedServerSentEvents(
+        _ events: [CapturedServerSentEvent],
+        to flowID: FlowID
+    ) {
+        guard inspection.flowID == flowID else {
+            return
+        }
+        let orderedEvents = Self.orderedUniqueServerSentEvents(
+            events + currentServerSentEvents
+        )
+        omittedServerSentEventCount = max(
+            0,
+            orderedEvents.count - maximumVisibleServerSentEvents
+        )
+        currentServerSentEvents = Array(orderedEvents.suffix(maximumVisibleServerSentEvents))
+        refreshServerSentEventPresentation(for: flowID)
+        beginServerSentEventAccumulation(for: flowID)
+    }
+
+    private func beginServerSentEventAccumulation(for flowID: FlowID) {
+        guard inspection.flowID == flowID, inspection.serverSentEvents != nil else {
+            return
+        }
+        serverSentEventAccumulationTask?.cancel()
+        let events = currentServerSentEvents
+        let expectedEventIDs = events.map(\.id)
+        let bodyReader = bodyReader
+        let maximumInputBytes = maximumServerSentEventAccumulationBytes
+        let maximumInputBytesPerEvent = maximumServerSentEventAccumulationBytesPerEvent
+        let maximumOutputBytes = maximumServerSentEventAccumulatedOutputBytes
+        let omittedEventCount = omittedServerSentEventCount
+
+        guard !events.isEmpty else {
+            applyServerSentEventAccumulation(
+                .none("No supported streaming text deltas were found."),
+                flowID: flowID,
+                expectedEventIDs: expectedEventIDs
+            )
+            return
+        }
+
+        serverSentEventAccumulationTask = Task { [weak self] in
+            let preview = await Self.accumulateServerSentEventText(
+                events,
+                reader: bodyReader,
+                maximumInputBytes: maximumInputBytes,
+                maximumInputBytesPerEvent: maximumInputBytesPerEvent,
+                maximumOutputBytes: maximumOutputBytes
+            )
+            guard !Task.isCancelled else {
+                return
+            }
+            let presentation = Self.serverSentEventAccumulationPresentation(
+                preview,
+                visibleEventCount: events.count,
+                omittedEventCount: omittedEventCount
+            )
+            self?.applyServerSentEventAccumulation(
+                presentation,
+                flowID: flowID,
+                expectedEventIDs: expectedEventIDs
+            )
+        }
+    }
+
+    private func applyServerSentEventAccumulation(
+        _ accumulated: TrafficBodyPresentation,
+        flowID: FlowID,
+        expectedEventIDs: [UUID]
+    ) {
+        guard inspection.flowID == flowID,
+            let serverSentEvents = inspection.serverSentEvents,
+            currentServerSentEvents.map(\.id) == expectedEventIDs
+        else {
+            return
+        }
+        replaceServerSentEventInspection(
+            makeServerSentEventInspection(
+                events: visibleServerSentEvents(),
+                selectedEventID: serverSentEvents.selectedEventID,
+                payload: serverSentEvents.payload,
+                payloadSyntax: serverSentEvents.payloadSyntax,
+                isSearching: serverSentEvents.isSearching,
+                accumulated: accumulated
+            ),
+            for: flowID
+        )
+    }
+
+    private func receiveServerSentEvent(_ event: CapturedServerSentEvent) {
+        guard inspection.flowID == event.flowID, inspection.serverSentEvents != nil else {
+            return
+        }
+        guard !currentServerSentEvents.contains(where: { $0.id == event.id }) else {
+            return
+        }
+
+        currentServerSentEvents.append(event)
+        currentServerSentEvents = Self.orderedUniqueServerSentEvents(currentServerSentEvents)
+        if currentServerSentEvents.count > maximumVisibleServerSentEvents {
+            let overflow = currentServerSentEvents.count - maximumVisibleServerSentEvents
+            currentServerSentEvents.removeFirst(overflow)
+            omittedServerSentEventCount += overflow
+        }
+
+        if serverSentEventSearchText.isEmpty {
+            refreshServerSentEventPresentation(for: event.flowID)
+        } else {
+            beginServerSentEventSearch(serverSentEventSearchText, flowID: event.flowID)
+        }
+        beginServerSentEventAccumulation(for: event.flowID)
+    }
+
+    private func refreshServerSentEventPresentation(for flowID: FlowID) {
+        guard inspection.flowID == flowID, let previous = inspection.serverSentEvents else {
+            return
+        }
+        let visibleEvents = visibleServerSentEvents()
+        let selectedEventID =
+            previous.selectedEventID.flatMap { selectedID in
+                visibleEvents.contains(where: { $0.id == selectedID }) ? selectedID : nil
+            } ?? visibleEvents.first?.id
+        let selectionChanged = previous.selectedEventID != selectedEventID
+        let isSearching =
+            !serverSentEventSearchText.isEmpty && serverSentEventSearchMatchIDs == nil
+        let payload: TrafficBodyPresentation
+        if selectedEventID == nil {
+            payload = .none(
+                isSearching
+                    ? "Searching captured Server-Sent Event data…"
+                    : "No Server-Sent Event matches the current search."
+            )
+        } else if selectionChanged {
+            payload = .loading("Loading Server-Sent Event data…")
+        } else {
+            payload = previous.payload
+        }
+        replaceServerSentEventInspection(
+            makeServerSentEventInspection(
+                events: visibleEvents,
+                selectedEventID: selectedEventID,
+                payload: payload,
+                payloadSyntax: selectionChanged ? .plainText : previous.payloadSyntax,
+                isSearching: isSearching
+            ),
+            for: flowID
+        )
+        if selectionChanged, let selectedEventID {
+            selectServerSentEvent(selectedEventID)
+        }
+    }
+
+    func selectServerSentEvent(_ eventID: UUID) {
+        guard let flowID = inspection.flowID,
+            inspection.serverSentEvents != nil,
+            let event = visibleServerSentEvents().first(where: { $0.id == eventID })
+        else {
+            return
+        }
+
+        serverSentEventPayloadTask?.cancel()
+        replaceServerSentEventInspection(
+            makeServerSentEventInspection(
+                events: visibleServerSentEvents(),
+                selectedEventID: event.id,
+                payload: .loading(BodyDisplayFormatter.metadata(for: event.data)),
+                payloadSyntax: .plainText,
+                isSearching: false
+            ),
+            for: flowID
+        )
+
+        let bodyReader = bodyReader
+        serverSentEventPayloadTask = Task { [weak self] in
+            do {
+                let data = try await bodyReader.read(event.data)
+                guard !Task.isCancelled,
+                    self?.inspection.flowID == flowID,
+                    self?.inspection.serverSentEvents?.selectedEventID == event.id
+                else {
+                    return
+                }
+                let presentation = Self.serverSentEventPayloadPresentation(data, event: event)
+                self?.applyServerSentEventPayload(
+                    presentation.body,
+                    syntax: presentation.syntax,
+                    eventID: event.id,
+                    flowID: flowID
+                )
+            } catch {
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.applyServerSentEventPayload(
+                    .failed(
+                        metadata: BodyDisplayFormatter.metadata(for: event.data),
+                        message: "Could not load event data: \(error.localizedDescription)"
+                    ),
+                    syntax: .plainText,
+                    eventID: event.id,
+                    flowID: flowID
+                )
+            }
+        }
+    }
+
+    private func applyServerSentEventPayload(
+        _ payload: TrafficBodyPresentation,
+        syntax: TrafficServerSentEventPayloadSyntax,
+        eventID: UUID,
+        flowID: FlowID
+    ) {
+        guard inspection.flowID == flowID,
+            let serverSentEvents = inspection.serverSentEvents,
+            serverSentEvents.selectedEventID == eventID
+        else {
+            return
+        }
+        replaceServerSentEventInspection(
+            makeServerSentEventInspection(
+                events: visibleServerSentEvents(),
+                selectedEventID: eventID,
+                payload: payload,
+                payloadSyntax: syntax,
+                isSearching: serverSentEvents.isSearching
+            ),
+            for: flowID
+        )
+    }
+
+    private func visibleServerSentEvents() -> [CapturedServerSentEvent] {
+        currentServerSentEvents.filter { event in
+            guard !serverSentEventSearchText.isEmpty else {
+                return true
+            }
+            guard let serverSentEventSearchMatchIDs else {
+                return true
+            }
+            return serverSentEventSearchMatchIDs.contains(event.id)
+        }
+    }
+
+    private func makeServerSentEventInspection(
+        events: [CapturedServerSentEvent],
+        selectedEventID: UUID?,
+        payload: TrafficBodyPresentation,
+        payloadSyntax: TrafficServerSentEventPayloadSyntax,
+        isSearching: Bool,
+        accumulated: TrafficBodyPresentation? = nil
+    ) -> TrafficServerSentEventInspection {
+        TrafficServerSentEventInspection(
+            events: events.map(TrafficServerSentEventRow.init),
+            capturedEventCount: currentServerSentEvents.count,
+            selectedEventID: selectedEventID,
+            payload: payload,
+            payloadSyntax: payloadSyntax,
+            accumulated: accumulated
+                ?? inspection.serverSentEvents?.accumulated
+                ?? .loading("Building accumulated streaming response preview…"),
+            omittedEventCount: omittedServerSentEventCount,
+            statusMessage: currentServerSentEventStatusMessage(
+                visibleCount: events.count,
+                isSearching: isSearching
+            ),
+            searchText: serverSentEventSearchText,
+            isSearching: isSearching
+        )
+    }
+
+    private func replaceServerSentEventInspection(
+        _ serverSentEvents: TrafficServerSentEventInspection,
+        for flowID: FlowID
+    ) {
+        guard inspection.flowID == flowID else {
+            return
+        }
+        inspection = TrafficFlowInspection(
+            flowID: inspection.flowID,
+            title: inspection.title,
+            summary: inspection.summary,
+            request: inspection.request,
+            response: inspection.response,
+            rules: inspection.rules,
+            timing: inspection.timing,
+            breakpoint: inspection.breakpoint,
+            annotation: inspection.annotation,
+            webSocket: inspection.webSocket,
+            serverSentEvents: serverSentEvents
+        )
+        publishSnapshot()
+    }
+
+    private static func orderedUniqueServerSentEvents(
+        _ events: [CapturedServerSentEvent]
+    ) -> [CapturedServerSentEvent] {
+        var seen: Set<UUID> = []
+        return
+            events
+            .filter { seen.insert($0.id).inserted }
+            .sorted {
+                if $0.sequenceNumber != $1.sequenceNumber {
+                    return $0.sequenceNumber < $1.sequenceNumber
+                }
+                return $0.receivedAt < $1.receivedAt
+            }
+    }
+
+    nonisolated private static func accumulateServerSentEventText(
+        _ events: [CapturedServerSentEvent],
+        reader: any TrafficBodyReading,
+        maximumInputBytes: Int64,
+        maximumInputBytesPerEvent: Int64,
+        maximumOutputBytes: Int
+    ) async -> ServerSentEventAccumulatedPreview {
+        var accumulator = ServerSentEventTextAccumulator(
+            maximumOutputBytes: maximumOutputBytes,
+            maximumEventDataBytes: Int(clamping: maximumInputBytesPerEvent)
+        )
+        var remainingInputBytes = maximumInputBytes
+        for event in events {
+            guard !Task.isCancelled else {
+                break
+            }
+            guard event.dataByteCount <= maximumInputBytesPerEvent,
+                event.dataByteCount <= remainingInputBytes
+            else {
+                accumulator.skipOversizedEvent()
+                continue
+            }
+            do {
+                let data = try await reader.read(event.data)
+                guard Int64(data.count) <= maximumInputBytesPerEvent,
+                    Int64(data.count) <= remainingInputBytes
+                else {
+                    accumulator.skipOversizedEvent()
+                    continue
+                }
+                remainingInputBytes -= Int64(data.count)
+                accumulator.consume(eventType: event.eventType, data: data)
+                if event.isDataTruncated {
+                    accumulator.markSourceTruncated()
+                }
+            } catch {
+                accumulator.ignoreEvent()
+            }
+        }
+        return accumulator.preview
+    }
+
+    nonisolated private static func serverSentEventAccumulationPresentation(
+        _ preview: ServerSentEventAccumulatedPreview,
+        visibleEventCount: Int,
+        omittedEventCount: Int
+    ) -> TrafficBodyPresentation {
+        var metadata = [
+            countDescription(preview.contributingEventCount, singular: "text delta"),
+            countDescription(preview.terminalEventCount, singular: "terminal marker")
+        ]
+        if preview.ignoredEventCount > 0 {
+            metadata.append(
+                countDescription(preview.ignoredEventCount, singular: "ignored event")
+            )
+        }
+        if preview.skippedOversizedEventCount > 0 {
+            let skippedCount = preview.skippedOversizedEventCount
+            metadata.append(
+                skippedCount == 1
+                    ? "1 event skipped by safety limits"
+                    : "\(skippedCount) events skipped by safety limits"
+            )
+        }
+        if omittedEventCount > 0 {
+            metadata.append(
+                "Derived from the latest \(visibleEventCount) events; \(omittedEventCount) earlier omitted"
+            )
+        }
+        if preview.isTruncated {
+            metadata.append("Preview truncated")
+        }
+        let metadataText = metadata.joined(separator: " • ")
+        guard !preview.text.isEmpty else {
+            return .none(
+                "No supported OpenAI streaming text deltas were found. \(metadataText)."
+            )
+        }
+        return .content(metadata: metadataText, value: preview.text)
+    }
+
+    nonisolated private static func countDescription(
+        _ count: Int,
+        singular: String
+    ) -> String {
+        count == 1 ? "1 \(singular)" : "\(count) \(singular)s"
+    }
+
+    nonisolated private static func searchServerSentEvents(
+        _ events: [CapturedServerSentEvent],
+        query: String,
+        reader: any TrafficBodyReading,
+        maximumBytes: Int64,
+        maximumBytesPerEvent: Int64
+    ) async -> (matchIDs: Set<UUID>, skippedLargePayloadCount: Int) {
+        var matchIDs: Set<UUID> = []
+        var remainingBytes = maximumBytes
+        var skippedLargePayloadCount = 0
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+
+        for event in events {
+            guard !Task.isCancelled else {
+                break
+            }
+            let metadata = [
+                String(event.sequenceNumber),
+                event.eventType,
+                event.eventID ?? "",
+                event.retryMilliseconds.map(String.init) ?? ""
+            ].joined(separator: " ")
+            if metadata.range(of: query, options: options) != nil {
+                matchIDs.insert(event.id)
+                continue
+            }
+            guard event.dataByteCount <= maximumBytesPerEvent,
+                event.dataByteCount <= remainingBytes
+            else {
+                skippedLargePayloadCount += 1
+                continue
+            }
+            do {
+                let data = try await reader.read(event.data)
+                remainingBytes = max(0, remainingBytes - Int64(data.count))
+                if let text = String(data: data, encoding: .utf8),
+                    text.range(of: query, options: options) != nil
+                {
+                    matchIDs.insert(event.id)
+                }
+            } catch {
+                continue
+            }
+        }
+        return (matchIDs, skippedLargePayloadCount)
+    }
+
+    private func currentServerSentEventStatusMessage(
+        visibleCount: Int,
+        isSearching: Bool
+    ) -> String? {
+        if isSearching {
+            return "Searching \(currentServerSentEvents.count) captured Server-Sent Events…"
+        }
+        if !serverSentEventSearchText.isEmpty {
+            var message =
+                "\(visibleCount) of \(currentServerSentEvents.count) captured events match."
+            if skippedLargeServerSentEventSearchPayloadCount == 1 {
+                message += " 1 large event data payload skipped."
+            } else if skippedLargeServerSentEventSearchPayloadCount > 1 {
+                message +=
+                    " \(skippedLargeServerSentEventSearchPayloadCount) large event data payloads skipped."
+            }
+            if omittedServerSentEventCount == 1 {
+                message += " 1 earlier event is outside the visible history."
+            } else if omittedServerSentEventCount > 1 {
+                message +=
+                    " \(omittedServerSentEventCount) earlier events are outside the visible history."
+            }
+            return message
+        }
+        if visibleCount == 0 {
+            return "No Server-Sent Events were captured."
+        }
+        guard omittedServerSentEventCount > 0 else {
+            return nil
+        }
+        if omittedServerSentEventCount == 1 {
+            return "Showing the latest \(visibleCount) events; 1 earlier event is hidden."
+        }
+        return
+            "Showing the latest \(visibleCount) events; \(omittedServerSentEventCount) earlier events are hidden."
+    }
+
+    nonisolated private static func serverSentEventPayloadPresentation(
+        _ data: Data,
+        event: CapturedServerSentEvent
+    ) -> (body: TrafficBodyPresentation, syntax: TrafficServerSentEventPayloadSyntax) {
+        let metadata = BodyDisplayFormatter.metadata(for: event.data)
+        switch JSONBodyView.render(
+            data: data,
+            contentType: event.data.contentType,
+            contentEncoding: event.data.contentEncoding,
+            isTruncated: event.data.isTruncated
+        ) {
+        case .prettyPrinted(let value):
+            return (.content(metadata: metadata, value: value), .json)
+        case .unavailable:
+            return (
+                .content(
+                    metadata: metadata,
+                    value: BodyDisplayFormatter.render(data, reference: event.data)
+                ),
+                .plainText
+            )
+        }
+    }
+
+    private static func isServerSentEventStream(_ flow: Flow) -> Bool {
+        guard let contentType = flow.response?.headers.firstValue(for: "Content-Type") else {
+            return false
+        }
+        return
+            contentType
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "text/event-stream"
+    }
+
     private func applyLoadedBodies(
         request: (
             body: TrafficBodyPresentation,
+            image: TrafficImagePresentation,
+            hex: TrafficBodyPresentation,
             json: TrafficBodyPresentation,
             jsonTree: TrafficJSONTreePresentation,
             xml: TrafficBodyPresentation,
             form: TrafficBodyPresentation,
-            graphql: TrafficBodyPresentation
+            graphql: TrafficBodyPresentation,
+            protobuf: TrafficBodyPresentation
         ),
         response: (
             body: TrafficBodyPresentation,
+            image: TrafficImagePresentation,
+            hex: TrafficBodyPresentation,
             json: TrafficBodyPresentation,
             jsonTree: TrafficJSONTreePresentation,
             xml: TrafficBodyPresentation,
             form: TrafficBodyPresentation,
-            graphql: TrafficBodyPresentation
+            graphql: TrafficBodyPresentation,
+            protobuf: TrafficBodyPresentation
         ),
         to flowID: FlowID
     ) {
@@ -1943,11 +3871,15 @@ final class TrafficConsoleViewModel: ObservableObject {
                     query: $0.query,
                     cookies: $0.cookies,
                     body: request.body,
+                    image: request.image,
+                    hex: request.hex,
                     json: request.json,
                     jsonTree: request.jsonTree,
                     xml: request.xml,
                     form: request.form,
                     graphql: request.graphql,
+                    protobuf: request.protobuf,
+                    protobufSchema: $0.protobufSchema,
                     bodyContentType: $0.bodyContentType
                 )
             },
@@ -1958,25 +3890,40 @@ final class TrafficConsoleViewModel: ObservableObject {
                     query: $0.query,
                     cookies: $0.cookies,
                     body: response.body,
+                    image: response.image,
+                    hex: response.hex,
                     json: response.json,
                     jsonTree: response.jsonTree,
                     xml: response.xml,
                     form: response.form,
                     graphql: response.graphql,
+                    protobuf: response.protobuf,
+                    protobufSchema: $0.protobufSchema,
                     bodyContentType: $0.bodyContentType
                 )
             },
             rules: inspection.rules,
             timing: inspection.timing,
             breakpoint: inspection.breakpoint.map { breakpoint in
-                let body = breakpoint.phase == .response ? response.body : request.body
+                let body: TrafficBodyPresentation
+                switch breakpoint.phase {
+                case .request:
+                    body = request.body
+                case .response:
+                    body = response.body
+                case .webSocketResponse:
+                    body = .none("WebSocket frame payloads are edited in the Frames inspector.")
+                }
                 return TrafficBreakpointInspection(
                     phase: breakpoint.phase,
-                    canEditBody: Self.bodyIsEditable(body)
+                    canEditBody: breakpoint.phase != .webSocketResponse
+                        && Self.bodyIsEditable(body),
+                    webSocketFrame: breakpoint.webSocketFrame
                 )
             },
             annotation: inspection.annotation,
-            webSocket: inspection.webSocket
+            webSocket: inspection.webSocket,
+            serverSentEvents: inspection.serverSentEvents
         )
         publishSnapshot()
     }
@@ -1990,7 +3937,105 @@ final class TrafficConsoleViewModel: ObservableObject {
         )
     }
 
-    private static func initialInspection(for flow: Flow) -> TrafficFlowInspection {
+    private func refreshBreakpointPresentation(for flow: Flow) {
+        guard flow.state.breakpointPhase == .webSocketResponse,
+            let breakpointCoordinator
+        else {
+            return
+        }
+
+        breakpointPresentationTask = Task { [weak self] in
+            for _ in 0..<100 {
+                guard !Task.isCancelled, self?.store.selectedFlowID == flow.id else {
+                    return
+                }
+                if let hit = await breakpointCoordinator.hit(for: flow.id),
+                    let frame = hit.webSocketFrame
+                {
+                    self?.replaceBreakpointInspection(
+                        Self.webSocketBreakpointInspection(frame),
+                        for: flow.id
+                    )
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+    }
+
+    private static func webSocketBreakpointInspection(
+        _ frame: WebSocketBreakpointFrame
+    ) -> TrafficWebSocketBreakpointInspection {
+        let payload: String
+        let syntax: TrafficWebSocketPayloadSyntax
+        if let data = frame.payload,
+            frame.opcode == .text,
+            let text = String(data: data, encoding: .utf8)
+        {
+            payload = text
+            syntax = isJSON(data) ? .json : .plainText
+        } else if let data = frame.payload {
+            payload = HexBodyView.render(data)
+            syntax = .binary
+        } else {
+            payload = "The frame payload is unavailable because it exceeded the capture limit."
+            syntax = .plainText
+        }
+
+        let pausedMessage =
+            "Paused before forwarding server frame #\(frame.sequenceNumber) (\(frame.originalPayloadByteCount) B)."
+        let statusMessage =
+            frame.editingUnavailableReason.map {
+                "\(pausedMessage) \($0)."
+            } ?? "\(pausedMessage) Edit the payload, then Continue or Abort."
+        return TrafficWebSocketBreakpointInspection(
+            sequenceNumber: frame.sequenceNumber,
+            opcode: frame.opcode,
+            payload: payload,
+            syntax: syntax,
+            canEditPayload: frame.canEditPayload,
+            statusMessage: statusMessage
+        )
+    }
+
+    private static func isJSON(_ data: Data) -> Bool {
+        (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) != nil
+    }
+
+    private func replaceBreakpointInspection(
+        _ webSocketFrame: TrafficWebSocketBreakpointInspection,
+        for flowID: FlowID
+    ) {
+        guard inspection.flowID == flowID,
+            inspection.breakpoint?.phase == .webSocketResponse
+        else {
+            return
+        }
+        inspection = TrafficFlowInspection(
+            flowID: inspection.flowID,
+            title: inspection.title,
+            summary: inspection.summary,
+            request: inspection.request,
+            response: inspection.response,
+            rules: inspection.rules,
+            timing: inspection.timing,
+            breakpoint: TrafficBreakpointInspection(
+                phase: .webSocketResponse,
+                canEditBody: false,
+                webSocketFrame: webSocketFrame
+            ),
+            annotation: inspection.annotation,
+            webSocket: inspection.webSocket,
+            serverSentEvents: inspection.serverSentEvents
+        )
+        publishSnapshot()
+    }
+
+    private static func initialInspection(
+        for flow: Flow,
+        requestProtobufInspection: TrafficProtobufSchemaInspection,
+        responseProtobufInspection: TrafficProtobufSchemaInspection
+    ) -> TrafficFlowInspection {
         TrafficFlowInspection(
             flowID: flow.id,
             title: "\(flow.request.method.rawValue) \(flow.request.url.absoluteString)",
@@ -2001,11 +4046,15 @@ final class TrafficConsoleViewModel: ObservableObject {
                 query: queryText(flow.request.url),
                 cookies: requestCookiesText(flow.request.headers),
                 body: initialBody(flow.request.body, emptyMessage: "This request has no body."),
+                image: initialImage(flow.request.body),
+                hex: initialHex(flow.request.body),
                 json: initialJSON(flow.request.body),
                 jsonTree: initialJSONTree(flow.request.body),
                 xml: initialXML(flow.request.body),
                 form: initialForm(flow.request.body),
                 graphql: initialGraphQL(flow.request.body),
+                protobuf: initialProtobuf(flow.request.body),
+                protobufSchema: requestProtobufInspection,
                 bodyContentType: flow.request.body?.contentType
             ),
             response: flow.response.map {
@@ -2014,11 +4063,15 @@ final class TrafficConsoleViewModel: ObservableObject {
                     headers: responseHeadersText($0),
                     cookies: responseCookiesText($0.headers),
                     body: initialBody($0.body, emptyMessage: "This response has no body."),
+                    image: initialImage($0.body),
+                    hex: initialHex($0.body),
                     json: initialJSON($0.body),
                     jsonTree: initialJSONTree($0.body),
                     xml: initialXML($0.body),
                     form: initialForm($0.body),
                     graphql: initialGraphQL($0.body),
+                    protobuf: initialProtobuf($0.body),
+                    protobufSchema: responseProtobufInspection,
                     bodyContentType: $0.body?.contentType
                 )
             },
@@ -2028,7 +4081,8 @@ final class TrafficConsoleViewModel: ObservableObject {
                 TrafficBreakpointInspection(phase: $0, canEditBody: false)
             },
             annotation: flow.annotation,
-            webSocket: isWebSocket(flow) ? .loading : nil
+            webSocket: isWebSocket(flow) ? .loading : nil,
+            serverSentEvents: isServerSentEventStream(flow) ? .loading : nil
         )
     }
 
@@ -2117,7 +4171,14 @@ final class TrafficConsoleViewModel: ObservableObject {
             case .failed(let message):
                 result = "failed (\(message))"
             }
-            return "\(name)\nphase: \(trace.phase.rawValue)\noutcome: \(result)"
+            var text = "\(name)\nphase: \(trace.phase.rawValue)\noutcome: \(result)"
+            if !trace.logs.isEmpty {
+                let logs = trace.logs.map { entry in
+                    "  • " + entry.replacingOccurrences(of: "\n", with: "\n    ")
+                }.joined(separator: "\n")
+                text += "\nlogs:\n\(logs)"
+            }
+            return text
         }.joined(separator: "\n\n")
     }
 
@@ -2134,6 +4195,20 @@ final class TrafficConsoleViewModel: ObservableObject {
     private static func initialJSON(_ reference: BodyReference?) -> TrafficBodyPresentation {
         guard let reference else {
             return .none(JSONBodyView.notJSONReason)
+        }
+        return .loading(BodyDisplayFormatter.metadata(for: reference))
+    }
+
+    private static func initialHex(_ reference: BodyReference?) -> TrafficBodyPresentation {
+        guard let reference else {
+            return .none(HexBodyView.noBodyReason)
+        }
+        return .loading(BodyDisplayFormatter.metadata(for: reference))
+    }
+
+    private static func initialImage(_ reference: BodyReference?) -> TrafficImagePresentation {
+        guard let reference else {
+            return .none(ImageBodyPreviewBuilder.noBodyReason)
         }
         return .loading(BodyDisplayFormatter.metadata(for: reference))
     }
@@ -2168,25 +4243,41 @@ final class TrafficConsoleViewModel: ObservableObject {
         return .loading(BodyDisplayFormatter.metadata(for: reference))
     }
 
+    private static func initialProtobuf(_ reference: BodyReference?) -> TrafficBodyPresentation {
+        guard let reference else {
+            return .none(ProtobufBodyView.notProtobufReason)
+        }
+        return .loading(BodyDisplayFormatter.metadata(for: reference))
+    }
+
     private static func loadBodies(
         _ reference: BodyReference?,
+        grpcEncoding: String?,
+        protobufSchema: ProtobufMessageSchema?,
+        protobufCatalog: ProtobufSchemaCatalog?,
         reader: any TrafficBodyReading
     ) async -> (
         body: TrafficBodyPresentation,
+        image: TrafficImagePresentation,
+        hex: TrafficBodyPresentation,
         json: TrafficBodyPresentation,
         jsonTree: TrafficJSONTreePresentation,
         xml: TrafficBodyPresentation,
         form: TrafficBodyPresentation,
-        graphql: TrafficBodyPresentation
+        graphql: TrafficBodyPresentation,
+        protobuf: TrafficBodyPresentation
     ) {
         guard let reference else {
             return (
                 body: .none("No body was captured."),
+                image: .none(ImageBodyPreviewBuilder.noBodyReason),
+                hex: .none(HexBodyView.noBodyReason),
                 json: .none(JSONBodyView.notJSONReason),
                 jsonTree: .none(JSONBodyView.notJSONReason),
                 xml: .none(XMLBodyView.notXMLReason),
                 form: .none(FormBodyView.notFormReason),
-                graphql: .none(GraphQLBodyView.notGraphQLReason)
+                graphql: .none(GraphQLBodyView.notGraphQLReason),
+                protobuf: .none(ProtobufBodyView.notProtobufReason)
             )
         }
         let metadata = BodyDisplayFormatter.metadata(for: reference)
@@ -2195,11 +4286,14 @@ final class TrafficConsoleViewModel: ObservableObject {
             return await Task.detached(priority: .utility) {
                 () -> (
                     body: TrafficBodyPresentation,
+                    image: TrafficImagePresentation,
+                    hex: TrafficBodyPresentation,
                     json: TrafficBodyPresentation,
                     jsonTree: TrafficJSONTreePresentation,
                     xml: TrafficBodyPresentation,
                     form: TrafficBodyPresentation,
-                    graphql: TrafficBodyPresentation
+                    graphql: TrafficBodyPresentation,
+                    protobuf: TrafficBodyPresentation
                 ) in
                 let json = jsonPresentation(
                     from: data,
@@ -2211,6 +4305,12 @@ final class TrafficConsoleViewModel: ObservableObject {
                         metadata: metadata,
                         value: BodyDisplayFormatter.render(data, reference: reference)
                     ),
+                    image: ImageBodyPreviewBuilder.render(
+                        data,
+                        reference: reference,
+                        metadata: metadata
+                    ),
+                    hex: .content(metadata: metadata, value: HexBodyView.render(data)),
                     json: json,
                     jsonTree: jsonTreePresentation(from: json),
                     xml: xmlPresentation(
@@ -2227,6 +4327,14 @@ final class TrafficConsoleViewModel: ObservableObject {
                         from: data,
                         reference: reference,
                         metadata: metadata
+                    ),
+                    protobuf: protobufPresentation(
+                        from: data,
+                        reference: reference,
+                        grpcEncoding: grpcEncoding,
+                        schema: protobufSchema,
+                        catalog: protobufCatalog,
+                        metadata: metadata
                     )
                 )
             }.value
@@ -2237,11 +4345,14 @@ final class TrafficConsoleViewModel: ObservableObject {
             )
             return (
                 body: failed,
+                image: .failed(metadata: metadata, message: error.localizedDescription),
+                hex: failed,
                 json: failed,
                 jsonTree: .failed(error.localizedDescription),
                 xml: failed,
                 form: failed,
-                graphql: failed
+                graphql: failed,
+                protobuf: failed
             )
         }
     }
@@ -2333,6 +4444,30 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
     }
 
+    nonisolated private static func protobufPresentation(
+        from data: Data,
+        reference: BodyReference,
+        grpcEncoding: String?,
+        schema: ProtobufMessageSchema?,
+        catalog: ProtobufSchemaCatalog?,
+        metadata: String
+    ) -> TrafficBodyPresentation {
+        switch ProtobufBodyView.render(
+            data: data,
+            contentType: reference.contentType,
+            contentEncoding: reference.contentEncoding,
+            grpcEncoding: grpcEncoding,
+            isTruncated: reference.isTruncated,
+            schema: schema,
+            catalog: catalog
+        ) {
+        case .decoded(let text):
+            .content(metadata: metadata, value: text)
+        case .unavailable(let reason):
+            .none(reason)
+        }
+    }
+
     nonisolated private static func comparisonBodyText(
         reference: BodyReference?,
         reader: any TrafficBodyReading,
@@ -2368,8 +4503,6 @@ final class TrafficConsoleViewModel: ObservableObject {
 
 private enum BodyDisplayFormatter {
     private static let textDisplayLimit = 1_048_576
-    private static let binaryDisplayLimit = 65_536
-    private static let hexDigits = Array("0123456789abcdef".utf8)
 
     static func metadata(for reference: BodyReference) -> String {
         var components = [formattedByteCount(reference.byteCount)]
@@ -2396,13 +4529,7 @@ private enum BodyDisplayFormatter {
             return result
         }
 
-        let shown = data.prefix(binaryDisplayLimit)
-        var result = hexDump(shown)
-        if data.count > shown.count {
-            result +=
-                "\n\n[Displaying the first \(formattedByteCount(Int64(shown.count))) of \(formattedByteCount(Int64(data.count))).]"
-        }
-        return result
+        return HexBodyView.render(data)
     }
 
     private static func isText(_ data: Data, contentEncoding: String?) -> Bool {
@@ -2418,52 +4545,6 @@ private enum BodyDisplayFormatter {
         }
         return !sample.contains { byte in
             byte == 0 || (byte < 9) || (byte > 13 && byte < 32)
-        }
-    }
-
-    private static func hexDump(_ data: Data.SubSequence) -> String {
-        guard !data.isEmpty else {
-            return "[Empty body]"
-        }
-        let bytes = Array(data)
-        var output = [UInt8]()
-        output.reserveCapacity(((bytes.count + 15) / 16) * 76)
-
-        for lineStart in stride(from: 0, to: bytes.count, by: 16) {
-            appendHex(UInt64(lineStart), width: 8, to: &output)
-            output.append(contentsOf: [32, 32])
-            let lineEnd = min(lineStart + 16, bytes.count)
-            for index in lineStart..<(lineStart + 16) {
-                if index < lineEnd {
-                    let byte = bytes[index]
-                    output.append(hexDigits[Int(byte >> 4)])
-                    output.append(hexDigits[Int(byte & 0x0F)])
-                } else {
-                    output.append(contentsOf: [32, 32])
-                }
-                output.append(index == lineStart + 7 ? 32 : 32)
-            }
-            output.append(32)
-            output.append(124)
-            for index in lineStart..<lineEnd {
-                let byte = bytes[index]
-                output.append((32...126).contains(byte) ? byte : 46)
-            }
-            if lineEnd - lineStart < 16 {
-                output.append(contentsOf: repeatElement(32, count: 16 - (lineEnd - lineStart)))
-            }
-            output.append(124)
-            if lineEnd < bytes.count {
-                output.append(10)
-            }
-        }
-        return String(decoding: output, as: UTF8.self)
-    }
-
-    private static func appendHex(_ value: UInt64, width: Int, to output: inout [UInt8]) {
-        for offset in (0..<width).reversed() {
-            let nibble = Int((value >> UInt64(offset * 4)) & 0x0F)
-            output.append(hexDigits[nibble])
         }
     }
 

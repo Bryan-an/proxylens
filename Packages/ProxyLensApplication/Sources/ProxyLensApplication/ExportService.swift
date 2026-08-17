@@ -153,6 +153,79 @@ public struct ExportService: Sendable {
         }
     }
 
+    /// Streams a portable, versioned Server-Sent Event document without retaining every payload.
+    /// The destination is replaced only after the complete document has been written successfully.
+    public func writeServerSentEvents(
+        _ events: [CapturedServerSentEvent],
+        for flowID: FlowID,
+        exportedAt: Date = Date(),
+        to destinationURL: URL
+    ) async throws {
+        guard !events.isEmpty else {
+            throw ProxyLensError.unsupportedOperation(
+                "No Server-Sent Events are available to export"
+            )
+        }
+        guard events.allSatisfy({ $0.flowID == flowID }) else {
+            throw ProxyLensError.unsupportedOperation(
+                "A Server-Sent Event export can contain only one flow"
+            )
+        }
+
+        let orderedEvents = events.sorted {
+            if $0.sequenceNumber != $1.sequenceNumber {
+                return $0.sequenceNumber < $1.sequenceNumber
+            }
+            return $0.receivedAt < $1.receivedAt
+        }
+        let fileManager = FileManager.default
+        let stagingURL = destinationURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(destinationURL.lastPathComponent).proxylens-\(UUID().uuidString).partial"
+        )
+        guard fileManager.createFile(atPath: stagingURL.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        var handle: FileHandle?
+        do {
+            let output = try FileHandle(forWritingTo: stagingURL)
+            handle = output
+            try output.write(
+                contentsOf: ServerSentEventsDocument.preamble(
+                    flowID: flowID,
+                    exportedAt: exportedAt
+                )
+            )
+            for (index, event) in orderedEvents.enumerated() {
+                try Task.checkCancellation()
+                if index > 0 {
+                    try output.write(contentsOf: ServerSentEventsDocument.entrySeparator)
+                }
+                let data = try await bodyStore.read(event.data)
+                try output.write(
+                    contentsOf: ServerSentEventsDocument.serializeEntry(
+                        event: event,
+                        data: data
+                    )
+                )
+            }
+            try output.write(contentsOf: ServerSentEventsDocument.epilogue)
+            try output.synchronize()
+            try output.close()
+            handle = nil
+
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                _ = try fileManager.replaceItemAt(destinationURL, withItemAt: stagingURL)
+            } else {
+                try fileManager.moveItem(at: stagingURL, to: destinationURL)
+            }
+        } catch {
+            try? handle?.close()
+            try? fileManager.removeItem(at: stagingURL)
+            throw error
+        }
+    }
+
     /// Streams a collection of flows into one HAR file without retaining every represented body.
     /// The destination is replaced only after the complete document has been written successfully.
     public func writeHAR(for flows: [Flow], to destinationURL: URL) async throws {

@@ -2,8 +2,10 @@ import Foundation
 
 public enum FlowSourceKind: String, Codable, Equatable, Hashable, Sendable {
     case desktopProxy
+    case reverseProxy
     case importedSession
     case replay
+    case socks5Proxy
 }
 
 public struct FlowApplication: Codable, Equatable, Hashable, Sendable {
@@ -61,6 +63,31 @@ public struct FlowSource: Codable, Equatable, Hashable, Sendable {
 
     public static let desktopProxy = FlowSource(kind: .desktopProxy, label: "Desktop proxy")
     public static let replay = FlowSource(kind: .replay, label: "Replay")
+
+    public static func socks5Proxy(
+        clientAddress: String? = nil,
+        application: FlowApplication? = nil
+    ) -> FlowSource {
+        FlowSource(
+            kind: .socks5Proxy,
+            label: "SOCKS5 Proxy",
+            clientAddress: clientAddress,
+            application: application
+        )
+    }
+
+    public static func reverseProxy(
+        name: String,
+        clientAddress: String? = nil,
+        application: FlowApplication? = nil
+    ) -> FlowSource {
+        FlowSource(
+            kind: .reverseProxy,
+            label: "Reverse Proxy: \(name)",
+            clientAddress: clientAddress,
+            application: application
+        )
+    }
 }
 
 public enum ConnectionProtocol: String, Codable, Equatable, Hashable, Sendable {
@@ -75,17 +102,37 @@ public struct ConnectionInfo: Codable, Equatable, Hashable, Sendable {
     public let upstreamHost: String
     public let upstreamPort: UInt16
     public let tlsIntercepted: Bool
+    public let upstreamHTTPVersion: HTTPVersion?
+    public let isUpstreamConnectionReused: Bool?
 
     public init(
         protocolKind: ConnectionProtocol,
         upstreamHost: String,
         upstreamPort: UInt16,
-        tlsIntercepted: Bool = false
+        tlsIntercepted: Bool = false,
+        upstreamHTTPVersion: HTTPVersion? = nil,
+        isUpstreamConnectionReused: Bool? = nil
     ) {
         self.protocolKind = protocolKind
         self.upstreamHost = upstreamHost
         self.upstreamPort = upstreamPort
         self.tlsIntercepted = tlsIntercepted
+        self.upstreamHTTPVersion = upstreamHTTPVersion
+        self.isUpstreamConnectionReused = isUpstreamConnectionReused
+    }
+
+    public func replacingTransport(
+        upstreamHTTPVersion: HTTPVersion?,
+        isUpstreamConnectionReused: Bool?
+    ) -> ConnectionInfo {
+        ConnectionInfo(
+            protocolKind: protocolKind,
+            upstreamHost: upstreamHost,
+            upstreamPort: upstreamPort,
+            tlsIntercepted: tlsIntercepted,
+            upstreamHTTPVersion: upstreamHTTPVersion,
+            isUpstreamConnectionReused: isUpstreamConnectionReused
+        )
     }
 }
 

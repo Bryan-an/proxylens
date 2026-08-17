@@ -9,6 +9,7 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
     private let contentTypePopup = NSPopUpButton()
     private let originPopup = NSPopUpButton()
     private let annotationPopup = NSPopUpButton()
+    private let customFilterPopup = NSPopUpButton()
     private let countField = NSTextField(labelWithString: "0 flows")
     private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
     private var isEditingSearch = false
@@ -35,6 +36,7 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
         select(filter.contentType, in: contentTypePopup, cases: TrafficContentTypeFilter.allCases)
         select(filter.origin, in: originPopup, cases: TrafficOriginFilter.allCases)
         select(filter.annotation, in: annotationPopup, cases: TrafficAnnotationFilter.allCases)
+        rebuildCustomFilterMenu(filter: filter)
 
         let visibleCount = snapshot.visibleRows.count
         countField.stringValue =
@@ -90,6 +92,11 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
             action: #selector(annotationChanged)
         )
 
+        customFilterPopup.setAccessibilityIdentifier("traffic.filter.custom")
+        customFilterPopup.setAccessibilityLabel("Custom traffic filters")
+        customFilterPopup.toolTip = "Custom Filters"
+        customFilterPopup.cell?.lineBreakMode = .byTruncatingTail
+
         countField.textColor = .secondaryLabelColor
         countField.alignment = .right
         countField.setContentHuggingPriority(.required, for: .horizontal)
@@ -111,6 +118,7 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
             contentTypePopup,
             originPopup,
             annotationPopup,
+            customFilterPopup,
             NSView(),
             countField,
             clearButton
@@ -131,7 +139,8 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
             statusPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 112),
             contentTypePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
             originPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 108),
-            annotationPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 112)
+            annotationPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 112),
+            customFilterPopup.widthAnchor.constraint(equalToConstant: 104)
         ])
     }
 
@@ -243,6 +252,188 @@ final class TrafficFilterBar: NSView, NSSearchFieldDelegate {
         viewModel.clearDisplayFilters()
     }
 
+    private func rebuildCustomFilterMenu(filter: TrafficDisplayFilter) {
+        customFilterPopup.removeAllItems()
+        guard let menu = customFilterPopup.menu else {
+            return
+        }
+        let presets = viewModel.customFilterPresets
+        let matchingPreset = presets.first { $0.filter == filter }
+        let heading = NSMenuItem(
+            title: matchingPreset?.name ?? "Custom Filters",
+            action: nil,
+            keyEquivalent: ""
+        )
+        heading.isEnabled = false
+        menu.addItem(heading)
+        menu.addItem(.separator())
+
+        if presets.isEmpty {
+            let emptyItem = NSMenuItem(title: "No Saved Filters", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            menu.addItem(emptyItem)
+        } else {
+            for preset in presets {
+                let item = NSMenuItem(
+                    title: preset.name,
+                    action: #selector(applyCustomFilterPreset(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = preset.id.uuidString
+                item.state = preset.id == matchingPreset?.id ? .on : .off
+                menu.addItem(item)
+            }
+        }
+
+        menu.addItem(.separator())
+        let saveItem = NSMenuItem(
+            title: "Save Current Filter…",
+            action: #selector(saveCurrentFilterPreset),
+            keyEquivalent: ""
+        )
+        saveItem.target = self
+        menu.addItem(saveItem)
+
+        if let matchingPreset {
+            let renameItem = NSMenuItem(
+                title: "Rename \(matchingPreset.name)…",
+                action: #selector(renameCurrentFilterPreset(_:)),
+                keyEquivalent: ""
+            )
+            renameItem.target = self
+            renameItem.representedObject = matchingPreset.id.uuidString
+            menu.addItem(renameItem)
+
+            let deleteItem = NSMenuItem(
+                title: "Delete \(matchingPreset.name)",
+                action: #selector(deleteCurrentFilterPreset(_:)),
+                keyEquivalent: ""
+            )
+            deleteItem.target = self
+            deleteItem.representedObject = matchingPreset.id.uuidString
+            menu.addItem(deleteItem)
+        }
+        customFilterPopup.selectItem(at: 0)
+    }
+
+    @objc private func applyCustomFilterPreset(_ sender: NSMenuItem) {
+        guard let id = presetID(from: sender) else {
+            return
+        }
+        do {
+            try viewModel.applyCustomFilterPreset(id: id)
+        } catch {
+            showPresetError(error)
+        }
+    }
+
+    @objc private func saveCurrentFilterPreset() {
+        presentNameDialog(
+            title: "Save Custom Filter",
+            informativeText:
+                "Save the complete search and filter combination. A filter with the same name will be updated.",
+            actionTitle: "Save",
+            initialValue: viewModel.matchingCustomFilterPreset?.name ?? "",
+            accessibilityIdentifier: "traffic.filter.customName"
+        ) { [weak self] name in
+            guard let self else { return }
+            do {
+                _ = try viewModel.saveCustomFilterPreset(named: name)
+            } catch {
+                showPresetError(error)
+            }
+        }
+    }
+
+    @objc private func renameCurrentFilterPreset(_ sender: NSMenuItem) {
+        guard let id = presetID(from: sender),
+            let preset = viewModel.customFilterPresets.first(where: { $0.id == id })
+        else {
+            return
+        }
+        presentNameDialog(
+            title: "Rename Custom Filter",
+            informativeText: "Choose a unique name for this saved filter.",
+            actionTitle: "Rename",
+            initialValue: preset.name,
+            accessibilityIdentifier: "traffic.filter.customRename"
+        ) { [weak self] name in
+            guard let self else { return }
+            do {
+                _ = try viewModel.renameCustomFilterPreset(id: id, name: name)
+            } catch {
+                showPresetError(error)
+            }
+        }
+    }
+
+    @objc private func deleteCurrentFilterPreset(_ sender: NSMenuItem) {
+        guard let id = presetID(from: sender),
+            let preset = viewModel.customFilterPresets.first(where: { $0.id == id })
+        else {
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Delete \(preset.name)?"
+        alert.informativeText = "This removes only the saved filter. Captured traffic is unchanged."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.viewModel.removeCustomFilterPreset(id: id)
+        }
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    private func presentNameDialog(
+        title: String,
+        informativeText: String,
+        actionTitle: String,
+        initialValue: String,
+        accessibilityIdentifier: String,
+        completion: @escaping (String) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: actionTitle)
+        alert.addButton(withTitle: "Cancel")
+        let nameField = NSTextField(string: initialValue)
+        nameField.placeholderString = "Filter name"
+        nameField.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+        nameField.setAccessibilityIdentifier(accessibilityIdentifier)
+        nameField.setAccessibilityLabel("Custom filter name")
+        alert.accessoryView = nameField
+        let handler: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn else { return }
+            completion(nameField.stringValue)
+        }
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func presetID(from item: NSMenuItem) -> UUID? {
+        (item.representedObject as? String).flatMap(UUID.init(uuidString:))
+    }
+
+    private func showPresetError(_ error: any Error) {
+        let alert = NSAlert(error: error)
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
     private static func flowCountText(_ count: Int) -> String {
         "\(count) \(count == 1 ? "flow" : "flows")"
     }
@@ -301,6 +492,8 @@ extension TrafficOriginFilter {
         switch self {
         case .all: "All Sources"
         case .desktopProxy: "Desktop Proxy"
+        case .socks5Proxy: "SOCKS5 Proxy"
+        case .reverseProxy: "Reverse Proxy"
         case .importedSession: "Imported"
         case .replay: "Replay"
         }
