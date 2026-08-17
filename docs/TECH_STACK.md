@@ -585,6 +585,20 @@ Useful internal metrics include:
   binds form one atomic operation, and every failure closes opened channels plus the shared upstream
   HTTP/2 pool. The native Listeners sheet owns stopped-state editing without adding another toolbar
   control.
+- External HTTP proxy routing sends selected outbound traffic through one manually configured
+  upstream proxy. `ExternalHTTPProxyConfiguration` validates a bounded host, a port, an optional
+  username, and at most 128 normalized bypass entries matching an exact host or a `*.` suffix, and
+  rejects an endpoint that collides with an active local listener. Passwords never enter
+  `UserDefaults`, captured headers, portable sessions, or rule archives; they are resolved once at
+  capture start through a Keychain-backed `ExternalHTTPProxyCredentialStoring` adapter, and an
+  enabled configuration whose credentials cannot be loaded fails the start closed. Plain HTTP and
+  `ws://` use absolute-form request targets, while HTTPS and `wss://` use a bounded HTTP/1.1 CONNECT
+  handshake capped at 32 KiB of headers with no body that requires a 2xx status before origin TLS is
+  negotiated and verified. Basic credentials produce one transport-owned `Proxy-Authorization`
+  header that never reaches captured metadata or localized errors. Disabled and bypassed
+  destinations keep direct routing and existing HTTP/2 pooling; proxied TLS uses the HTTP/1.1
+  upstream path in this increment. The native Listeners sheet owns the stopped-state workflow,
+  including Apply and Clear Credentials, without adding a toolbar control.
 - Throttling. Removable, host-scoped latency-only presets plus Slow 3G, Fast 3G, and Wi-Fi presets
   are implemented through the shared rule pipeline. Connection latency and upload/download
   transfer deadlines are scheduled without blocking a NIO event loop; bounded queues coordinate

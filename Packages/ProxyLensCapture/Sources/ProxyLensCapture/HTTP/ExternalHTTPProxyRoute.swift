@@ -71,7 +71,7 @@ struct ExternalHTTPProxyRoute: Sendable {
         to target: ProxyTarget,
         allocator: ByteBufferAllocator
     ) -> ByteBuffer {
-        let authority = connectionAuthority(for: target)
+        let authority = connectAuthority(for: target)
         var request = "CONNECT \(authority) HTTP/1.1\r\nHost: \(authority)\r\n"
         request += "Proxy-Connection: keep-alive\r\n"
         if let authorizationValue {
@@ -94,12 +94,22 @@ struct ExternalHTTPProxyRoute: Sendable {
         return "\(scheme)://\(authority)\(path)"
     }
 
+    /// Absolute-form request targets omit a default port, matching ordinary origin URLs.
     private func connectionAuthority(for target: ProxyTarget) -> String {
-        let formattedHost =
-            target.connectionHost.contains(":") && !target.connectionHost.hasPrefix("[")
-            ? "[\(target.connectionHost)]"
-            : target.connectionHost
+        let formattedHost = bracketedConnectionHost(for: target)
         let defaultPort = target.usesTLS ? 443 : 80
         return target.port == defaultPort ? formattedHost : "\(formattedHost):\(target.port)"
+    }
+
+    /// RFC 9110 requires the authority form of a `CONNECT` target to carry an explicit port, so the
+    /// default port is never elided here.
+    private func connectAuthority(for target: ProxyTarget) -> String {
+        "\(bracketedConnectionHost(for: target)):\(target.port)"
+    }
+
+    private func bracketedConnectionHost(for target: ProxyTarget) -> String {
+        target.connectionHost.contains(":") && !target.connectionHost.hasPrefix("[")
+            ? "[\(target.connectionHost)]"
+            : target.connectionHost
     }
 }

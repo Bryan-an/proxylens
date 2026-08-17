@@ -441,6 +441,32 @@ WebSocket, SSE, scripting, breakpoint, and throttling paths. A distinct `FlowSou
 `SOCKS5 Proxy`. The `@MainActor` listener store persists a versioned disabled-by-default preference,
 and the native Listeners sheet permits changes only while capture is stopped or failed.
 
+### External HTTP proxy routing
+
+An external HTTP proxy is capture configuration rather than a rule action. `ProxyConfiguration`
+carries one optional validated `ExternalHTTPProxyConfiguration`: a bounded hostname or IP literal, a
+port, an optional username, and at most 128 normalized bypass entries that match an exact host or a
+leading `*.` suffix. That configuration is non-secret and never carries the password. The password
+lives only behind the `ExternalHTTPProxyCredentialStoring` port, implemented in `ProxyLensPlatform`
+by a Keychain-backed store. `NIOProxyEngine` resolves credentials once during start, builds an
+immutable `ExternalHTTPProxyRoute`, and fails the start closed when an enabled configuration cannot
+produce the credentials it declares. Handlers then read that `Sendable` route on their own event
+loop and never touch the store.
+
+Routing is decided per destination. `shouldProxy(host:)` keeps disabled and bypassed destinations on
+the existing direct path, including its HTTP/2 pooling. Plain HTTP and `ws://` connect to the proxy
+and rewrite the request target into absolute form while the origin `Host` header and the captured
+request stay authoritative. HTTPS and `wss://` open a bounded HTTP/1.1 CONNECT handshake through
+`HTTPUpstreamProxyConnectHandler` — at most 32 KiB of response headers, no response body, and a
+required 2xx status — then negotiate and verify TLS to the logical destination before the ordinary
+interception pipeline is installed. Optional Basic credentials produce one transport-owned
+`Proxy-Authorization` header on the proxy request or the CONNECT handshake; any client-supplied
+value is removed first, the header never enters captured request metadata, and credentials are
+redacted from descriptions and excluded from localized errors. DNS Spoofing keeps its physical
+authority for the socket and the CONNECT target while `Host`, SNI, certificate validation, rules,
+capture, replay, and export retain the logical host. Proxied TLS uses the existing HTTP/1.1 upstream
+path in this increment.
+
 ## Concurrency and ownership
 
 SwiftNIO and Swift Concurrency have different ownership models. The boundary must be explicit.

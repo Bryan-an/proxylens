@@ -518,7 +518,12 @@ dependency order, not excluded scope or paid feature tiers.
   dimensions, frame count, and capture metadata. Truncated, oversized, unsupported, or malformed
   bodies fail closed in Preview while Body, Hex, Raw, export, and replay retain the authoritative
   captured bytes.
-- External upstream proxy configuration remains staged.
+- External upstream proxy configuration is implemented for one manually configured HTTP proxy.
+  Routing covers HTTP, HTTPS, `ws://`, and `wss://` through absolute-form forwarding or a bounded
+  authenticated CONNECT handshake, with normalized exact-host and `*.` suffix bypass entries and
+  Keychain-only password storage. HTTPS transport to the proxy itself, SOCKS4/SOCKS5 upstream
+  proxies, PAC evaluation, system-proxy discovery, proxy failover, NTLM/Kerberos/Digest
+  authentication, and proxied HTTP/2 multiplexing remain staged increments.
 - Protobuf wire decoding is implemented for declared Protobuf bodies. The inspector keeps a
   schema-less mode and can also import a compiled `FileDescriptorSet`, restore it locally, and use
   independently selected request and response message types to render field names, scalar types,
