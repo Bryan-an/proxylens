@@ -25,6 +25,10 @@ actor FlowTransaction {
         flow.response
     }
 
+    func snapshot() -> Flow {
+        flow
+    }
+
     func start(at date: Date) async {
         guard flow.state == .created else {
             return
@@ -39,13 +43,17 @@ actor FlowTransaction {
         }
     }
 
-    func finishRequestBody(_ body: BodyReference?, at date: Date) async {
+    func finishRequestBody(
+        _ body: BodyReference?,
+        graphqlOperation: GraphQLOperationMetadata? = nil,
+        at date: Date
+    ) async {
         guard !isFinished else {
             return
         }
 
         if let body {
-            flow.attachRequestBody(body)
+            flow.attachRequestBody(body, graphqlOperation: graphqlOperation)
         }
         flow.markRequestBodyCompleted(at: date)
         requestBodyIsComplete = true
@@ -75,6 +83,24 @@ actor FlowTransaction {
         await eventSink.publish(.updated(flow))
     }
 
+    func replaceUpstreamConnection(host: String, port: UInt16, usesTLS: Bool) async {
+        guard !isFinished else {
+            return
+        }
+
+        flow.replaceConnection(
+            ConnectionInfo(
+                protocolKind: usesTLS ? .https : .http,
+                upstreamHost: host,
+                upstreamPort: port,
+                tlsIntercepted: flow.connection?.tlsIntercepted ?? false,
+                upstreamHTTPVersion: flow.connection?.upstreamHTTPVersion,
+                isUpstreamConnectionReused: flow.connection?.isUpstreamConnectionReused
+            )
+        )
+        await eventSink.publish(.updated(flow))
+    }
+
     func serveLocalResponse(_ response: HTTPResponse, at date: Date) async {
         guard !isFinished else {
             return
@@ -99,7 +125,11 @@ actor FlowTransaction {
         await complete(at: date)
     }
 
-    func markUpstreamConnected(at date: Date) async {
+    func markUpstreamConnected(
+        at date: Date,
+        upstreamHTTPVersion: HTTPVersion? = nil,
+        isConnectionReused: Bool? = nil
+    ) async {
         guard !isFinished else {
             return
         }
@@ -108,6 +138,16 @@ actor FlowTransaction {
             try? flow.transition(to: .connectingUpstream)
         }
 
+        if let connection = flow.connection,
+            upstreamHTTPVersion != nil || isConnectionReused != nil
+        {
+            flow.replaceConnection(
+                connection.replacingTransport(
+                    upstreamHTTPVersion: upstreamHTTPVersion,
+                    isUpstreamConnectionReused: isConnectionReused
+                )
+            )
+        }
         flow.markUpstreamConnected(at: date)
         await eventSink.publish(.updated(flow))
     }
@@ -162,6 +202,35 @@ actor FlowTransaction {
         }
     }
 
+    func beginWebSocket(secure: Bool, at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+
+        if let connection = flow.connection {
+            flow.replaceConnection(
+                ConnectionInfo(
+                    protocolKind: secure ? .secureWebSocket : .webSocket,
+                    upstreamHost: connection.upstreamHost,
+                    upstreamPort: connection.upstreamPort,
+                    tlsIntercepted: connection.tlsIntercepted,
+                    upstreamHTTPVersion: connection.upstreamHTTPVersion,
+                    isUpstreamConnectionReused: connection.isUpstreamConnectionReused
+                )
+            )
+        }
+        flow.markResponseBodyCompleted(at: date)
+        responseBodyIsComplete = true
+        await eventSink.publish(.updated(flow))
+    }
+
+    func finishWebSocket(at date: Date) async {
+        guard !isFinished else {
+            return
+        }
+        await complete(at: date)
+    }
+
     func completePausedResponse(at date: Date) async {
         guard !isFinished else {
             return
@@ -182,6 +251,15 @@ actor FlowTransaction {
         }
 
         try? flow.transition(to: nextState)
+        await eventSink.publish(.updated(flow))
+    }
+
+    func resumeWebSocketBreakpoint() async {
+        guard !isFinished, flow.state == .paused(.webSocketResponse) else {
+            return
+        }
+
+        try? flow.transition(to: .receivingResponse)
         await eventSink.publish(.updated(flow))
     }
 

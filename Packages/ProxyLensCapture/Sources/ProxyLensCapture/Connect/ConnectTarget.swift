@@ -18,12 +18,44 @@ struct ConnectTarget: Equatable, Hashable, Sendable {
             throw ConnectTargetError.invalidAuthority(authority)
         }
 
-        let port = components.port ?? 443
+        try self.init(host: host, port: components.port ?? 443)
+    }
+
+    init(host: String, port: Int) throws {
+        var normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        // `URLComponents.host` reports IPv6 literals bracketed, while `URL.host`, SOCKS5 address
+        // bytes, and the stored form are unbracketed. Normalize to the unbracketed spelling here so
+        // every caller agrees, and rebracket only where a URL or wire authority is built.
+        if normalizedHost.hasPrefix("["), normalizedHost.hasSuffix("]") {
+            let literal = String(normalizedHost.dropFirst().dropLast())
+            guard literal.contains(":") else {
+                throw ConnectTargetError.invalidAuthority(host)
+            }
+            normalizedHost = literal
+        }
+        guard !normalizedHost.isEmpty,
+            !normalizedHost.contains("["),
+            !normalizedHost.contains("]"),
+            normalizedHost.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            }),
+            !normalizedHost.contains(where: \Character.isWhitespace)
+        else {
+            throw ConnectTargetError.invalidAuthority(host)
+        }
         guard (1...65_535).contains(port) else {
             throw ConnectTargetError.invalidPort(port)
         }
 
-        self.host = host
+        let authorityHost = normalizedHost.contains(":") ? "[\(normalizedHost)]" : normalizedHost
+        guard let components = URLComponents(string: "https://\(authorityHost):\(port)"),
+            components.host != nil,
+            components.url != nil
+        else {
+            throw ConnectTargetError.invalidAuthority(host)
+        }
+
+        self.host = normalizedHost
         self.port = port
     }
 }

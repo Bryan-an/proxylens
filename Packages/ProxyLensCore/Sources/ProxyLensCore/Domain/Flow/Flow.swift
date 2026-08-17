@@ -2,8 +2,10 @@ import Foundation
 
 public enum FlowSourceKind: String, Codable, Equatable, Hashable, Sendable {
     case desktopProxy
+    case reverseProxy
     case importedSession
     case replay
+    case socks5Proxy
 }
 
 public struct FlowApplication: Codable, Equatable, Hashable, Sendable {
@@ -61,6 +63,31 @@ public struct FlowSource: Codable, Equatable, Hashable, Sendable {
 
     public static let desktopProxy = FlowSource(kind: .desktopProxy, label: "Desktop proxy")
     public static let replay = FlowSource(kind: .replay, label: "Replay")
+
+    public static func socks5Proxy(
+        clientAddress: String? = nil,
+        application: FlowApplication? = nil
+    ) -> FlowSource {
+        FlowSource(
+            kind: .socks5Proxy,
+            label: "SOCKS5 Proxy",
+            clientAddress: clientAddress,
+            application: application
+        )
+    }
+
+    public static func reverseProxy(
+        name: String,
+        clientAddress: String? = nil,
+        application: FlowApplication? = nil
+    ) -> FlowSource {
+        FlowSource(
+            kind: .reverseProxy,
+            label: "Reverse Proxy: \(name)",
+            clientAddress: clientAddress,
+            application: application
+        )
+    }
 }
 
 public enum ConnectionProtocol: String, Codable, Equatable, Hashable, Sendable {
@@ -75,17 +102,37 @@ public struct ConnectionInfo: Codable, Equatable, Hashable, Sendable {
     public let upstreamHost: String
     public let upstreamPort: UInt16
     public let tlsIntercepted: Bool
+    public let upstreamHTTPVersion: HTTPVersion?
+    public let isUpstreamConnectionReused: Bool?
 
     public init(
         protocolKind: ConnectionProtocol,
         upstreamHost: String,
         upstreamPort: UInt16,
-        tlsIntercepted: Bool = false
+        tlsIntercepted: Bool = false,
+        upstreamHTTPVersion: HTTPVersion? = nil,
+        isUpstreamConnectionReused: Bool? = nil
     ) {
         self.protocolKind = protocolKind
         self.upstreamHost = upstreamHost
         self.upstreamPort = upstreamPort
         self.tlsIntercepted = tlsIntercepted
+        self.upstreamHTTPVersion = upstreamHTTPVersion
+        self.isUpstreamConnectionReused = isUpstreamConnectionReused
+    }
+
+    public func replacingTransport(
+        upstreamHTTPVersion: HTTPVersion?,
+        isUpstreamConnectionReused: Bool?
+    ) -> ConnectionInfo {
+        ConnectionInfo(
+            protocolKind: protocolKind,
+            upstreamHost: upstreamHost,
+            upstreamPort: upstreamPort,
+            tlsIntercepted: tlsIntercepted,
+            upstreamHTTPVersion: upstreamHTTPVersion,
+            isUpstreamConnectionReused: isUpstreamConnectionReused
+        )
     }
 }
 
@@ -95,11 +142,12 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
     public let source: FlowSource
     public let createdAt: Date
     public private(set) var request: HTTPRequest
-    public let connection: ConnectionInfo?
+    public private(set) var connection: ConnectionInfo?
     public private(set) var response: HTTPResponse?
     public private(set) var timing: FlowTiming
     public private(set) var ruleTraces: [RuleTrace]
     public private(set) var state: FlowState
+    public private(set) var annotation: FlowAnnotation?
 
     public init(
         id: FlowID = FlowID(),
@@ -119,6 +167,7 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
         self.timing = FlowTiming(startedAt: startedAt)
         self.ruleTraces = []
         self.state = .created
+        self.annotation = nil
     }
 
     public mutating func transition(to nextState: FlowState) throws {
@@ -137,6 +186,13 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
         request.attachBody(body)
     }
 
+    public mutating func attachRequestBody(
+        _ body: BodyReference,
+        graphqlOperation: GraphQLOperationMetadata?
+    ) {
+        request.attachBody(body, graphqlOperation: graphqlOperation)
+    }
+
     public mutating func attachResponseBody(_ body: BodyReference) {
         response?.attachBody(body)
     }
@@ -153,8 +209,44 @@ public struct Flow: Codable, Equatable, Hashable, Sendable, Identifiable {
         self.request = request
     }
 
+    public mutating func replaceConnection(_ connection: ConnectionInfo?) {
+        self.connection = connection
+    }
+
     public mutating func replaceResponse(_ response: HTTPResponse) {
         self.response = response
+    }
+
+    public mutating func setAnnotation(_ annotation: FlowAnnotation?) {
+        self.annotation = annotation?.isEmpty == true ? nil : annotation
+    }
+
+    /// Creates a structurally identical snapshot with a new owner and body references.
+    /// Portable-session import uses fresh identifiers so the same capture can be imported more
+    /// than once without colliding with its original database records.
+    public func replacingIdentityAndBodies(
+        id: FlowID,
+        sessionID: SessionID,
+        requestBody: BodyReference?,
+        responseBody: BodyReference?
+    ) -> Flow {
+        var copy = Flow(
+            id: id,
+            sessionID: sessionID,
+            source: source,
+            request: request.replacingBody(
+                requestBody,
+                graphqlOperation: request.graphqlOperation
+            ),
+            connection: connection,
+            startedAt: createdAt
+        )
+        copy.response = response?.replacingBody(responseBody)
+        copy.timing = timing
+        copy.ruleTraces = ruleTraces
+        copy.state = state
+        copy.annotation = annotation
+        return copy
     }
 
     public mutating func markRequestHeadersReceived(at date: Date) {

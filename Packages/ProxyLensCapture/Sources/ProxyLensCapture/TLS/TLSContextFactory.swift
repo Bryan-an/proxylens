@@ -1,4 +1,5 @@
 import Foundation
+import NIOHTTP2
 import NIOSSL
 import ProxyLensCore
 
@@ -25,12 +26,30 @@ enum TLSContextFactory {
             privateKey: .privateKey(privateKey)
         )
         configuration.minimumTLSVersion = .tlsv12
+        configuration.applicationProtocols = NIOHTTP2SupportedALPNProtocols
         return try NIOSSLContext(configuration: configuration)
     }
 
     static func upstreamContext(configuration: UpstreamTLSConfiguration) throws -> NIOSSLContext {
+        try upstreamContext(configuration: configuration, applicationProtocols: [])
+    }
+
+    static func upstreamHTTP2Context(
+        configuration: UpstreamTLSConfiguration
+    ) throws -> NIOSSLContext {
+        try upstreamContext(
+            configuration: configuration,
+            applicationProtocols: NIOHTTP2SupportedALPNProtocols
+        )
+    }
+
+    private static func upstreamContext(
+        configuration: UpstreamTLSConfiguration,
+        applicationProtocols: [String]
+    ) throws -> NIOSSLContext {
         var tlsConfiguration = TLSConfiguration.makeClientConfiguration()
         tlsConfiguration.minimumTLSVersion = .tlsv12
+        tlsConfiguration.applicationProtocols = applicationProtocols
 
         let certificates = try configuration.additionalTrustRootCertificates.flatMap {
             try NIOSSLCertificate.fromPEMBytes(Array($0))

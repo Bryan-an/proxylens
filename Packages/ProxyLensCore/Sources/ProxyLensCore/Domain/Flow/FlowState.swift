@@ -5,6 +5,7 @@ public enum FlowFailure: Codable, Equatable, Hashable, Sendable {
     case upstreamUnavailable
     case timeout
     case tlsHandshakeFailed
+    case simulatedNetworkFailure
     case protocolError(String)
     case persistenceError(String)
     case unknown(String)
@@ -13,6 +14,7 @@ public enum FlowFailure: Codable, Equatable, Hashable, Sendable {
 public enum BreakpointPhase: String, Codable, Equatable, Hashable, Sendable {
     case request
     case response
+    case webSocketResponse
 }
 
 public enum FlowState: Codable, Equatable, Hashable, Sendable {
@@ -54,7 +56,8 @@ public enum FlowState: Codable, Equatable, Hashable, Sendable {
             switch nextState {
             case .connectingUpstream, .receivingResponse, .paused(.request), .cancelled, .failed:
                 true
-            case .created, .receivingRequest, .paused(.response), .completed:
+            case .created, .receivingRequest, .paused(.response), .paused(.webSocketResponse),
+                .completed:
                 false
             }
         case .paused(.request):
@@ -73,7 +76,7 @@ public enum FlowState: Codable, Equatable, Hashable, Sendable {
             }
         case .receivingResponse:
             switch nextState {
-            case .paused(.response), .completed, .cancelled, .failed:
+            case .paused(.response), .paused(.webSocketResponse), .completed, .cancelled, .failed:
                 true
             case .created, .receivingRequest, .connectingUpstream, .receivingResponse,
                 .paused(.request):
@@ -84,6 +87,13 @@ public enum FlowState: Codable, Equatable, Hashable, Sendable {
             case .completed, .cancelled, .failed:
                 true
             case .created, .receivingRequest, .connectingUpstream, .receivingResponse, .paused:
+                false
+            }
+        case .paused(.webSocketResponse):
+            switch nextState {
+            case .receivingResponse, .completed, .cancelled, .failed:
+                true
+            case .created, .receivingRequest, .connectingUpstream, .paused:
                 false
             }
         case .completed, .cancelled, .failed:

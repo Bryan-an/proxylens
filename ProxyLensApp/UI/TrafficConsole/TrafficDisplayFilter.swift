@@ -1,7 +1,7 @@
 import Foundation
 import ProxyLensCore
 
-enum TrafficMethodFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficMethodFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case get
     case post
@@ -29,7 +29,7 @@ enum TrafficMethodFilter: String, CaseIterable, Equatable, Sendable {
     )
 }
 
-enum TrafficStatusFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficStatusFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case informational
     case success
@@ -58,8 +58,9 @@ enum TrafficStatusFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-enum TrafficContentTypeFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficContentTypeFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
+    case graphql
     case json
     case html
     case xml
@@ -69,9 +70,18 @@ enum TrafficContentTypeFilter: String, CaseIterable, Equatable, Sendable {
     case binary
     case other
 
-    func matches(_ contentType: String?) -> Bool {
+    func matches(
+        _ contentType: String?,
+        graphqlOperation: GraphQLOperationMetadata?
+    ) -> Bool {
         guard self != .all else {
             return true
+        }
+        if graphqlOperation != nil {
+            return self == .graphql
+        }
+        if self == .graphql {
+            return false
         }
         guard let contentType else {
             return self == .other
@@ -121,9 +131,11 @@ enum TrafficContentTypeFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-enum TrafficOriginFilter: String, CaseIterable, Equatable, Sendable {
+enum TrafficOriginFilter: String, CaseIterable, Codable, Equatable, Sendable {
     case all
     case desktopProxy
+    case socks5Proxy
+    case reverseProxy
     case importedSession
     case replay
 
@@ -133,6 +145,10 @@ enum TrafficOriginFilter: String, CaseIterable, Equatable, Sendable {
             true
         case .desktopProxy:
             kind == .desktopProxy
+        case .socks5Proxy:
+            kind == .socks5Proxy
+        case .reverseProxy:
+            kind == .reverseProxy
         case .importedSession:
             kind == .importedSession
         case .replay:
@@ -141,12 +157,41 @@ enum TrafficOriginFilter: String, CaseIterable, Equatable, Sendable {
     }
 }
 
-struct TrafficDisplayFilter: Equatable, Sendable {
+enum TrafficAnnotationFilter: String, CaseIterable, Codable, Equatable, Sendable {
+    case all
+    case commented
+    case highlighted
+    case struckThrough
+    case red
+    case yellow
+    case green
+    case blue
+    case purple
+    case gray
+
+    func matches(_ annotation: FlowAnnotation?) -> Bool {
+        switch self {
+        case .all:
+            true
+        case .commented:
+            annotation?.comment != nil
+        case .highlighted:
+            annotation?.highlight != nil
+        case .struckThrough:
+            annotation?.isStruckThrough == true
+        case .red, .yellow, .green, .blue, .purple, .gray:
+            annotation?.highlight?.rawValue == rawValue
+        }
+    }
+}
+
+struct TrafficDisplayFilter: Codable, Equatable, Sendable {
     var searchText = ""
     var method: TrafficMethodFilter = .all
     var status: TrafficStatusFilter = .all
     var contentType: TrafficContentTypeFilter = .all
     var origin: TrafficOriginFilter = .all
+    var annotation: TrafficAnnotationFilter = .all
 
     static let all = TrafficDisplayFilter()
 
@@ -156,6 +201,7 @@ struct TrafficDisplayFilter: Equatable, Sendable {
             || status != .all
             || contentType != .all
             || origin != .all
+            || annotation != .all
     }
 
     func matches(_ flow: Flow) -> Bool {
@@ -179,8 +225,12 @@ struct TrafficDisplayFilter: Equatable, Sendable {
     ) -> Bool {
         method.matches(flow.request.method)
             && status.matches(flow.response?.statusCode)
-            && contentType.matches(Self.contentType(for: flow))
+            && contentType.matches(
+                Self.contentType(for: flow),
+                graphqlOperation: flow.request.graphqlOperation
+            )
             && origin.matches(flow.source.kind)
+            && annotation.matches(flow.annotation)
             && searchTokens.allSatisfy(searchableText.contains)
     }
 
@@ -208,6 +258,11 @@ struct TrafficDisplayFilter: Equatable, Sendable {
         ]
         fields.append(contentsOf: headerFields(flow.request.headers))
         appendBodyMetadata(flow.request.body, to: &fields)
+        if let operation = flow.request.graphqlOperation {
+            fields.append(operation.kind.rawValue)
+            fields.append(operation.name ?? "anonymous")
+            fields.append("graphql")
+        }
 
         if let connection = flow.connection {
             fields.append(contentsOf: [
@@ -228,6 +283,20 @@ struct TrafficDisplayFilter: Equatable, Sendable {
             fields.append(trace.ruleName ?? "")
             fields.append(trace.phase.rawValue)
             fields.append(String(describing: trace.outcome))
+            fields.append(contentsOf: trace.logs)
+        }
+        if let annotation = flow.annotation {
+            fields.append(annotation.comment ?? "")
+            fields.append(annotation.highlight?.rawValue ?? "")
+            if annotation.comment != nil {
+                fields.append("commented annotation")
+            }
+            if annotation.highlight != nil {
+                fields.append("highlighted annotation")
+            }
+            if annotation.isStruckThrough {
+                fields.append("struck through annotation")
+            }
         }
         return fields
     }

@@ -1,10 +1,14 @@
 import AppKit
 import Combine
+import ProxyLensApplication
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class TrafficConsoleViewController: NSViewController {
     private let viewModel: TrafficConsoleViewModel
+    private let sourceListVisibilityStore: any TrafficSourceListVisibilityStoring
+    private let composerStore: any TrafficRequestComposerStoring
     private let sourceController: SourceListViewController
     private let flowController: FlowTableViewController
     private let inspectorController: InspectorViewController
@@ -13,6 +17,9 @@ final class TrafficConsoleViewController: NSViewController {
     private let captureButton = NSButton()
     private let clearSessionButton = NSButton()
     private let composeButton = NSButton()
+    private let importButton = NSButton()
+    private let reverseProxyButton = NSButton()
+    private let rulesButton = NSButton()
     private let certificateButton = NSButton()
     private let sourceToggleButton = NSButton()
     private let statusImage = NSImageView()
@@ -27,22 +34,35 @@ final class TrafficConsoleViewController: NSViewController {
     }()
     private lazy var sourceSplitViewItem: NSSplitViewItem = {
         let item = NSSplitViewItem(sidebarWithViewController: sourceController)
-        item.minimumThickness = 170
+        item.minimumThickness = 250
         item.maximumThickness = 400
         item.preferredThicknessFraction = 0.22
         item.canCollapse = true
+        item.isCollapsed = !sourceListVisibilityStore.isVisible
         return item
     }()
     private var snapshotCancellable: AnyCancellable?
     private var didSetInitialSourcePosition = false
     private var didSetInitialDetailPosition = false
+    private var didScheduleInitialSplitPositions = false
     private var rememberedInspectorHeight: CGFloat?
     private weak var configuredWindow: NSWindow?
 
-    init(viewModel: TrafficConsoleViewModel) {
+    init(
+        viewModel: TrafficConsoleViewModel,
+        sourceListVisibilityStore: any TrafficSourceListVisibilityStoring =
+            InMemoryTrafficSourceListVisibilityStore(),
+        composerStore: any TrafficRequestComposerStoring =
+            UserDefaultsTrafficRequestComposerStore()
+    ) {
         self.viewModel = viewModel
+        self.sourceListVisibilityStore = sourceListVisibilityStore
+        self.composerStore = composerStore
         self.sourceController = SourceListViewController(viewModel: viewModel)
-        self.flowController = FlowTableViewController(viewModel: viewModel)
+        self.flowController = FlowTableViewController(
+            viewModel: viewModel,
+            networkConditionProfileStore: UserDefaultsTrafficNetworkConditionProfileStore()
+        )
         self.inspectorController = InspectorViewController(viewModel: viewModel)
         super.init(nibName: nil, bundle: nil)
     }
@@ -109,6 +129,44 @@ final class TrafficConsoleViewController: NSViewController {
         composeButton.keyEquivalentModifierMask = [.command]
         composeButton.setAccessibilityIdentifier("request.compose")
 
+        importButton.translatesAutoresizingMaskIntoConstraints = false
+        importButton.title = "Import…"
+        importButton.bezelStyle = .rounded
+        importButton.target = self
+        importButton.action = #selector(importSession(_:))
+        importButton.keyEquivalent = "o"
+        importButton.keyEquivalentModifierMask = [.command]
+        importButton.setAccessibilityIdentifier("session.import")
+        importButton.setAccessibilityLabel("Import ProxyLens session or HAR file")
+
+        reverseProxyButton.translatesAutoresizingMaskIntoConstraints = false
+        reverseProxyButton.image = NSImage(
+            systemSymbolName: "arrow.triangle.branch",
+            accessibilityDescription: "Reverse Proxy"
+        )
+        reverseProxyButton.imagePosition = .imageOnly
+        reverseProxyButton.bezelStyle = .texturedRounded
+        reverseProxyButton.isBordered = false
+        reverseProxyButton.target = self
+        reverseProxyButton.action = #selector(showReverseProxy)
+        reverseProxyButton.toolTip = "Manage Listeners"
+        reverseProxyButton.setAccessibilityIdentifier("reverseProxy.manage")
+        reverseProxyButton.setAccessibilityLabel("Manage Proxy Listeners")
+
+        rulesButton.translatesAutoresizingMaskIntoConstraints = false
+        rulesButton.image = NSImage(
+            systemSymbolName: "slider.horizontal.3",
+            accessibilityDescription: "Rules"
+        )
+        rulesButton.imagePosition = .imageOnly
+        rulesButton.bezelStyle = .texturedRounded
+        rulesButton.isBordered = false
+        rulesButton.target = self
+        rulesButton.action = #selector(showRules)
+        rulesButton.toolTip = "Rules"
+        rulesButton.setAccessibilityIdentifier("rules.manage")
+        rulesButton.setAccessibilityLabel("Manage Rules")
+
         certificateButton.translatesAutoresizingMaskIntoConstraints = false
         certificateButton.title = "Trust HTTPS Certificate…"
         certificateButton.bezelStyle = .rounded
@@ -122,6 +180,9 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(appTitle)
         header.addSubview(statusImage)
         header.addSubview(statusField)
+        header.addSubview(reverseProxyButton)
+        header.addSubview(rulesButton)
+        header.addSubview(importButton)
         header.addSubview(composeButton)
         header.addSubview(certificateButton)
         header.addSubview(clearSessionButton)
@@ -141,7 +202,20 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.leadingAnchor.constraint(equalTo: statusImage.trailingAnchor, constant: 5),
             statusField.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             statusField.trailingAnchor.constraint(
-                lessThanOrEqualTo: composeButton.leadingAnchor, constant: -12),
+                lessThanOrEqualTo: reverseProxyButton.leadingAnchor, constant: -12),
+            reverseProxyButton.trailingAnchor.constraint(
+                equalTo: rulesButton.leadingAnchor, constant: -8),
+            reverseProxyButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            reverseProxyButton.widthAnchor.constraint(equalToConstant: 28),
+            reverseProxyButton.heightAnchor.constraint(equalToConstant: 28),
+            rulesButton.trailingAnchor.constraint(
+                equalTo: importButton.leadingAnchor, constant: -8),
+            rulesButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            rulesButton.widthAnchor.constraint(equalToConstant: 28),
+            rulesButton.heightAnchor.constraint(equalToConstant: 28),
+            importButton.trailingAnchor.constraint(
+                equalTo: composeButton.leadingAnchor, constant: -8),
+            importButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             composeButton.trailingAnchor.constraint(
                 equalTo: certificateButton.leadingAnchor, constant: -8),
             composeButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -204,8 +278,23 @@ final class TrafficConsoleViewController: NSViewController {
         super.viewDidAppear()
 
         hideWindowTitle()
-        setInitialSourcePositionIfNeeded()
-        setInitialDetailPositionIfNeeded()
+        scheduleInitialSplitPositions()
+    }
+
+    private func scheduleInitialSplitPositions() {
+        guard !didScheduleInitialSplitPositions else {
+            return
+        }
+        didScheduleInitialSplitPositions = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else {
+                return
+            }
+            view.layoutSubtreeIfNeeded()
+            setInitialSourcePositionIfNeeded()
+            setInitialDetailPositionIfNeeded()
+            view.layoutSubtreeIfNeeded()
+        }
     }
 
     private func setInitialSourcePositionIfNeeded() {
@@ -320,6 +409,7 @@ final class TrafficConsoleViewController: NSViewController {
 
     @objc private func toggleSourceList() {
         sourceSplitViewItem.isCollapsed.toggle()
+        sourceListVisibilityStore.save(isVisible: !sourceSplitViewItem.isCollapsed)
         updateSourceTogglePresentation()
     }
 
@@ -399,6 +489,28 @@ final class TrafficConsoleViewController: NSViewController {
         presentAsSheet(sheet)
     }
 
+    @objc private func showRules() {
+        let controller = RuleManagerViewController(viewModel: viewModel)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else {
+                return
+            }
+            self.dismiss(controller)
+        }
+        presentAsSheet(controller)
+    }
+
+    @objc private func showReverseProxy() {
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else {
+                return
+            }
+            self.dismiss(controller)
+        }
+        presentAsSheet(controller)
+    }
+
     private func dismissCertificateTrustSheet() {
         guard let presented = presentedViewControllers?.last else {
             return
@@ -416,6 +528,61 @@ final class TrafficConsoleViewController: NSViewController {
         }
     }
 
+    @objc private func importSession(_: NSButton) {
+        Task { @MainActor in
+            await presentSessionImporter()
+        }
+    }
+
+    private func presentSessionImporter() async {
+        let panel = NSOpenPanel()
+        panel.title = "Import Session"
+        panel.message = "Choose a ProxyLens session package or HAR 1.2 file."
+        panel.prompt = "Import"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            .package,
+            UTType(filenameExtension: "har"),
+            .json
+        ].compactMap { $0 }
+
+        let response: NSApplication.ModalResponse
+        if let window = view.window {
+            response = await panel.beginSheetModal(for: window)
+        } else {
+            response = panel.runModal()
+        }
+        guard response == .OK, let fileURL = panel.url else {
+            return
+        }
+
+        importButton.isEnabled = false
+        importButton.title = "Importing…"
+        defer {
+            importButton.title = "Import…"
+            importButton.isEnabled = true
+        }
+        do {
+            let values = try? fileURL.resourceValues(forKeys: [.isDirectoryKey])
+            if fileURL.pathExtension.lowercased() == PortableSessionService.fileExtension
+                || values?.isDirectory == true
+            {
+                try await viewModel.importPortableSession(from: fileURL)
+            } else {
+                try await viewModel.importHAR(from: fileURL)
+            }
+        } catch {
+            let alert = NSAlert(error: error)
+            if let window = view.window {
+                await alert.beginSheetModal(for: window)
+            } else {
+                alert.runModal()
+            }
+        }
+    }
+
     private func presentRequestComposer() async {
         let editor = RequestEditorViewController(
             draft: TrafficRequestEditDraft(
@@ -426,7 +593,9 @@ final class TrafficConsoleViewController: NSViewController {
                 bodyText: "",
                 canEditBody: true,
                 bodyMessage: nil
-            )
+            ),
+            allowsCURLImport: true,
+            composerStore: composerStore
         )
         addChild(editor)
         defer { editor.removeFromParent() }
@@ -434,7 +603,7 @@ final class TrafficConsoleViewController: NSViewController {
         let alert = NSAlert()
         alert.messageText = "Compose Request"
         alert.informativeText =
-            "Enter an absolute HTTP or HTTPS URL in the request line, then edit headers and body."
+            "Enter an absolute HTTP or HTTPS URL, or import a cURL command from the clipboard."
         alert.addButton(withTitle: "Send Request")
         let cancelButton = alert.addButton(withTitle: "Cancel")
         cancelButton.keyEquivalent = "\u{1b}"
@@ -451,10 +620,15 @@ final class TrafficConsoleViewController: NSViewController {
             return
         }
 
+        let bodyText = editor.bodyText
         do {
             try await viewModel.composeRequest(
                 headersText: editor.headersText,
-                bodyText: editor.bodyText.isEmpty ? nil : editor.bodyText
+                bodyText: bodyText.isEmpty ? nil : bodyText
+            )
+            _ = composerStore.recordHistory(
+                headersText: editor.headersText,
+                bodyText: bodyText
             )
         } catch {
             let errorAlert = NSAlert(error: error)

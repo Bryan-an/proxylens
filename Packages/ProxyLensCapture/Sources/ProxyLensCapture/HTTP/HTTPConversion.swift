@@ -23,25 +23,59 @@ enum HTTPConversion {
 
     static func coreVersion(from version: NIOHTTP1.HTTPVersion) throws -> ProxyLensCore.HTTPVersion
     {
-        guard version.major == 1, version.minor == 0 || version.minor == 1 else {
+        switch (version.major, version.minor) {
+        case (1, 0):
+            return .http10
+        case (1, 1):
+            return .http11
+        case (2, 0):
+            return .http2
+        default:
             throw ProxyLensError.unsupportedOperation("HTTP version \(version)")
         }
-
-        return version.minor == 0 ? .http10 : .http11
     }
 
-    static func sanitizedRequestHeaders(_ headers: NIOHTTP1.HTTPHeaders) -> NIOHTTP1.HTTPHeaders {
+    static func upstreamVersion(for downstreamVersion: NIOHTTP1.HTTPVersion) -> NIOHTTP1.HTTPVersion
+    {
+        downstreamVersion.major == 2 ? .http1_1 : downstreamVersion
+    }
+
+    static func nioVersion(from version: ProxyLensCore.HTTPVersion) -> NIOHTTP1.HTTPVersion {
+        switch version {
+        case .http10:
+            return .http1_0
+        case .http11:
+            return .http1_1
+        case .http2:
+            return NIOHTTP1.HTTPVersion(major: 2, minor: 0)
+        case .http3:
+            return NIOHTTP1.HTTPVersion(major: 3, minor: 0)
+        }
+    }
+
+    static func sanitizedRequestHeaders(
+        _ headers: NIOHTTP1.HTTPHeaders,
+        preservingWebSocketUpgrade: Bool = false
+    ) -> NIOHTTP1.HTTPHeaders {
         var result = NIOHTTP1.HTTPHeaders()
 
         for (name, value) in headers where !hopByHopHeaders.contains(name.lowercased()) {
             result.add(name: name, value: value)
         }
 
-        result.add(name: "Connection", value: "close")
+        if preservingWebSocketUpgrade {
+            result.add(name: "Connection", value: "Upgrade")
+            result.add(name: "Upgrade", value: "websocket")
+        } else {
+            result.add(name: "Connection", value: "close")
+        }
         return result
     }
 
-    static func sanitizedResponseHead(_ head: NIOHTTP1.HTTPResponseHead)
+    static func sanitizedResponseHead(
+        _ head: NIOHTTP1.HTTPResponseHead,
+        preservingWebSocketUpgrade: Bool = false
+    )
         -> NIOHTTP1.HTTPResponseHead
     {
         var result = head
@@ -51,9 +85,23 @@ enum HTTPConversion {
             headers.add(name: name, value: value)
         }
 
-        headers.add(name: "Connection", value: "close")
+        if preservingWebSocketUpgrade {
+            headers.add(name: "Connection", value: "Upgrade")
+            headers.add(name: "Upgrade", value: "websocket")
+        } else {
+            headers.add(name: "Connection", value: "close")
+        }
         result.headers = headers
         return result
+    }
+
+    static func isWebSocketUpgradeRequest(_ head: HTTPRequestHead) -> Bool {
+        isWebSocketUpgradeHeaders(head.headers)
+    }
+
+    static func isWebSocketUpgradeHeaders(_ headers: NIOHTTP1.HTTPHeaders) -> Bool {
+        headerContainsToken(headers[canonicalForm: "Connection"], token: "upgrade")
+            && headerContainsToken(headers[canonicalForm: "Upgrade"], token: "websocket")
     }
 
     static func sanitizedTrailers(_ trailers: NIOHTTP1.HTTPHeaders?) -> NIOHTTP1.HTTPHeaders? {
@@ -79,4 +127,16 @@ enum HTTPConversion {
         "transfer-encoding",
         "upgrade"
     ]
+
+    private static func headerContainsToken<Values: Sequence>(
+        _ values: Values,
+        token: String
+    ) -> Bool where Values.Element: StringProtocol {
+        values.contains { value in
+            value.split(separator: ",").contains {
+                String($0).trimmingCharacters(in: .whitespaces)
+                    .caseInsensitiveCompare(token) == .orderedSame
+            }
+        }
+    }
 }

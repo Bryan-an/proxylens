@@ -32,13 +32,32 @@ targets:
       - path: ProxyLensApp
         excludes:
           - "**/*.entitlements"
+    info:
+      path: ProxyLensApp/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: ProxyLens
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.proxylens.session
+            UTTypeDescription: ProxyLens Session
+            UTTypeConformsTo:
+              - com.apple.package
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - proxylens
+          - UTTypeIdentifier: com.proxylens.rule-profile
+            UTTypeDescription: ProxyLens Rule Profile
+            UTTypeConformsTo:
+              - public.json
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - proxylensrules
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.proxylens.ProxyLens
         PRODUCT_NAME: ProxyLens
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: ProxyLens
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: 1
         ENABLE_HARDENED_RUNTIME: YES

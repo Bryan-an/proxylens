@@ -115,6 +115,91 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
         )
     }
 
+    func testHighlightsGraphQLKeywordsVariablesStringsAndComments() {
+        let graphql = #"""
+            query Viewer($id: ID!) { viewer(id: $id) { name # selected field
+            } label(value: "query $ignored") }
+            """#
+        let highlighted = InspectorSyntaxHighlighter.highlight(graphql, as: .graphql)
+
+        XCTAssertEqual(highlighted.string, graphql)
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: "query")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: "$id")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: #""query $ignored""#)!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+        XCTAssertEqual(
+            foregroundColor(at: graphql.range(of: "# selected field")!, in: highlighted),
+            .secondaryLabelColor
+        )
+    }
+
+    func testHighlightsProtobufFieldsTypesAndValuesWithoutChangingContent() {
+        let protobuf = "1  varint   150\n2  string   \"hello\""
+        let highlighted = InspectorSyntaxHighlighter.highlight(protobuf, as: .protobuf)
+
+        XCTAssertEqual(highlighted.string, protobuf)
+        XCTAssertEqual(
+            foregroundColor(at: protobuf.range(of: "1")!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            foregroundColor(at: protobuf.range(of: "varint")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: protobuf.range(of: "150")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: protobuf.range(of: #""hello""#)!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+    }
+
+    func testHighlightsJavaScriptWithoutChangingSource() {
+        let source = #"""
+            function onRequest(context) {
+              const count = 42;
+              context.log("request"); // visible in the Rules inspector
+              return context.request;
+            }
+            """#
+        let highlighted = InspectorSyntaxHighlighter.highlight(source, as: .javaScript)
+
+        XCTAssertEqual(highlighted.string, source)
+        XCTAssertEqual(
+            foregroundColor(at: source.range(of: "function")!, in: highlighted),
+            InspectorSyntaxPalette.literal
+        )
+        XCTAssertEqual(
+            foregroundColor(at: source.range(of: "onRequest")!, in: highlighted),
+            InspectorSyntaxPalette.key
+        )
+        XCTAssertEqual(
+            foregroundColor(at: source.range(of: "42")!, in: highlighted),
+            InspectorSyntaxPalette.number
+        )
+        XCTAssertEqual(
+            foregroundColor(at: source.range(of: #""request""#)!, in: highlighted),
+            InspectorSyntaxPalette.string
+        )
+        XCTAssertEqual(
+            foregroundColor(
+                at: source.range(of: "// visible in the Rules inspector")!,
+                in: highlighted
+            ),
+            .secondaryLabelColor
+        )
+    }
+
     func testSelectsBodyLanguageFromContentType() {
         XCTAssertEqual(
             InspectorSyntaxHighlighter.language(forContentType: "application/xml; charset=utf-8"),
@@ -138,6 +223,10 @@ final class InspectorSyntaxHighlighterTests: XCTestCase {
             InspectorSyntaxHighlighter.language(
                 forContentType: "multipart/form-data; boundary=test"),
             .plainText
+        )
+        XCTAssertEqual(
+            InspectorSyntaxHighlighter.language(forContentType: "application/graphql"),
+            .graphql
         )
         XCTAssertEqual(
             InspectorSyntaxHighlighter.language(forContentType: "text/plain"),

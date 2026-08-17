@@ -16,9 +16,10 @@ These documents are complementary. The feature investigation defines product con
 
 Current product decisions:
 
-- macOS only.
-- Native experience.
-- Desktop proxying first.
+- macOS-first native desktop experience, followed by the authorized P2 companion/mobile and
+  integration surfaces.
+- Desktop proxying first so later protocol, device, automation, and collaboration work shares a
+  reliable data plane.
 - Free and local-first; no required account, server, cloud, or subscription.
 - Raw request/response bytes are authoritative; decoded views are derived.
 - Implement behavior independently. Do not copy Proxyman proprietary code, assets, branding, or implementation details.
@@ -42,15 +43,16 @@ P0 is a reliable local desktop debugger:
 - Session persistence and offline inspection.
 - Signed and notarized direct-download macOS build.
 
-P1 follows after P0 is reliable:
+P1 follows as the desktop data plane becomes reliable:
 
 - WebSocket inspection, HTTP/2, throttling, scripting, richer decoders, request builders, replay, annotations, and advanced search.
 
-P2 is intentionally deferred:
+P2 is an authorized expansion milestone after the relevant P0/P1 foundations:
 
 - Mobile capture, transparent/VPN routing, HTTP/3/QUIC, cloud sync, collaboration, team accounts, hosted telemetry, MCP/Raycast integrations, and App Store distribution.
 
-Do not pull P1/P2 work into P0 unless the user explicitly changes scope.
+P0, P1, and P2 are all in product scope. Preserve the staged dependency order and land thin,
+tested vertical slices rather than mixing unrelated milestone work into one change.
 
 ## Technology decisions
 

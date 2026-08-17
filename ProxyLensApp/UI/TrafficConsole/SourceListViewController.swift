@@ -1,4 +1,7 @@
 import AppKit
+import ProxyLensApplication
+import ProxyLensCore
+import UniformTypeIdentifiers
 
 @MainActor
 final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
@@ -56,6 +59,30 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
             symbolName: "tray.full",
             selection: .allTraffic
         )
+        let sessions = SourceOutlineNode(
+            id: "sessions",
+            title: "Sessions",
+            count: snapshot.sessions.count,
+            countSingular: "session",
+            symbolName: "clock.arrow.circlepath",
+            selection: nil,
+            children: snapshot.sessions.map { session in
+                let presentation = Self.presentation(for: session.state)
+                return SourceOutlineNode(
+                    id: "session:\(session.id)",
+                    title: session.name
+                        ?? Self.sessionDateFormatter.string(from: session.startedAt),
+                    count: session.flowCount,
+                    symbolName: presentation.symbolName,
+                    symbolTintColor: presentation.tintColor,
+                    statusDescription: presentation.statusDescription,
+                    selection: .session(session.id),
+                    sessionID: session.id,
+                    sessionName: session.name,
+                    sessionState: session.state
+                )
+            }
+        )
         let applications = SourceOutlineNode(
             id: "applications",
             title: "Apps",
@@ -111,6 +138,9 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
             }
         )
         roots = [allTraffic]
+        if !sessions.children.isEmpty {
+            roots.append(sessions)
+        }
         if !pinned.children.isEmpty {
             roots.append(pinned)
         }
@@ -118,6 +148,9 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         outlineView.reloadData()
         if !pinned.children.isEmpty {
             outlineView.expandItem(pinned)
+        }
+        if !sessions.children.isEmpty {
+            outlineView.expandItem(sessions)
         }
         outlineView.expandItem(applications)
         outlineView.expandItem(domains)
@@ -172,7 +205,9 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
             count: node.count,
             countSingular: node.countSingular,
             symbolName: node.symbolName,
-            bundlePath: node.bundlePath
+            bundlePath: node.bundlePath,
+            symbolTintColor: node.symbolTintColor,
+            statusDescription: node.statusDescription
         )
         return cell
     }
@@ -196,9 +231,17 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         menu.removeAllItems()
         let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
         guard row >= 0,
-            let node = outlineView.item(atRow: row) as? SourceOutlineNode,
-            let host = node.domainHost
+            let node = outlineView.item(atRow: row) as? SourceOutlineNode
         else {
+            return
+        }
+
+        if node.sessionID != nil {
+            addSessionActions(for: node, to: menu)
+            return
+        }
+
+        guard let host = node.domainHost else {
             return
         }
 
@@ -223,6 +266,264 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         }
         viewModel.setPinnedDomain(host, isPinned: !pinnedDomainHosts.contains(host))
     }
+
+    private func addSessionActions(for node: SourceOutlineNode, to menu: NSMenu) {
+        let canModify = node.sessionState != .recording
+        let exportPortable = NSMenuItem(
+            title: "Export ProxyLens Session…",
+            action: #selector(exportPortableSession(_:)),
+            keyEquivalent: ""
+        )
+        exportPortable.image = NSImage(
+            systemSymbolName: "shippingbox",
+            accessibilityDescription: nil
+        )
+        exportPortable.target = self
+        exportPortable.representedObject = node
+        menu.addItem(exportPortable)
+
+        let exportHAR = NSMenuItem(
+            title: "Export Session as HAR…",
+            action: #selector(exportSessionHAR(_:)),
+            keyEquivalent: ""
+        )
+        exportHAR.image = NSImage(
+            systemSymbolName: "square.and.arrow.up",
+            accessibilityDescription: nil
+        )
+        exportHAR.target = self
+        exportHAR.representedObject = node
+        exportHAR.isEnabled = node.count > 0
+        menu.addItem(exportHAR)
+        menu.addItem(.separator())
+
+        let rename = NSMenuItem(
+            title: "Rename Session…",
+            action: #selector(renameSession(_:)),
+            keyEquivalent: ""
+        )
+        rename.image = NSImage(
+            systemSymbolName: "pencil",
+            accessibilityDescription: nil
+        )
+        rename.target = self
+        rename.representedObject = node
+        rename.isEnabled = canModify
+        menu.addItem(rename)
+
+        let delete = NSMenuItem(
+            title: "Delete Session…",
+            action: #selector(deleteSession(_:)),
+            keyEquivalent: ""
+        )
+        delete.image = NSImage(
+            systemSymbolName: "trash",
+            accessibilityDescription: nil
+        )
+        delete.target = self
+        delete.representedObject = node
+        delete.isEnabled = canModify
+        menu.addItem(delete)
+    }
+
+    @objc private func exportPortableSession(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? SourceOutlineNode,
+            let sessionID = node.sessionID
+        else {
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.title = "Export ProxyLens Session"
+        panel.message =
+            "Preserve this session's raw bodies, metadata, timings, annotations, and rule traces."
+        panel.prompt = "Export"
+        panel.nameFieldStringValue = Self.portableFileName(for: node.title)
+        panel.allowedContentTypes = [Self.portableSessionType]
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] result in
+            guard result == .OK, let fileURL = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.writePortableSession(
+                        sessionID: sessionID,
+                        to: fileURL
+                    )
+                } catch {
+                    self.present(error)
+                }
+            }
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
+
+    @objc private func exportSessionHAR(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? SourceOutlineNode,
+            let sessionID = node.sessionID
+        else {
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.title = "Export Session as HAR"
+        panel.message = "Export every captured flow in this session as one HAR 1.2 file."
+        panel.prompt = "Export"
+        panel.nameFieldStringValue = Self.harFileName(for: node.title)
+        if let harType = UTType(filenameExtension: "har") {
+            panel.allowedContentTypes = [harType]
+        } else {
+            panel.allowedContentTypes = [.json]
+        }
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] result in
+            guard result == .OK, let fileURL = panel.url, let self else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    try await self.viewModel.writeHAR(sessionID: sessionID, to: fileURL)
+                } catch {
+                    self.present(error)
+                }
+            }
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
+
+    @objc private func renameSession(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? SourceOutlineNode,
+            let sessionID = node.sessionID
+        else {
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Rename Session"
+        alert.informativeText = "Use a short name that describes this capture."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let nameField = NSTextField(string: node.sessionName ?? "")
+        nameField.placeholderString = "Session name"
+        nameField.setAccessibilityLabel("Session name")
+        nameField.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        alert.accessoryView = nameField
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+
+        Task {
+            do {
+                try await viewModel.renameSession(sessionID, to: nameField.stringValue)
+            } catch {
+                present(error)
+            }
+        }
+    }
+
+    @objc private func deleteSession(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? SourceOutlineNode,
+            let sessionID = node.sessionID
+        else {
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete “\(node.title)”?"
+        alert.informativeText =
+            "This removes the saved session and all of its captured flows from this Mac."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+
+        Task {
+            do {
+                try await viewModel.deleteSession(sessionID)
+            } catch {
+                present(error)
+            }
+        }
+    }
+
+    private func present(_ error: Error) {
+        let alert = NSAlert(error: error)
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    private static let sessionDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private static let portableSessionType = UTType(
+        exportedAs: "com.proxylens.session",
+        conformingTo: .package
+    )
+
+    private static func portableFileName(for sessionTitle: String) -> String {
+        "\(sanitizedFileName(for: sessionTitle)).\(PortableSessionService.fileExtension)"
+    }
+
+    private static func harFileName(for sessionTitle: String) -> String {
+        "\(sanitizedFileName(for: sessionTitle)).har"
+    }
+
+    private static func sanitizedFileName(for sessionTitle: String) -> String {
+        let sanitized =
+            sessionTitle
+            .replacingOccurrences(of: "/", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitized.isEmpty ? "session" : sanitized
+    }
+
+    private static func presentation(for state: SessionState) -> SessionPresentation {
+        switch state {
+        case .recording:
+            SessionPresentation(
+                symbolName: "record.circle.fill",
+                tintColor: .systemRed,
+                statusDescription: "Recording"
+            )
+        case .stopped:
+            SessionPresentation(
+                symbolName: "clock",
+                tintColor: .secondaryLabelColor,
+                statusDescription: "Stopped"
+            )
+        case .interrupted:
+            SessionPresentation(
+                symbolName: "exclamationmark.triangle.fill",
+                tintColor: .systemOrange,
+                statusDescription: "Interrupted"
+            )
+        }
+    }
+}
+
+private struct SessionPresentation {
+    let symbolName: String
+    let tintColor: NSColor
+    let statusDescription: String
 }
 
 @MainActor
@@ -233,8 +534,13 @@ private final class SourceOutlineNode: NSObject {
     let countSingular: String
     let symbolName: String
     let bundlePath: String?
+    let symbolTintColor: NSColor?
+    let statusDescription: String?
     let selection: TrafficSourceSelection?
     let domainHost: String?
+    let sessionID: SessionID?
+    let sessionName: String?
+    let sessionState: SessionState?
     let children: [SourceOutlineNode]
 
     init(
@@ -244,8 +550,13 @@ private final class SourceOutlineNode: NSObject {
         countSingular: String = "flow",
         symbolName: String,
         bundlePath: String? = nil,
+        symbolTintColor: NSColor? = nil,
+        statusDescription: String? = nil,
         selection: TrafficSourceSelection?,
         domainHost: String? = nil,
+        sessionID: SessionID? = nil,
+        sessionName: String? = nil,
+        sessionState: SessionState? = nil,
         children: [SourceOutlineNode] = []
     ) {
         self.id = id
@@ -254,8 +565,13 @@ private final class SourceOutlineNode: NSObject {
         self.countSingular = countSingular
         self.symbolName = symbolName
         self.bundlePath = bundlePath
+        self.symbolTintColor = symbolTintColor
+        self.statusDescription = statusDescription
         self.selection = selection
         self.domainHost = domainHost
+        self.sessionID = sessionID
+        self.sessionName = sessionName
+        self.sessionState = sessionState
         self.children = children
     }
 }
@@ -309,18 +625,22 @@ private final class SourceCellView: NSTableCellView {
         count: Int,
         countSingular: String,
         symbolName: String,
-        bundlePath: String?
+        bundlePath: String?,
+        symbolTintColor: NSColor?,
+        statusDescription: String?
     ) {
         if let bundlePath {
             symbolView.image = NSWorkspace.shared.icon(forFile: bundlePath)
             symbolView.contentTintColor = nil
         } else {
             symbolView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
-            symbolView.contentTintColor = .secondaryLabelColor
+            symbolView.contentTintColor = symbolTintColor ?? .secondaryLabelColor
         }
+        symbolView.toolTip = statusDescription
         titleField.stringValue = title
         countField.stringValue = count.formatted()
         let countDescription = count == 1 ? countSingular : "\(countSingular)s"
-        setAccessibilityLabel("\(title), \(count) \(countDescription)")
+        let status = statusDescription.map { ", \($0)" } ?? ""
+        setAccessibilityLabel("\(title)\(status), \(count) \(countDescription)")
     }
 }

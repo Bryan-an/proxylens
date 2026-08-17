@@ -120,6 +120,32 @@ public actor FileBodyStore: BodyStore {
                 }
             }
 
+            let frameRows = try Row.fetchAll(
+                database,
+                sql: "SELECT snapshot FROM websocket_frames"
+            )
+            for row in frameRows {
+                let snapshot: Data = row["snapshot"]
+                let frame = try PersistenceCoding.decode(
+                    CapturedWebSocketFrame.self,
+                    from: snapshot
+                )
+                referencedBodyIDs.insert(frame.payload.id.description)
+            }
+
+            let serverSentEventRows = try Row.fetchAll(
+                database,
+                sql: "SELECT snapshot FROM server_sent_events"
+            )
+            for row in serverSentEventRows {
+                let snapshot: Data = row["snapshot"]
+                let event = try PersistenceCoding.decode(
+                    CapturedServerSentEvent.self,
+                    from: snapshot
+                )
+                referencedBodyIDs.insert(event.data.id.description)
+            }
+
             let bodyRows = try Row.fetchAll(
                 database,
                 sql: "SELECT id, relative_path FROM bodies"

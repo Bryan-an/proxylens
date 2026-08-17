@@ -5,11 +5,15 @@ import ProxyLensCore
 import ProxyLensPersistence
 import ProxyLensPlatform
 
+extension GRDBSessionStore: TrafficWebSocketFrameLoading {}
+extension GRDBSessionStore: TrafficServerSentEventLoading {}
+
 @MainActor
 final class CompositionRoot {
     let captureCoordinator: CaptureCoordinator
     let flowEvents: FlowEventBus
     let trafficConsoleViewModel: TrafficConsoleViewModel
+    private let webSocketConnectionClient: NIOWebSocketConnectionClient
 
     init(fileManager: FileManager = .default) throws {
         let storageRoot = try Self.storageRoot(fileManager: fileManager)
@@ -25,6 +29,16 @@ final class CompositionRoot {
             flowStore: sessionStore,
             downstream: flowEvents
         )
+        let webSocketFrameEvents = WebSocketFrameEventBus()
+        let webSocketFramePersistenceSink = PersistingWebSocketFrameEventSink(
+            frameStore: sessionStore,
+            downstream: webSocketFrameEvents
+        )
+        let serverSentEventEvents = ServerSentEventEventBus()
+        let serverSentEventPersistenceSink = PersistingServerSentEventEventSink(
+            eventStore: sessionStore,
+            downstream: serverSentEventEvents
+        )
         let certificateProvider = KeychainCertificateProvider()
         let certificateTrustStore = SystemCertificateTrustStore(
             certificateProvider: certificateProvider
@@ -32,14 +46,22 @@ final class CompositionRoot {
         let ruleEngine = RuleEngine()
         let breakpointCoordinator = BreakpointCoordinator()
         let flowSourceResolver = MacOSFlowSourceResolver()
+        let externalHTTPProxyCredentialStore = KeychainExternalHTTPProxyCredentialStore()
+        let scriptExecutor = Bundle.main.executableURL.map {
+            ProcessJavaScriptExecutor(workerExecutableURL: $0)
+        }
         let proxyEngine = NIOProxyEngine(
             eventSink: persistenceSink,
+            serverSentEventEventSink: serverSentEventPersistenceSink,
+            webSocketFrameEventSink: webSocketFramePersistenceSink,
             bodyStore: bodyStore,
             maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes,
             certificateProvider: certificateProvider,
             ruleSnapshot: ruleEngine.snapshot,
+            scriptExecutor: scriptExecutor,
             breakpointGate: breakpointCoordinator,
-            flowSourceResolver: flowSourceResolver
+            flowSourceResolver: flowSourceResolver,
+            externalHTTPProxyCredentialStore: externalHTTPProxyCredentialStore
         )
         let systemProxyController = MacOSSystemProxyController(
             snapshotURL:
@@ -63,11 +85,45 @@ final class CompositionRoot {
             client: requestReplayClient,
             flowStore: sessionStore
         )
+        let webSocketConnectionClient = NIOWebSocketConnectionClient(
+            eventSink: persistenceSink,
+            webSocketFrameEventSink: webSocketFramePersistenceSink,
+            bodyStore: bodyStore,
+            maximumCapturedFrameBytes: databaseConfiguration.maximumCapturedBodyBytes,
+            maximumWebSocketFrameBytes: Int(
+                clamping: databaseConfiguration.maximumCapturedBodyBytes
+            )
+        )
+        let webSocketComposeService = WebSocketComposeService(
+            transmitters: [proxyEngine, webSocketConnectionClient],
+            connectionClient: webSocketConnectionClient
+        )
         let sessionService = SessionService(sessionStore: sessionStore)
+        let harImporter = HARImportService(
+            sessionStore: sessionStore,
+            bodyStore: bodyStore,
+            maximumBodyByteCount: databaseConfiguration.maximumCapturedBodyBytes
+        )
+        let portableSessionService = PortableSessionService(
+            sessionStore: sessionStore,
+            bodyStore: bodyStore,
+            maximumBodyByteCount: databaseConfiguration.maximumCapturedBodyBytes
+        )
         let certificateTrustService = CertificateTrustService(trustStore: certificateTrustStore)
+        let ruleProfileStore = FileRuleProfileStore(
+            directoryURL: storageRoot.appendingPathComponent("RuleProfiles", isDirectory: true)
+        )
+        let ruleProfileArchive = RuleProfileArchiveService()
+        let protobufDescriptorStore = FileTrafficProtobufDescriptorStore(
+            directoryURL: storageRoot.appendingPathComponent(
+                "ProtobufDescriptors",
+                isDirectory: true
+            )
+        )
 
         self.flowEvents = flowEvents
         self.captureCoordinator = captureCoordinator
+        self.webSocketConnectionClient = webSocketConnectionClient
         self.trafficConsoleViewModel = TrafficConsoleViewModel(
             captureController: captureCoordinator,
             eventSource: flowEvents,
@@ -78,14 +134,33 @@ final class CompositionRoot {
                     interceptHTTPS: true
                 )
             ),
+            webSocketFrameLoader: sessionStore,
+            webSocketFrameEventSource: webSocketFrameEvents,
+            webSocketComposer: webSocketComposeService,
+            serverSentEventLoader: sessionStore,
+            serverSentEventEventSource: serverSentEventEvents,
             ruleEngine: ruleEngine,
             breakpointCoordinator: breakpointCoordinator,
             exportService: exportService,
             requestReplayer: replayService,
             sessionService: sessionService,
+            harImporter: harImporter,
+            portableSessionTransfer: portableSessionService,
             certificateTrust: certificateTrustService,
-            pinnedDomainsStore: UserDefaultsTrafficPinnedDomainsStore()
+            ruleProfileStore: ruleProfileStore,
+            ruleProfileArchive: ruleProfileArchive,
+            pinnedDomainsStore: UserDefaultsTrafficPinnedDomainsStore(),
+            protobufDescriptorStore: protobufDescriptorStore,
+            reverseProxyRouteStore: UserDefaultsTrafficReverseProxyRouteStore(),
+            socks5ListenerStore: UserDefaultsTrafficSOCKS5ListenerStore(),
+            externalHTTPProxyStore: UserDefaultsTrafficExternalHTTPProxyStore(),
+            externalHTTPProxyCredentialStore: externalHTTPProxyCredentialStore,
+            customFilterPresetStore: UserDefaultsTrafficCustomFilterPresetStore()
         )
+    }
+
+    func shutdown() async {
+        await webSocketConnectionClient.shutdown()
     }
 
     private static func storageRoot(fileManager: FileManager) throws -> URL {

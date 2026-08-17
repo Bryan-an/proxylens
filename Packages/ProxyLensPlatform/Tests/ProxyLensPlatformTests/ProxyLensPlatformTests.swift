@@ -8,6 +8,241 @@ import XCTest
 @testable import ProxyLensPlatform
 
 final class ProxyLensPlatformTests: XCTestCase {
+    func testExternalHTTPProxyCredentialsRoundTripAndRemoveFromKeychain() async throws {
+        let store = KeychainExternalHTTPProxyCredentialStore(
+            configuration: .init(service: "com.proxylens.tests.\(UUID().uuidString)")
+        )
+        let endpoint = NetworkEndpoint(host: "proxy.example.test", port: 8_080)
+        let credentials = try ExternalHTTPProxyCredentials(
+            username: "local-user",
+            password: "private-password"
+        )
+
+        do {
+            try await store.save(credentials, for: endpoint)
+            let stored = try await store.credentials(
+                for: endpoint,
+                username: credentials.username
+            )
+            XCTAssertEqual(stored, credentials)
+            try await store.removeCredentials(for: endpoint)
+            let removed = try await store.credentials(
+                for: endpoint,
+                username: credentials.username
+            )
+            XCTAssertNil(removed)
+        } catch {
+            try? await store.removeCredentials(for: endpoint)
+            throw error
+        }
+    }
+
+    func testJavaScriptWorkerMutatesRequestAndReturnsBoundedLogs() throws {
+        let request = try ScriptExecutionRequest(
+            hook: .request,
+            source: """
+                function onRequest(context) {
+                  context.request.method = "PATCH";
+                  context.request.headers.push({ name: "X-ProxyLens", value: "script" });
+                  context.request.body = JSON.stringify({ updated: true });
+                  context.log("request updated");
+                }
+                """,
+            message: ScriptHTTPMessage(
+                method: "POST",
+                url: "https://example.test/items",
+                headers: [
+                    try HTTPHeader(name: "Set-Cookie", value: "first=1"),
+                    try HTTPHeader(name: "Set-Cookie", value: "second=2")
+                ]
+            )
+        )
+
+        let result = try JavaScriptWorker.evaluate(request)
+
+        XCTAssertEqual(result.hook, .request)
+        XCTAssertEqual(result.message.method, "PATCH")
+        XCTAssertEqual(
+            result.message.headers.map(\.name), ["Set-Cookie", "Set-Cookie", "X-ProxyLens"])
+        XCTAssertEqual(result.message.body, #"{"updated":true}"#)
+        XCTAssertEqual(result.logs, ["request updated"])
+    }
+
+    func testJavaScriptWorkerSupportsResponseReplacementAndFreshContexts() throws {
+        let first = try ScriptExecutionRequest(
+            hook: .response,
+            source: """
+                globalThis.leakedValue = 7;
+                function onResponse(context) {
+                  return { ...context.response, statusCode: 201, body: "created" };
+                }
+                """,
+            message: ScriptHTTPMessage(statusCode: 200)
+        )
+        let second = try ScriptExecutionRequest(
+            hook: .response,
+            source: """
+                function onResponse(context) {
+                  context.response.body = typeof leakedValue;
+                }
+                """,
+            message: ScriptHTTPMessage(statusCode: 204)
+        )
+
+        XCTAssertEqual(try JavaScriptWorker.evaluate(first).message.statusCode, 201)
+        XCTAssertEqual(try JavaScriptWorker.evaluate(first).message.body, "created")
+        XCTAssertEqual(try JavaScriptWorker.evaluate(second).message.body, "undefined")
+    }
+
+    func testJavaScriptWorkerReportsMissingExceptionAndAsyncHandlers() throws {
+        let message = ScriptHTTPMessage(method: "GET", url: "https://example.test/")
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source: "const value = 1;",
+                    message: message
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? ScriptExecutionError, .missingHandler("onRequest"))
+        }
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source: "function onRequest() { throw new Error('boom'); }",
+                    message: message
+                )
+            )
+        ) { error in
+            guard case .javaScriptException(let message) = error as? ScriptExecutionError else {
+                return XCTFail("Expected a JavaScript exception, got \(error)")
+            }
+            XCTAssertTrue(message.contains("boom"))
+        }
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source:
+                        "function onRequest(context) { return Promise.resolve(context.request); }",
+                    message: message
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? ScriptExecutionError, .asynchronousResultUnsupported)
+        }
+    }
+
+    func testJavaScriptWorkerRejectsInvalidMessagesAndBoundOverflows() throws {
+        let message = ScriptHTTPMessage(method: "GET", url: "https://example.test/")
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source:
+                        "function onRequest(context) { context.request.url = 'file:///tmp/x'; }",
+                    message: message
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? ScriptExecutionError, .invalidRequestMessage)
+        }
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source:
+                        "function onRequest(context) { context.request.headers.push({ name: 'Bad Header', value: 'x' }); }",
+                    message: message
+                )
+            )
+        ) { error in
+            guard case .invalidOutput = error as? ScriptExecutionError else {
+                return XCTFail("Expected invalid header output, got \(error)")
+            }
+        }
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source:
+                        "function onRequest(context) { context.request.body = 'x'.repeat(\(ScriptExecutionLimits.maximumBodyByteCount + 1)); }",
+                    message: message
+                )
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ScriptExecutionError,
+                .outputTooLarge(maximumByteCount: ScriptExecutionLimits.maximumOutputByteCount)
+            )
+        }
+
+        XCTAssertThrowsError(
+            try JavaScriptWorker.evaluate(
+                ScriptExecutionRequest(
+                    hook: .request,
+                    source:
+                        "function onRequest(context) { for (let i = 0; i < 101; i++) context.log(i); }",
+                    message: message
+                )
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ScriptExecutionError,
+                .tooManyLogs(maximumCount: ScriptExecutionLimits.maximumLogCount)
+            )
+        }
+    }
+
+    func testProcessJavaScriptExecutorRejectsMalformedWorkerOutputAndCleansUp() async throws {
+        let temporaryRootURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ProxyLensMalformedScriptWorker-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: temporaryRootURL,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryRootURL) }
+        let workerURL = temporaryRootURL.appendingPathComponent("worker.sh", isDirectory: false)
+        try Data("#!/bin/sh\nprintf 'not-json' > \"$3\"\n".utf8).write(to: workerURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: workerURL.path
+        )
+        let executor = ProcessJavaScriptExecutor(
+            workerExecutableURL: workerURL,
+            timeoutMilliseconds: 1_000,
+            temporaryRootURL: temporaryRootURL
+        )
+        let request = try ScriptExecutionRequest(
+            hook: .request,
+            source: "function onRequest(context) {}",
+            message: ScriptHTTPMessage(method: "GET", url: "https://example.test/")
+        )
+
+        do {
+            _ = try await executor.execute(request)
+            XCTFail("Expected malformed worker output to fail")
+        } catch {
+            guard case .invalidOutput = error as? ScriptExecutionError else {
+                return XCTFail("Expected invalid output, got \(error)")
+            }
+        }
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: temporaryRootURL.path),
+            ["worker.sh"]
+        )
+    }
+
     func testKeychainProviderKeepsRootStableAndNonExtractable() async throws {
         let provider = makeProvider()
 

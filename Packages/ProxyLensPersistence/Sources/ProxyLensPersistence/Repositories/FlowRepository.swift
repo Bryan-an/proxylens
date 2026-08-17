@@ -20,6 +20,9 @@ struct FlowRepository: Sendable {
             summary.requestByteCount,
             summary.responseByteCount,
             summary.totalDuration,
+            flow.annotation?.comment,
+            flow.annotation?.highlight?.rawValue,
+            flow.annotation?.isStruckThrough ?? false,
             snapshot,
             Date().timeIntervalSince1970
         ]
@@ -29,8 +32,9 @@ struct FlowRepository: Sendable {
                 INSERT INTO flows (
                     id, session_id, created_at, source_kind, source_label, client_address,
                     method, url, status_code, state, request_byte_count, response_byte_count,
-                    total_duration, snapshot, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_duration, annotation_comment, highlight_color, is_struck_through,
+                    snapshot, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     session_id = excluded.session_id,
                     created_at = excluded.created_at,
@@ -53,22 +57,28 @@ struct FlowRepository: Sendable {
 
     static func fetch(_ flowID: FlowID, from database: Database) throws -> Flow? {
         guard
-            let snapshot = try Data.fetchOne(
+            let row = try Row.fetchOne(
                 database,
-                sql: "SELECT snapshot FROM flows WHERE id = ?",
+                sql: """
+                    SELECT snapshot, annotation_comment, highlight_color, is_struck_through
+                    FROM flows WHERE id = ?
+                    """,
                 arguments: [flowID.description]
             )
         else {
             return nil
         }
 
-        return try PersistenceCoding.decode(Flow.self, from: snapshot)
+        return try decodeFlow(row)
     }
 
     static func fetchAll(from database: Database) throws -> [Flow] {
         let rows = try Row.fetchAll(
             database,
-            sql: "SELECT snapshot FROM flows ORDER BY created_at ASC"
+            sql: """
+                SELECT snapshot, annotation_comment, highlight_color, is_struck_through
+                FROM flows ORDER BY created_at ASC
+                """
         )
         return try decodeFlows(rows)
     }
@@ -76,7 +86,10 @@ struct FlowRepository: Sendable {
     static func fetchAll(in sessionID: SessionID, from database: Database) throws -> [Flow] {
         let rows = try Row.fetchAll(
             database,
-            sql: "SELECT snapshot FROM flows WHERE session_id = ? ORDER BY created_at DESC",
+            sql: """
+                SELECT snapshot, annotation_comment, highlight_color, is_struck_through
+                FROM flows WHERE session_id = ? ORDER BY created_at DESC
+                """,
             arguments: [sessionID.description]
         )
         return try decodeFlows(rows)
@@ -87,7 +100,7 @@ struct FlowRepository: Sendable {
         let rows = try Row.fetchAll(
             database,
             sql: """
-                SELECT snapshot FROM flows
+                SELECT snapshot, annotation_comment, highlight_color, is_struck_through FROM flows
                 WHERE session_id = ? AND state NOT IN ('completed', 'cancelled', 'failed')
                 ORDER BY created_at
                 """,
@@ -104,6 +117,38 @@ struct FlowRepository: Sendable {
         ) ?? false
     }
 
+    static func updateAnnotation(
+        _ annotation: FlowAnnotation?,
+        for flowID: FlowID,
+        in database: Database
+    ) throws -> Flow? {
+        guard var flow = try fetch(flowID, from: database) else {
+            return nil
+        }
+        flow.setAnnotation(annotation)
+        let snapshot = try PersistenceCoding.encode(flow)
+        try database.execute(
+            sql: """
+                UPDATE flows SET
+                    annotation_comment = ?,
+                    highlight_color = ?,
+                    is_struck_through = ?,
+                    snapshot = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+            arguments: [
+                flow.annotation?.comment,
+                flow.annotation?.highlight?.rawValue,
+                flow.annotation?.isStruckThrough ?? false,
+                snapshot,
+                Date().timeIntervalSince1970,
+                flowID.description
+            ]
+        )
+        return flow
+    }
+
     static func delete(_ flowID: FlowID, from database: Database) throws {
         try database.execute(
             sql: "DELETE FROM flows WHERE id = ?",
@@ -112,10 +157,22 @@ struct FlowRepository: Sendable {
     }
 
     private static func decodeFlows(_ rows: [Row]) throws -> [Flow] {
-        try rows.map { row in
-            let snapshot: Data = row["snapshot"]
-            return try PersistenceCoding.decode(Flow.self, from: snapshot)
-        }
+        try rows.map(decodeFlow)
+    }
+
+    private static func decodeFlow(_ row: Row) throws -> Flow {
+        let snapshot: Data = row["snapshot"]
+        var flow = try PersistenceCoding.decode(Flow.self, from: snapshot)
+        let comment: String? = row["annotation_comment"]
+        let highlightValue: String? = row["highlight_color"]
+        let isStruckThrough: Bool = row["is_struck_through"]
+        let annotation = try FlowAnnotation(
+            comment: comment,
+            highlight: highlightValue.flatMap(FlowHighlightColor.init(rawValue:)),
+            isStruckThrough: isStruckThrough
+        )
+        flow.setAnnotation(annotation)
+        return flow
     }
 
     private static func persistedState(_ state: FlowState) -> String {
@@ -132,6 +189,8 @@ struct FlowRepository: Sendable {
             "paused_request"
         case .paused(.response):
             "paused_response"
+        case .paused(.webSocketResponse):
+            "paused_websocket_response"
         case .completed:
             "completed"
         case .cancelled:

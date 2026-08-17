@@ -56,4 +56,8 @@ public struct RuleSet: Codable, Equatable, Hashable, Sendable {
             (phase == nil || rule.phase == phase) && rule.matches(context)
         }
     }
+
+    public func hasEnabledRules(for phase: RulePhase) -> Bool {
+        rules.contains { $0.enabled && $0.phase == phase }
+    }
 }

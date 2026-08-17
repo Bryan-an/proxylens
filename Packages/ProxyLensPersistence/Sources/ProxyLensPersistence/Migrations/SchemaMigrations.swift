@@ -57,6 +57,62 @@ public enum SchemaMigrations {
             }
         }
 
+        migrator.registerMigration("v2_add_flow_annotations") { database in
+            try database.alter(table: "flows") { table in
+                table.add(column: "annotation_comment", .text)
+                table.add(column: "highlight_color", .text)
+                table.add(column: "is_struck_through", .boolean).notNull().defaults(to: false)
+            }
+            try database.create(
+                index: "flows_highlight_color",
+                on: "flows",
+                columns: ["highlight_color"]
+            )
+        }
+
+        migrator.registerMigration("v3_add_websocket_frames") { database in
+            try database.create(table: "websocket_frames") { table in
+                table.column("id", .text).primaryKey()
+                table.column("flow_id", .text).notNull()
+                    .references("flows", onDelete: .cascade)
+                table.column("sequence_number", .integer).notNull()
+                table.column("direction", .text).notNull()
+                table.column("opcode", .text).notNull()
+                table.column("received_at", .double).notNull()
+                table.column("payload_byte_count", .integer).notNull()
+                table.column("snapshot", .blob).notNull()
+                table.column("updated_at", .double).notNull()
+                table.uniqueKey(["flow_id", "sequence_number"])
+            }
+            try database.create(
+                index: "websocket_frames_flow_sequence",
+                on: "websocket_frames",
+                columns: ["flow_id", "sequence_number"]
+            )
+        }
+
+        migrator.registerMigration("v4_add_server_sent_events") { database in
+            try database.create(table: "server_sent_events") { table in
+                table.column("id", .text).primaryKey()
+                table.column("flow_id", .text).notNull()
+                    .references("flows", onDelete: .cascade)
+                table.column("sequence_number", .integer).notNull()
+                table.column("event_type", .text).notNull()
+                table.column("event_id", .text)
+                table.column("retry_milliseconds", .integer)
+                table.column("received_at", .double).notNull()
+                table.column("data_byte_count", .integer).notNull()
+                table.column("snapshot", .blob).notNull()
+                table.column("updated_at", .double).notNull()
+                table.uniqueKey(["flow_id", "sequence_number"])
+            }
+            try database.create(
+                index: "server_sent_events_flow_sequence",
+                on: "server_sent_events",
+                columns: ["flow_id", "sequence_number"]
+            )
+        }
+
         return migrator
     }
 }
