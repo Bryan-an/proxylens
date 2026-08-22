@@ -2949,4 +2949,113 @@ final class ProxyLensCoreTests: XCTestCase {
             XCTAssertEqual(error as? HTTPContentCoding.CodingError, .exceedsLimit)
         }
     }
+
+    func testTLSInterceptionPolicyDefaultsToInterceptingEverything() {
+        let policy = TLSInterceptionPolicy()
+        XCTAssertEqual(policy.mode, .interceptAllExcept)
+        XCTAssertTrue(policy.entries.isEmpty)
+        XCTAssertTrue(policy.shouldIntercept(host: "api.example.com"))
+        XCTAssertTrue(policy.shouldIntercept(host: "127.0.0.1"))
+    }
+
+    func testTLSInterceptionPolicyExcludeModeMatchesExactAndWildcardEntries()
+        throws
+    {
+        let policy = try TLSInterceptionPolicy(
+            mode: .interceptAllExcept,
+            entries: ["pinned.example.com", "*.apple.com"]
+        )
+        XCTAssertFalse(policy.shouldIntercept(host: "pinned.example.com"))
+        XCTAssertFalse(policy.shouldIntercept(host: "PINNED.example.com"))
+        XCTAssertFalse(policy.shouldIntercept(host: "push.apple.com"))
+        XCTAssertFalse(policy.shouldIntercept(host: "a.b.apple.com"))
+        XCTAssertTrue(policy.shouldIntercept(host: "apple.com"))
+        XCTAssertTrue(policy.shouldIntercept(host: "example.com"))
+        XCTAssertTrue(policy.matches(host: "pinned.example.com"))
+        XCTAssertFalse(policy.matches(host: "example.com"))
+    }
+
+    func testTLSInterceptionPolicyInterceptOnlyModeInterceptsOnlyListedHosts()
+        throws
+    {
+        let policy = try TLSInterceptionPolicy(
+            mode: .interceptOnly,
+            entries: ["*.dev.internal"]
+        )
+        XCTAssertTrue(policy.shouldIntercept(host: "api.dev.internal"))
+        XCTAssertFalse(policy.shouldIntercept(host: "example.com"))
+        XCTAssertFalse(policy.shouldIntercept(host: "dev.internal"))
+    }
+
+    func testTLSInterceptionPolicyNormalizesEntriesAndRejectsInvalidOnes()
+        throws
+    {
+        let policy = try TLSInterceptionPolicy(
+            mode: .interceptAllExcept,
+            entries: ["  Pinned.Example.COM ", "[::1]"]
+        )
+        XCTAssertEqual(policy.entries, ["pinned.example.com", "::1"])
+        XCTAssertFalse(policy.shouldIntercept(host: "::1"))
+
+        XCTAssertThrowsError(
+            try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["bad host"])
+        )
+        XCTAssertThrowsError(
+            try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["a..b"])
+        )
+        XCTAssertThrowsError(
+            try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["a.com", "A.com"])
+        ) { error in
+            XCTAssertEqual(
+                error as? TLSInterceptionPolicyError, .duplicateEntry("a.com")
+            )
+        }
+        let tooMany = (0..<(TLSInterceptionPolicy.maximumEntryCount + 1))
+            .map { "h\($0).example" }
+        XCTAssertThrowsError(
+            try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: tooMany)
+        ) { error in
+            XCTAssertEqual(
+                error as? TLSInterceptionPolicyError,
+                .tooManyEntries(maximum: TLSInterceptionPolicy.maximumEntryCount)
+            )
+        }
+    }
+
+    func testTLSInterceptionPolicyCodableRoundTripsAndRejectsMalformedDocuments()
+        throws
+    {
+        let policy = try TLSInterceptionPolicy(
+            mode: .interceptOnly,
+            entries: ["*.example.com"]
+        )
+        let data = try JSONEncoder().encode(policy)
+        let decoded = try JSONDecoder().decode(
+            TLSInterceptionPolicy.self,
+            from: data
+        )
+        XCTAssertEqual(decoded, policy)
+
+        let malformed = Data(
+            #"{"mode":"interceptOnly","entries":["bad host"]}"#.utf8
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                TLSInterceptionPolicy.self,
+                from: malformed
+            )
+        )
+    }
+
+    func testMutableTLSInterceptionPolicyReplacesLivePolicy() throws {
+        let box = MutableTLSInterceptionPolicy()
+        XCTAssertTrue(box.currentPolicy().shouldIntercept(host: "example.com"))
+        box.replace(
+            try TLSInterceptionPolicy(
+                mode: .interceptAllExcept,
+                entries: ["example.com"]
+            )
+        )
+        XCTAssertFalse(box.currentPolicy().shouldIntercept(host: "example.com"))
+    }
 }
