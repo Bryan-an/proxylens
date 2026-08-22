@@ -1707,7 +1707,7 @@ final class ProxyLensCaptureTests: XCTestCase {
         )
     }
 
-    func testConnectIsRejectedWhenInterceptionIsDisabled() throws {
+    func testConnectAttemptsATunnelWhenInterceptionIsDisabled() throws {
         let channel = EmbeddedChannel()
         try channel.pipeline.syncOperations.addHandler(
             HTTPProxyHandler(
@@ -1726,15 +1726,15 @@ final class ProxyLensCaptureTests: XCTestCase {
             headers: headers
         )
 
+        // Deliberately stop after the head: completing the CONNECT (`.end`) would make the
+        // handler dial the origin through a real `ClientBootstrap`, which requires a
+        // `SelectableEventLoop` and fatal-errors immediately against `EmbeddedChannel`'s
+        // `EmbeddedEventLoop`. The head alone already proves the regression this test
+        // guards against: no eager 501/503 the moment CONNECT is no longer intercepted.
+        // The end-to-end tunnel behavior is covered by the engine-level tests above.
         _ = try channel.writeInbound(HTTPServerRequestPart.head(head))
 
-        let response = try XCTUnwrap(channel.readOutbound(as: HTTPServerResponsePart.self))
-        guard case .head(let responseHead) = response else {
-            return XCTFail("Expected an HTTP response head")
-        }
-
-        XCTAssertEqual(responseHead.status.code, 501)
-        XCTAssertEqual(responseHead.status.reasonPhrase, "Not Implemented")
+        XCTAssertNil(try channel.readOutbound(as: HTTPServerResponsePart.self))
     }
 
     func testEngineStartsOnEphemeralPortAndStops() async throws {
@@ -6495,6 +6495,401 @@ final class ProxyLensCaptureTests: XCTestCase {
         wait(for: [closed], timeout: 1)
         XCTAssertFalse(upstreamSide.isActive)
     }
+
+    // MARK: - CONNECT passthrough
+
+    func testCONNECTPassthroughForExcludedHostDeliversOriginCertificate() async throws {
+        let engineProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-tests.\(UUID().uuidString)"
+            )
+        )
+        let originProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-origin.\(UUID().uuidString)"
+            )
+        )
+        let originRoot = try await originProvider.rootCertificate()
+        let originIdentity = try await originProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "origin body",
+            identity: originIdentity
+        )
+        let eventSink = RecordingFlowEventSink()
+        let policy = MutableTLSInterceptionPolicy(
+            policy: try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["localhost"])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            certificateProvider: engineProvider,
+            tlsInterceptionPolicy: policy
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            // Trusts ONLY the origin root: succeeds only if the proxy did not re-terminate TLS.
+            let response = try await HTTPSTestClient.get(
+                url: "https://localhost:\(upstream.endpoint.port)/pinned",
+                through: proxyEndpoint,
+                trustedRootCertificate: originRoot
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("origin body".utf8))
+            XCTAssertEqual(upstream.requestCount, 1)
+
+            await eventSink.waitForFinished()
+            let tunnelFlow = await eventSink.lastFlow { $0.state == .completed }
+            let tunnel = try XCTUnwrap(tunnelFlow)
+            XCTAssertEqual(tunnel.request.method, .connect)
+            XCTAssertEqual(tunnel.request.url.host, "localhost")
+            XCTAssertEqual(tunnel.connection?.tlsIntercepted, false)
+            XCTAssertEqual(tunnel.connection?.protocolKind, .https)
+            XCTAssertNotNil(tunnel.timing.upstreamConnectedAt)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await engineProvider.removeCertificateAuthority()
+            try? await originProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await engineProvider.removeCertificateAuthority()
+        try await originProvider.removeCertificateAuthority()
+    }
+
+    func testDisabledHTTPSInterceptionTunnelsInsteadOfRefusingCONNECT() async throws {
+        let originProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-501.\(UUID().uuidString)"
+            )
+        )
+        let originRoot = try await originProvider.rootCertificate()
+        let originIdentity = try await originProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "tunneled",
+            identity: originIdentity
+        )
+        let eventSink = RecordingFlowEventSink()
+        let engine = NIOProxyEngine(eventSink: eventSink)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            let response = try await HTTPSTestClient.get(
+                url: "https://localhost:\(upstream.endpoint.port)/tunnel",
+                through: proxyEndpoint,
+                trustedRootCertificate: originRoot
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("tunneled".utf8))
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await originProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await originProvider.removeCertificateAuthority()
+    }
+
+    func testLivePolicyReplacementAffectsTheNextCONNECT() async throws {
+        let engineProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-live.\(UUID().uuidString)"
+            )
+        )
+        let engineRoot = try await engineProvider.rootCertificate()
+        let originProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-live-origin.\(UUID().uuidString)"
+            )
+        )
+        let originRoot = try await originProvider.rootCertificate()
+        let originIdentity = try await originProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "either way",
+            identity: originIdentity
+        )
+        let eventSink = RecordingFlowEventSink()
+        let policy = MutableTLSInterceptionPolicy()
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            certificateProvider: engineProvider,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [originRoot]
+            ),
+            tlsInterceptionPolicy: policy
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            // Empty policy: MITM as today — client trusts the ENGINE root.
+            let intercepted = try await HTTPSTestClient.get(
+                url: "https://localhost:\(upstream.endpoint.port)/first",
+                through: proxyEndpoint,
+                trustedRootCertificate: engineRoot
+            )
+            XCTAssertEqual(intercepted.statusCode, 200)
+
+            policy.replace(
+                try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["localhost"])
+            )
+
+            // Next CONNECT passes through — client now succeeds trusting only the ORIGIN root.
+            let passthrough = try await HTTPSTestClient.get(
+                url: "https://localhost:\(upstream.endpoint.port)/second",
+                through: proxyEndpoint,
+                trustedRootCertificate: originRoot
+            )
+            XCTAssertEqual(passthrough.statusCode, 200)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await engineProvider.removeCertificateAuthority()
+            try? await originProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await engineProvider.removeCertificateAuthority()
+        try await originProvider.removeCertificateAuthority()
+    }
+
+    func testInterceptOnlyModePassesUnlistedHostsThrough() async throws {
+        let engineProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-only.\(UUID().uuidString)"
+            )
+        )
+        let originProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-only-origin.\(UUID().uuidString)"
+            )
+        )
+        let originRoot = try await originProvider.rootCertificate()
+        let originIdentity = try await originProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "unlisted",
+            identity: originIdentity
+        )
+        let engine = NIOProxyEngine(
+            eventSink: RecordingFlowEventSink(),
+            certificateProvider: engineProvider,
+            tlsInterceptionPolicy: MutableTLSInterceptionPolicy(
+                policy: try TLSInterceptionPolicy(
+                    mode: .interceptOnly,
+                    entries: ["listed.example.com"]
+                )
+            )
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                return
+            }
+
+            // "localhost" is not listed, so intercept-only mode must tunnel it: the client
+            // trusting only the origin root proves the proxy never re-terminated TLS.
+            let response = try await HTTPSTestClient.get(
+                url: "https://localhost:\(upstream.endpoint.port)/unlisted",
+                through: proxyEndpoint,
+                trustedRootCertificate: originRoot
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("unlisted".utf8))
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await engineProvider.removeCertificateAuthority()
+            try? await originProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await engineProvider.removeCertificateAuthority()
+        try await originProvider.removeCertificateAuthority()
+    }
+
+    func testCONNECTPassthroughUpstreamFailureFailsTheTunnelFlow() async throws {
+        let eventSink = RecordingFlowEventSink()
+        let policy = MutableTLSInterceptionPolicy(
+            policy: try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["127.0.0.1"])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, tlsInterceptionPolicy: policy)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                return
+            }
+
+            // Port 1 on loopback: nothing listens there, the raw dial must fail. The
+            // helper's TLS material is never reached because no 200 is written when the
+            // upstream connect fails, so an empty trusted root is fine here.
+            await assertThrowsErrorAsync(
+                try await HTTPSTestClient.get(
+                    url: "https://127.0.0.1:1/unreachable",
+                    through: proxyEndpoint,
+                    trustedRootCertificate: Data()
+                )
+            )
+
+            await eventSink.waitForFinished()
+            let failedFlow = await eventSink.lastFlow {
+                if case .failed = $0.state { return true }
+                return false
+            }
+            let failed = try XCTUnwrap(failedFlow)
+            XCTAssertEqual(failed.request.method, .connect)
+            XCTAssertEqual(failed.state, .failed(.upstreamUnavailable))
+        } catch {
+            await engine.stop()
+            throw error
+        }
+
+        await engine.stop()
+    }
+
+    func testCONNECTPassthroughChainsThroughTheExternalHTTPProxy() async throws {
+        // Engine B (interceptHTTPS: false → passthrough-everything) plays the external
+        // CONNECT proxy for engine A, so no new relaying fixture is needed.
+        let originProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-chain.\(UUID().uuidString)"
+            )
+        )
+        let originRoot = try await originProvider.rootCertificate()
+        let originIdentity = try await originProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "chained",
+            identity: originIdentity
+        )
+        let outerSink = RecordingFlowEventSink()
+        let innerSink = RecordingFlowEventSink()
+        let engineB = NIOProxyEngine(eventSink: innerSink)
+        let engineA = NIOProxyEngine(
+            eventSink: outerSink,
+            tlsInterceptionPolicy: MutableTLSInterceptionPolicy(
+                policy: try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["localhost"])
+            )
+        )
+
+        do {
+            try await engineB.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let innerEndpoint) = await engineB.state() else {
+                XCTFail("Expected the inner proxy engine to be running")
+                return
+            }
+            try await engineA.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false,
+                    externalHTTPProxy: try ExternalHTTPProxyConfiguration(
+                        endpoint: innerEndpoint,
+                        isEnabled: true
+                    )
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let outerEndpoint) = await engineA.state() else {
+                XCTFail("Expected the outer proxy engine to be running")
+                return
+            }
+
+            let response = try await HTTPSTestClient.get(
+                url: "https://localhost:\(upstream.endpoint.port)/via-chain",
+                through: outerEndpoint,
+                trustedRootCertificate: originRoot
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("chained".utf8))
+        } catch {
+            await engineA.stop()
+            await engineB.stop()
+            await upstream.stop()
+            try? await originProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engineA.stop()
+        await engineB.stop()
+        await upstream.stop()
+        try await originProvider.removeCertificateAuthority()
+    }
+}
+
+private func assertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected the expression to throw", file: file, line: line)
+    } catch {}
 }
 
 private actor TestExternalHTTPProxyCredentialStore: ExternalHTTPProxyCredentialStoring {

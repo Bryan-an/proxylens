@@ -18,6 +18,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
     private let certificateProvider: (any CertificateProvider)?
     private let upstreamTLSConfiguration: UpstreamTLSConfiguration
     private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let tlsInterceptionPolicy: (any TLSInterceptionPolicySource)?
     private let scriptExecutor: (any ScriptExecutor)?
     private let breakpointGate: any BreakpointGate
     private let flowSourceResolver: any FlowSourceResolver
@@ -43,6 +44,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
         certificateProvider: (any CertificateProvider)? = nil,
         upstreamTLSConfiguration: UpstreamTLSConfiguration = UpstreamTLSConfiguration(),
         ruleSnapshot: (any RuleSnapshotSource)? = nil,
+        tlsInterceptionPolicy: (any TLSInterceptionPolicySource)? = nil,
         scriptExecutor: (any ScriptExecutor)? = nil,
         breakpointGate: any BreakpointGate = ImmediateBreakpointGate(),
         flowSourceResolver: any FlowSourceResolver = UnknownFlowSourceResolver(),
@@ -63,6 +65,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
         self.certificateProvider = certificateProvider
         self.upstreamTLSConfiguration = upstreamTLSConfiguration
         self.ruleSnapshot = ruleSnapshot
+        self.tlsInterceptionPolicy = tlsInterceptionPolicy
         self.scriptExecutor = scriptExecutor
         self.breakpointGate = breakpointGate
         self.flowSourceResolver = flowSourceResolver
@@ -140,6 +143,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
                         upstreamTLSContext,
                         upstreamHTTP2Pool,
                         ruleSnapshot,
+                        tlsInterceptionPolicy,
                         scriptExecutor,
                         breakpointGate,
                         flowSourceResolver,
@@ -187,6 +191,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
                                 reverseProxyRoute: reverseProxyRoute,
                                 externalHTTPProxyRoute: externalHTTPProxyRoute,
                                 ruleSnapshot: ruleSnapshot,
+                                tlsInterceptionPolicy: tlsInterceptionPolicy,
                                 scriptExecutor: scriptExecutor,
                                 breakpointGate: breakpointGate,
                                 flowSource: flowSource

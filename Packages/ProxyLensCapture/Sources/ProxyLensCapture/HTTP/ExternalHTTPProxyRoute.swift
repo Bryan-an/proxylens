@@ -50,6 +50,30 @@ struct ExternalHTTPProxyRoute: Sendable {
         configuration.shouldProxy(host: target.host)
     }
 
+    func shouldProxy(host: String) -> Bool {
+        configuration.shouldProxy(host: host)
+    }
+
+    /// Builds a CONNECT request directly from a host/port pair, for callers that have not
+    /// (and, for a spliced tunnel, must not) parsed a `ProxyTarget`.
+    func connectRequestBytes(
+        host: String,
+        port: Int,
+        allocator: ByteBufferAllocator
+    ) -> ByteBuffer {
+        let formattedHost = host.contains(":") ? "[\(host)]" : host
+        let authority = "\(formattedHost):\(port)"
+        var request = "CONNECT \(authority) HTTP/1.1\r\nHost: \(authority)\r\n"
+        request += "Proxy-Connection: keep-alive\r\n"
+        if let authorizationValue {
+            request += "Proxy-Authorization: \(authorizationValue)\r\n"
+        }
+        request += "\r\n"
+        var buffer = allocator.buffer(capacity: request.utf8.count)
+        buffer.writeString(request)
+        return buffer
+    }
+
     func requestHead(
         forwarding head: HTTPRequestHead,
         to target: ProxyTarget
@@ -71,17 +95,11 @@ struct ExternalHTTPProxyRoute: Sendable {
         to target: ProxyTarget,
         allocator: ByteBufferAllocator
     ) -> ByteBuffer {
-        let authority = connectAuthority(for: target)
-        var request = "CONNECT \(authority) HTTP/1.1\r\nHost: \(authority)\r\n"
-        request += "Proxy-Connection: keep-alive\r\n"
-        if let authorizationValue {
-            request += "Proxy-Authorization: \(authorizationValue)\r\n"
-        }
-        request += "\r\n"
-
-        var buffer = allocator.buffer(capacity: request.utf8.count)
-        buffer.writeString(request)
-        return buffer
+        connectRequestBytes(
+            host: target.connectionHost,
+            port: target.port,
+            allocator: allocator
+        )
     }
 
     private func absoluteRequestTarget(for target: ProxyTarget) throws -> String {
@@ -99,12 +117,6 @@ struct ExternalHTTPProxyRoute: Sendable {
         let formattedHost = bracketedConnectionHost(for: target)
         let defaultPort = target.usesTLS ? 443 : 80
         return target.port == defaultPort ? formattedHost : "\(formattedHost):\(target.port)"
-    }
-
-    /// RFC 9110 requires the authority form of a `CONNECT` target to carry an explicit port, so the
-    /// default port is never elided here.
-    private func connectAuthority(for target: ProxyTarget) -> String {
-        "\(bracketedConnectionHost(for: target)):\(target.port)"
     }
 
     private func bracketedConnectionHost(for target: ProxyTarget) -> String {
