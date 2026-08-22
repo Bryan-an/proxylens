@@ -229,6 +229,92 @@ final class ProtobufDescriptorSetTests: XCTestCase {
         }
     }
 
+    func testSchemaAwareBodyViewFallsBackToWireLevelForVarintWireTypeMismatches() throws {
+        let catalog = try ProtobufDescriptorSetParser.parse(
+            field(1, message: exampleFileDescriptor())
+        )
+        let user = try XCTUnwrap(catalog.message(named: "example.User"))
+        var payload = field(1, varint: 150)  // id = 150, matches int32.
+        payload.append(field(2, varint: 7))  // name is string, arrives as a varint.
+        payload.append(field(3, varint: 1))  // state = ACTIVE, matches enum.
+        payload.append(field(4, varint: 9))  // profile is a message, arrives as a varint.
+
+        let result = ProtobufBodyView.render(
+            data: payload,
+            contentType: "application/protobuf",
+            contentEncoding: nil,
+            schema: user,
+            catalog: catalog
+        )
+
+        guard case .decoded(let text) = result else {
+            return XCTFail("expected schema-aware Protobuf output, got \(result)")
+        }
+        let lines = text.split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines.contains("2  varint   7"), "Missing string mismatch in:\n\(text)")
+        XCTAssertTrue(lines.contains("4  varint   9"), "Missing message mismatch in:\n\(text)")
+        XCTAssertFalse(text.contains("name"), "Mismatched field kept its schema name:\n\(text)")
+        XCTAssertFalse(
+            text.contains("profile"),
+            "Mismatched field kept its schema name:\n\(text)"
+        )
+        XCTAssertFalse(
+            text.contains("example.User.Profile"),
+            "Mismatched field kept its schema type:\n\(text)"
+        )
+        XCTAssertTrue(text.contains("1  id"))
+        XCTAssertTrue(text.contains("int32       150"))
+        XCTAssertTrue(text.contains("3  state"))
+        XCTAssertTrue(text.contains("enum        ACTIVE (1)"))
+    }
+
+    func testSchemaAwareBodyViewFallsBackToWireLevelForFixedWidthWireTypeMismatches() throws {
+        let schema = ProtobufMessageSchema(
+            fullName: "example.Mismatched",
+            fields: [
+                ProtobufFieldSchema(
+                    number: 1, name: "fixed32_value", label: .optional, type: .fixed32),
+                ProtobufFieldSchema(
+                    number: 2, name: "double_value", label: .optional, type: .double),
+                ProtobufFieldSchema(number: 3, name: "int32_value", label: .optional, type: .int32),
+                ProtobufFieldSchema(number: 4, name: "label_value", label: .optional, type: .string)
+            ]
+        )
+        let catalog = ProtobufSchemaCatalog(messages: [schema], enumerations: [])
+        // fixed32 arrives length-delimited with unprintable bytes.
+        var payload = field(1, message: Data([0xFF, 0x00]))
+        payload.append(field(2, string: "hi"))  // double arrives length-delimited.
+        payload.append(fixed32Field(3, value: 42))  // int32 arrives fixed-width.
+        payload.append(field(4, string: "ok"))  // string arrives as declared.
+
+        let result = ProtobufBodyView.render(
+            data: payload,
+            contentType: "application/protobuf",
+            contentEncoding: nil,
+            schema: schema,
+            catalog: catalog
+        )
+
+        guard case .decoded(let text) = result else {
+            return XCTFail("expected schema-aware Protobuf output, got \(result)")
+        }
+        let lines = text.split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines.contains("1  bytes    ff 00"), "Missing bytes fallback in:\n\(text)")
+        XCTAssertTrue(
+            lines.contains("2  string   \"hi\""),
+            "Missing string fallback in:\n\(text)"
+        )
+        XCTAssertTrue(
+            lines.contains("3  fixed32  0x0000002a  uint32 42  float \(Float(bitPattern: 42))"),
+            "Missing fixed32 fallback in:\n\(text)"
+        )
+        for absent in ["fixed32_value", "double_value", "int32_value"] {
+            XCTAssertFalse(text.contains(absent), "\(absent) survived the mismatch:\n\(text)")
+        }
+        XCTAssertTrue(text.contains("4  label_value"))
+        XCTAssertTrue(text.contains("string      \"ok\""))
+    }
+
     func testPackedValuesShareTheGlobalFieldLimit() {
         let schema = ProtobufMessageSchema(
             fullName: "example.Many",
