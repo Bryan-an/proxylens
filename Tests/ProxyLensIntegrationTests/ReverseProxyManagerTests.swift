@@ -420,6 +420,282 @@ final class ReverseProxyManagerTests: XCTestCase {
         XCTAssertFalse(password.isEnabled)
     }
 
+    func testRouteTableRendersLocalEndpointUpstreamAndEnabledState() async throws {
+        let enabledRoute = try makeRoute(
+            name: "Local API",
+            port: 9_443,
+            upstream: "https://api.example.com/v1"
+        )
+        let disabledRoute = try ReverseProxyRoute(
+            name: "Staging API",
+            listenEndpoint: NetworkEndpoint(host: "::1", port: 9_444),
+            upstreamURL: XCTUnwrap(URL(string: "http://staging.example.com/base")),
+            isEnabled: false
+        )
+        let routeStore = InMemoryTrafficReverseProxyRouteStore(
+            routes: [enabledRoute, disabledRoute]
+        )
+        let viewModel = makeViewModel(routeStore: routeStore)
+        await viewModel.prepare()
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        let window = makeWindow(hosting: controller)
+        defer { closeWindow(window) }
+
+        let table = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "reverseProxyManager.table")
+                as? NSTableView
+        )
+        XCTAssertEqual(table.numberOfRows, 2)
+        XCTAssertEqual(table.accessibilityLabel(), "Reverse proxy routes")
+        XCTAssertEqual(
+            table.tableColumns.map(\.identifier.rawValue),
+            ["enabled", "name", "listener", "upstream"]
+        )
+        XCTAssertEqual(
+            table.tableColumns.map(\.title),
+            ["On", "Name", "Local Listener", "Upstream"]
+        )
+
+        XCTAssertEqual(try cellText(in: table, row: 0, column: "name"), "Local API")
+        XCTAssertEqual(try cellText(in: table, row: 0, column: "listener"), "127.0.0.1:9443")
+        XCTAssertEqual(
+            try cellText(in: table, row: 0, column: "upstream"),
+            "https://api.example.com/v1"
+        )
+        XCTAssertEqual(try cellText(in: table, row: 1, column: "name"), "Staging API")
+        XCTAssertEqual(try cellText(in: table, row: 1, column: "listener"), "::1:9444")
+        XCTAssertEqual(
+            try cellText(in: table, row: 1, column: "upstream"),
+            "http://staging.example.com/base"
+        )
+
+        let firstToggle = try enabledCheckbox(in: table, row: 0)
+        let secondToggle = try enabledCheckbox(in: table, row: 1)
+        XCTAssertEqual(firstToggle.state, .on)
+        XCTAssertEqual(secondToggle.state, .off)
+        XCTAssertTrue(firstToggle.isEnabled)
+        XCTAssertEqual(firstToggle.accessibilityLabel(), "Enable Local API")
+        XCTAssertEqual(secondToggle.accessibilityLabel(), "Enable Staging API")
+        XCTAssertEqual(
+            descendant(in: controller.view, identifier: "reverseProxyManager.empty")?.isHidden,
+            true
+        )
+    }
+
+    func testTogglingRouteCheckboxPersistsEnabledStateAndReachesNextCapture() async throws {
+        let route = try makeRoute()
+        let routeStore = InMemoryTrafficReverseProxyRouteStore(routes: [route])
+        let captureController = ReverseProxyRecordingCaptureController()
+        let viewModel = makeViewModel(
+            routeStore: routeStore,
+            captureController: captureController
+        )
+        await viewModel.prepare()
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        let window = makeWindow(hosting: controller)
+        defer { closeWindow(window) }
+        let table = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "reverseProxyManager.table")
+                as? NSTableView
+        )
+
+        try enabledCheckbox(in: table, row: 0).performClick(nil)
+
+        XCTAssertEqual(routeStore.routes.first?.isEnabled, false)
+        XCTAssertEqual(viewModel.currentReverseProxyRoutes().first?.isEnabled, false)
+        XCTAssertEqual(try enabledCheckbox(in: table, row: 0).state, .off)
+
+        try enabledCheckbox(in: table, row: 0).performClick(nil)
+
+        XCTAssertEqual(routeStore.routes.first?.isEnabled, true)
+        XCTAssertEqual(try enabledCheckbox(in: table, row: 0).state, .on)
+        XCTAssertEqual(routeStore.routes.first?.id, route.id)
+
+        try enabledCheckbox(in: table, row: 0).performClick(nil)
+        viewModel.toggleCapture()
+        try await waitUntil { await captureController.lastConfiguration() != nil }
+
+        let startedConfiguration = await captureController.lastConfiguration()
+        XCTAssertEqual(startedConfiguration?.proxy.reverseProxyRoutes.count, 1)
+        XCTAssertEqual(startedConfiguration?.proxy.reverseProxyRoutes.first?.isEnabled, false)
+    }
+
+    func testTogglingRouteDuringCaptureRestoresThePreviousCheckboxState() async throws {
+        let route = try makeRoute()
+        let routeStore = InMemoryTrafficReverseProxyRouteStore(routes: [route])
+        let captureController = ReverseProxyRecordingCaptureController()
+        let viewModel = makeViewModel(
+            routeStore: routeStore,
+            captureController: captureController
+        )
+        await viewModel.prepare()
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        let window = makeWindow(hosting: controller)
+        defer { closeWindow(window) }
+        let table = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "reverseProxyManager.table")
+                as? NSTableView
+        )
+
+        viewModel.toggleCapture()
+        try await waitUntil { await captureController.lastConfiguration() != nil }
+        try await waitUntil { !viewModel.canEditReverseProxyRoutes }
+        controller.reloadRoutes()
+
+        let toggle = try enabledCheckbox(in: table, row: 0)
+        XCTAssertFalse(toggle.isEnabled)
+
+        toggle.isEnabled = true
+        dismissingModalAlert { toggle.performClick(nil) }
+
+        XCTAssertEqual(toggle.state, .on)
+        XCTAssertEqual(routeStore.routes.first?.isEnabled, true)
+    }
+
+    func testRouteEditorPresentsForAddAndSavesThroughTheViewModel() async throws {
+        let routeStore = InMemoryTrafficReverseProxyRouteStore()
+        let viewModel = makeViewModel(routeStore: routeStore)
+        await viewModel.prepare()
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        let window = makeWindow(hosting: controller)
+        defer { closeWindow(window) }
+
+        try clickButton(in: controller.view, identifier: "reverseProxyManager.add")
+
+        let editor = try presentedEditorView(in: controller)
+        XCTAssertEqual(editor.accessibilityIdentifier(), "reverseProxyEditor")
+        let name = try field(in: editor, identifier: "reverseProxyEditor.name")
+        let port = try field(in: editor, identifier: "reverseProxyEditor.port")
+        let upstream = try field(in: editor, identifier: "reverseProxyEditor.upstreamURL")
+        let host = try XCTUnwrap(
+            descendant(in: editor, identifier: "reverseProxyEditor.host") as? NSPopUpButton
+        )
+        let enabled = try XCTUnwrap(
+            descendant(in: editor, identifier: "reverseProxyEditor.enabled") as? NSButton
+        )
+        XCTAssertEqual(name.stringValue, "")
+        XCTAssertEqual(port.stringValue, "8080")
+        XCTAssertEqual(upstream.stringValue, "")
+        XCTAssertEqual(host.itemTitles, ["127.0.0.1", "::1"])
+        XCTAssertEqual(enabled.state, .on)
+        XCTAssertNotNil(descendant(in: editor, identifier: "reverseProxyEditor.cancel"))
+
+        name.stringValue = "  Local API  "
+        port.stringValue = "9443"
+        upstream.stringValue = "https://api.example.com/v1/"
+        try clickButton(in: editor, identifier: "reverseProxyEditor.save")
+
+        let saved = try XCTUnwrap(routeStore.routes.first)
+        XCTAssertEqual(routeStore.routes.count, 1)
+        XCTAssertEqual(saved.name, "Local API")
+        XCTAssertEqual(saved.listenEndpoint, NetworkEndpoint(host: "127.0.0.1", port: 9_443))
+        XCTAssertEqual(saved.upstreamURL.absoluteString, "https://api.example.com/v1")
+        XCTAssertTrue(saved.isEnabled)
+        XCTAssertEqual(controller.numberOfRoutes, 1)
+        XCTAssertEqual(
+            try field(in: editor, identifier: "reverseProxyEditor.validation").stringValue,
+            ""
+        )
+    }
+
+    func testRouteEditorPrefillsSelectedRouteAndSavesEdits() async throws {
+        let route = try makeRoute()
+        let routeStore = InMemoryTrafficReverseProxyRouteStore(routes: [route])
+        let viewModel = makeViewModel(routeStore: routeStore)
+        await viewModel.prepare()
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        let window = makeWindow(hosting: controller)
+        defer { closeWindow(window) }
+        let table = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "reverseProxyManager.table")
+                as? NSTableView
+        )
+
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try clickButton(in: controller.view, identifier: "reverseProxyManager.edit")
+
+        let editor = try presentedEditorView(in: controller)
+        let name = try field(in: editor, identifier: "reverseProxyEditor.name")
+        let port = try field(in: editor, identifier: "reverseProxyEditor.port")
+        let upstream = try field(in: editor, identifier: "reverseProxyEditor.upstreamURL")
+        let host = try XCTUnwrap(
+            descendant(in: editor, identifier: "reverseProxyEditor.host") as? NSPopUpButton
+        )
+        let enabled = try XCTUnwrap(
+            descendant(in: editor, identifier: "reverseProxyEditor.enabled") as? NSButton
+        )
+        XCTAssertEqual(name.stringValue, "Local API")
+        XCTAssertEqual(port.stringValue, "9443")
+        XCTAssertEqual(upstream.stringValue, "https://api.example.com/v1")
+        XCTAssertEqual(host.titleOfSelectedItem, "127.0.0.1")
+        XCTAssertEqual(enabled.state, .on)
+
+        name.stringValue = "Renamed API"
+        upstream.stringValue = "https://api.example.com/v2"
+        enabled.state = .off
+        try clickButton(in: editor, identifier: "reverseProxyEditor.save")
+
+        let saved = try XCTUnwrap(routeStore.routes.first)
+        XCTAssertEqual(routeStore.routes.count, 1)
+        XCTAssertEqual(saved.id, route.id)
+        XCTAssertEqual(saved.name, "Renamed API")
+        XCTAssertEqual(saved.upstreamURL.absoluteString, "https://api.example.com/v2")
+        XCTAssertFalse(saved.isEnabled)
+        XCTAssertEqual(try cellText(in: table, row: 0, column: "name"), "Renamed API")
+        XCTAssertEqual(try enabledCheckbox(in: table, row: 0).state, .off)
+    }
+
+    func testRouteEditorReportsValidationFailuresWithoutSavingTheRoute() async throws {
+        let routeStore = InMemoryTrafficReverseProxyRouteStore()
+        let viewModel = makeViewModel(routeStore: routeStore)
+        await viewModel.prepare()
+        let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        let window = makeWindow(hosting: controller)
+        defer { closeWindow(window) }
+
+        try clickButton(in: controller.view, identifier: "reverseProxyManager.add")
+
+        let editor = try presentedEditorView(in: controller)
+        let name = try field(in: editor, identifier: "reverseProxyEditor.name")
+        let port = try field(in: editor, identifier: "reverseProxyEditor.port")
+        let upstream = try field(in: editor, identifier: "reverseProxyEditor.upstreamURL")
+        let validation = try field(in: editor, identifier: "reverseProxyEditor.validation")
+
+        name.stringValue = "Local API"
+        port.stringValue = "0"
+        upstream.stringValue = "https://api.example.com/v1"
+        try clickButton(in: editor, identifier: "reverseProxyEditor.save")
+
+        XCTAssertEqual(
+            validation.stringValue,
+            TrafficReverseProxyRouteStoreError.invalidListenPort.localizedDescription
+        )
+        XCTAssertTrue(routeStore.routes.isEmpty)
+
+        port.stringValue = "9443"
+        upstream.stringValue = "https://user:secret@api.example.com/v1"
+        try clickButton(in: editor, identifier: "reverseProxyEditor.save")
+
+        XCTAssertEqual(
+            validation.stringValue,
+            ReverseProxyRouteError.invalidUpstreamURL.localizedDescription
+        )
+        XCTAssertTrue(routeStore.routes.isEmpty)
+
+        port.stringValue = "9090"
+        upstream.stringValue = "https://api.example.com/v1"
+        try clickButton(in: editor, identifier: "reverseProxyEditor.save")
+
+        XCTAssertEqual(
+            validation.stringValue,
+            ReverseProxyRouteError.listenerCollision(
+                NetworkEndpoint(host: "127.0.0.1", port: 9_090)
+            ).localizedDescription
+        )
+        XCTAssertTrue(routeStore.routes.isEmpty)
+        XCTAssertEqual(controller.numberOfRoutes, 0)
+    }
+
     private func makeRoute(
         id: UUID = UUID(),
         name: String = "Local API",
@@ -453,6 +729,100 @@ final class ReverseProxyManagerTests: XCTestCase {
             if let match = descendant(in: subview, identifier: identifier) { return match }
         }
         return nil
+    }
+
+    private func makeViewModel(
+        routeStore: InMemoryTrafficReverseProxyRouteStore,
+        captureController: ReverseProxyRecordingCaptureController =
+            ReverseProxyRecordingCaptureController()
+    ) -> TrafficConsoleViewModel {
+        TrafficConsoleViewModel(
+            captureController: captureController,
+            eventSource: ReverseProxyFinishedEventSource(),
+            bodyReader: ReverseProxyInlineBodyReader(),
+            captureConfiguration: CaptureConfiguration(
+                proxy: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 9_090),
+                    interceptHTTPS: true
+                ),
+                configuresSystemProxy: false
+            ),
+            reverseProxyRouteStore: routeStore
+        )
+    }
+
+    private func makeWindow(hosting controller: ReverseProxyManagerViewController) -> NSWindow {
+        let frame = NSRect(x: 0, y: 0, width: 920, height: 780)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        controller.view.frame = NSRect(origin: .zero, size: frame.size)
+        window.contentView?.layoutSubtreeIfNeeded()
+        return window
+    }
+
+    private func closeWindow(_ window: NSWindow) {
+        for sheet in window.sheets {
+            window.endSheet(sheet)
+        }
+        window.contentViewController = nil
+        window.orderOut(nil)
+    }
+
+    private func presentedEditorView(
+        in controller: ReverseProxyManagerViewController
+    ) throws -> NSView {
+        let editor = try XCTUnwrap(controller.presentedViewControllers?.first)
+        return editor.view
+    }
+
+    private func clickButton(in view: NSView, identifier: String) throws {
+        let button = try XCTUnwrap(descendant(in: view, identifier: identifier) as? NSButton)
+        button.performClick(nil)
+    }
+
+    private func field(in view: NSView, identifier: String) throws -> NSTextField {
+        try XCTUnwrap(descendant(in: view, identifier: identifier) as? NSTextField)
+    }
+
+    private func column(_ table: NSTableView, identifier: String) throws -> Int {
+        try XCTUnwrap(
+            table.tableColumns.firstIndex { $0.identifier.rawValue == identifier }
+        )
+    }
+
+    private func cellText(in table: NSTableView, row: Int, column name: String) throws -> String {
+        let index = try column(table, identifier: name)
+        let cell = try XCTUnwrap(
+            table.view(atColumn: index, row: row, makeIfNecessary: true) as? NSTextField
+        )
+        XCTAssertEqual(cell.toolTip, cell.stringValue)
+        return cell.stringValue
+    }
+
+    private func enabledCheckbox(in table: NSTableView, row: Int) throws -> NSButton {
+        let index = try column(table, identifier: "enabled")
+        return try XCTUnwrap(
+            table.view(atColumn: index, row: row, makeIfNecessary: true) as? NSButton
+        )
+    }
+
+    private func dismissingModalAlert(_ body: () -> Void) {
+        let timer = Timer(timeInterval: 0.02, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard NSApp.modalWindow != nil else { return }
+                NSApp.abortModal()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        RunLoop.main.add(timer, forMode: .common)
+        defer { timer.invalidate() }
+        body()
     }
 }
 

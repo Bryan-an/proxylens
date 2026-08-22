@@ -6039,6 +6039,348 @@ final class ProxyLensCaptureTests: XCTestCase {
 
         await upstream.stop()
     }
+
+    func testRequestHeaderScriptRetargetsUpstreamMethodAndURLAcrossHosts() async throws {
+        let originalUpstream = try await TestHTTPServer.start(responseBody: "original-upstream")
+        let scriptedUpstream = try await TestHTTPServer.start(responseBody: "scripted-upstream")
+        let scriptedPort = scriptedUpstream.endpoint.port
+        let eventSink = RecordingFlowEventSink()
+        let scriptExecutor = StubScriptExecutor { request in
+            XCTAssertEqual(request.hook, .request)
+            XCTAssertEqual(request.message.method, "GET")
+            XCTAssertNil(request.message.body)
+            XCTAssertTrue(request.message.url?.hasSuffix("/original") == true)
+            return try ScriptExecutionResult(
+                hook: .request,
+                message: ScriptHTTPMessage(
+                    method: "PUT",
+                    url: "http://127.0.0.1:\(scriptedPort)/rewritten",
+                    headers: request.message.headers
+                ),
+                logs: ["request retargeted"]
+            )
+        }
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Retarget request",
+                    phase: .requestHeaders,
+                    matcher: .path(.exact("/original")),
+                    action: .script(
+                        try ScriptRuleSpec(source: "function onRequest(context) {}")
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            ruleSnapshot: snapshot,
+            scriptExecutor: scriptExecutor
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                return XCTFail("Expected the proxy engine to be running")
+            }
+
+            let response = try await HTTPTestClient.get(
+                url: "http://127.0.0.1:\(originalUpstream.endpoint.port)/original",
+                through: proxyEndpoint
+            )
+
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("scripted-upstream".utf8))
+            XCTAssertEqual(scriptedUpstream.requestMethod, "PUT")
+            XCTAssertEqual(scriptedUpstream.requestURI, "/rewritten")
+            XCTAssertEqual(scriptedUpstream.requestHeader("Host"), "127.0.0.1:\(scriptedPort)")
+            XCTAssertEqual(originalUpstream.requestCount, 0)
+            await eventSink.waitForFinished()
+            let completedFlow = await eventSink.lastFlow { $0.state == .completed }
+            let flow = try XCTUnwrap(completedFlow)
+            XCTAssertEqual(flow.request.method, .get)
+            XCTAssertEqual(flow.request.url.path, "/original")
+            XCTAssertEqual(flow.request.url.port, Int(originalUpstream.endpoint.port))
+            XCTAssertEqual(flow.connection?.upstreamPort, scriptedPort)
+            XCTAssertEqual(flow.ruleTraces.map(\.phase), [.requestHeaders])
+            XCTAssertEqual(flow.ruleTraces.map(\.outcome), [.applied])
+            XCTAssertEqual(flow.ruleTraces.map(\.logs), [["request retargeted"]])
+        } catch {
+            await engine.stop()
+            await scriptedUpstream.stop()
+            await originalUpstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await scriptedUpstream.stop()
+        await originalUpstream.stop()
+    }
+
+    func testInterceptedSecureWebSocketHandshakeScriptsRewriteSafeRequestAndResponseFields()
+        async throws
+    {
+        let certificateProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.secure-ws-script-tests.\(UUID().uuidString)"
+            )
+        )
+        let rootCertificate = try await certificateProvider.rootCertificate()
+        let upstreamIdentity = try await certificateProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestWebSocketServer.startTLS(identity: upstreamIdentity)
+        let flowEvents = RecordingFlowEventSink()
+        let scriptExecutor = StubScriptExecutor { request in
+            switch request.hook {
+            case .request:
+                XCTAssertTrue(request.message.url?.hasPrefix("wss://") == true)
+                let url = try XCTUnwrap(URL(string: try XCTUnwrap(request.message.url)))
+                var components = try XCTUnwrap(
+                    URLComponents(url: url, resolvingAgainstBaseURL: false))
+                components.path = "/scripted"
+                return try ScriptExecutionResult(
+                    hook: .request,
+                    message: ScriptHTTPMessage(
+                        method: request.message.method,
+                        url: try XCTUnwrap(components.url).absoluteString,
+                        headers: request.message.headers + [
+                            try HTTPHeader(name: "X-ProxyLens-Secure-WebSocket", value: "request")
+                        ]
+                    ),
+                    logs: ["secure WebSocket request handshake updated"]
+                )
+            case .response:
+                return try ScriptExecutionResult(
+                    hook: .response,
+                    message: ScriptHTTPMessage(
+                        statusCode: request.message.statusCode,
+                        headers: request.message.headers + [
+                            try HTTPHeader(name: "X-ProxyLens-Secure-WebSocket", value: "response")
+                        ]
+                    ),
+                    logs: ["secure WebSocket response handshake updated"]
+                )
+            }
+        }
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Rewrite secure WebSocket request handshake",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    matcher: .header(name: "Upgrade", value: .exact("websocket")),
+                    action: .script(
+                        try ScriptRuleSpec(source: "function onRequest(context) {}")
+                    )
+                ),
+                Rule(
+                    name: "Rewrite secure WebSocket response handshake",
+                    priority: 10,
+                    phase: .responseHeaders,
+                    matcher: .header(name: "Upgrade", value: .exact("websocket")),
+                    action: .script(
+                        try ScriptRuleSpec(source: "function onResponse(context) {}")
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: flowEvents,
+            certificateProvider: certificateProvider,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [rootCertificate]
+            ),
+            ruleSnapshot: snapshot,
+            scriptExecutor: scriptExecutor
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                try await certificateProvider.removeCertificateAuthority()
+                return
+            }
+
+            let result = try await SecureWebSocketTestClient.exchangeDetails(
+                url: "wss://localhost:\(upstream.endpoint.port)/echo",
+                through: proxyEndpoint,
+                trustedRootCertificate: rootCertificate,
+                initialMessage: "hello",
+                expectedResponseCount: 1
+            )
+
+            XCTAssertEqual(result.responses, ["echo:hello"])
+            XCTAssertEqual(upstream.requestURI, "/scripted")
+            XCTAssertEqual(upstream.requestHeader("X-ProxyLens-Secure-WebSocket"), "request")
+            XCTAssertEqual(upstream.requestHeader("Upgrade"), "websocket")
+            XCTAssertEqual(upstream.requestHeader("Sec-WebSocket-Key"), "AQIDBAUGBwgJCgsMDQ4PEC==")
+            XCTAssertEqual(upstream.requestHeader("Host"), "localhost:\(upstream.endpoint.port)")
+            XCTAssertEqual(result.header("X-ProxyLens-Secure-WebSocket"), "response")
+            XCTAssertEqual(result.header("Upgrade"), "websocket")
+            await flowEvents.waitForFinished()
+            let completedFlow = await flowEvents.lastFlow { $0.state == .completed }
+            let flow = try XCTUnwrap(completedFlow)
+            XCTAssertEqual(flow.request.url.scheme, "https")
+            XCTAssertEqual(flow.request.url.path, "/echo")
+            XCTAssertEqual(flow.connection?.protocolKind, .secureWebSocket)
+            XCTAssertEqual(flow.connection?.tlsIntercepted, true)
+            XCTAssertNil(flow.request.headers.firstValue(for: "X-ProxyLens-Secure-WebSocket"))
+            XCTAssertNil(flow.response?.headers.firstValue(for: "X-ProxyLens-Secure-WebSocket"))
+            XCTAssertEqual(flow.ruleTraces.map(\.outcome), [.applied, .applied])
+            XCTAssertEqual(
+                flow.ruleTraces.map(\.logs),
+                [
+                    ["secure WebSocket request handshake updated"],
+                    ["secure WebSocket response handshake updated"]
+                ]
+            )
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await certificateProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await certificateProvider.removeCertificateAuthority()
+    }
+
+    func testInterceptedSecureWebSocketHandshakeScriptsFailOpenForCriticalFieldMutations()
+        async throws
+    {
+        let certificateProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.secure-ws-script-tests.\(UUID().uuidString)"
+            )
+        )
+        let rootCertificate = try await certificateProvider.rootCertificate()
+        let upstreamIdentity = try await certificateProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestWebSocketServer.startTLS(identity: upstreamIdentity)
+        let flowEvents = RecordingFlowEventSink()
+        let scriptExecutor = StubScriptExecutor { request in
+            switch request.hook {
+            case .request:
+                XCTAssertTrue(request.message.url?.hasPrefix("wss://") == true)
+                return try ScriptExecutionResult(
+                    hook: .request,
+                    message: ScriptHTTPMessage(
+                        method: "POST",
+                        url: request.message.url,
+                        headers: request.message.headers.filter {
+                            $0.name.caseInsensitiveCompare("Sec-WebSocket-Key") != .orderedSame
+                        } + [
+                            try HTTPHeader(name: "Sec-WebSocket-Key", value: "invalid"),
+                            try HTTPHeader(name: "X-Must-Not-Apply", value: "request")
+                        ]
+                    )
+                )
+            case .response:
+                return try ScriptExecutionResult(
+                    hook: .response,
+                    message: ScriptHTTPMessage(
+                        statusCode: 200,
+                        headers: request.message.headers + [
+                            try HTTPHeader(name: "X-Must-Not-Apply", value: "response")
+                        ]
+                    )
+                )
+            }
+        }
+        let snapshot = MutableRuleSnapshot(
+            rules: RuleSet(rules: [
+                Rule(
+                    name: "Invalid secure WebSocket request handshake",
+                    priority: 10,
+                    phase: .requestHeaders,
+                    matcher: .header(name: "Upgrade", value: .exact("websocket")),
+                    action: .script(
+                        try ScriptRuleSpec(source: "function onRequest(context) {}")
+                    )
+                ),
+                Rule(
+                    name: "Invalid secure WebSocket response handshake",
+                    priority: 10,
+                    phase: .responseHeaders,
+                    matcher: .header(name: "Upgrade", value: .exact("websocket")),
+                    action: .script(
+                        try ScriptRuleSpec(source: "function onResponse(context) {}")
+                    )
+                )
+            ])
+        )
+        let engine = NIOProxyEngine(
+            eventSink: flowEvents,
+            certificateProvider: certificateProvider,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [rootCertificate]
+            ),
+            ruleSnapshot: snapshot,
+            scriptExecutor: scriptExecutor
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                try await certificateProvider.removeCertificateAuthority()
+                return
+            }
+
+            let result = try await SecureWebSocketTestClient.exchangeDetails(
+                url: "wss://localhost:\(upstream.endpoint.port)/echo",
+                through: proxyEndpoint,
+                trustedRootCertificate: rootCertificate,
+                initialMessage: "hello",
+                expectedResponseCount: 1
+            )
+
+            XCTAssertEqual(result.responses, ["echo:hello"])
+            XCTAssertEqual(upstream.requestURI, "/echo")
+            XCTAssertNil(upstream.requestHeader("X-Must-Not-Apply"))
+            XCTAssertEqual(upstream.requestHeader("Sec-WebSocket-Key"), "AQIDBAUGBwgJCgsMDQ4PEC==")
+            XCTAssertNil(result.header("X-Must-Not-Apply"))
+            await flowEvents.waitForFinished()
+            let completedFlow = await flowEvents.lastFlow { $0.state == .completed }
+            let flow = try XCTUnwrap(completedFlow)
+            XCTAssertEqual(flow.ruleTraces.count, 2)
+            for trace in flow.ruleTraces {
+                guard case .failed(let message) = trace.outcome else {
+                    return XCTFail("Expected protected WebSocket mutation to fail open")
+                }
+                XCTAssertTrue(message.contains("WebSocket handshake"))
+            }
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await certificateProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await certificateProvider.removeCertificateAuthority()
+    }
 }
 
 private actor TestExternalHTTPProxyCredentialStore: ExternalHTTPProxyCredentialStoring {
@@ -7324,6 +7666,52 @@ private enum HTTPSTestPipeline {
         }.flatMap { $0 }
     }
 
+    static func replaceConnectHandlersWithTLSOnly(
+        on channel: Channel,
+        tlsContext: NIOSSLContext,
+        serverHostname: String,
+        handshakePromise: EventLoopPromise<Void>
+    ) -> EventLoopFuture<Void> {
+        channel.eventLoop.submit {
+            let operations = channel.pipeline.syncOperations
+            let responseHandler = try operations.context(name: responseHandlerName)
+            let responseDecoder = try operations.context(name: responseDecoderName)
+            let requestEncoder = try operations.context(name: requestEncoderName)
+            let loopBoundOperations = NIOLoopBound(operations, eventLoop: channel.eventLoop)
+            let loopBoundResponseDecoder = NIOLoopBound(
+                responseDecoder,
+                eventLoop: channel.eventLoop
+            )
+            let loopBoundRequestEncoder = NIOLoopBound(
+                requestEncoder,
+                eventLoop: channel.eventLoop
+            )
+
+            return operations.removeHandler(context: responseHandler)
+                .flatMap {
+                    loopBoundOperations.value.removeHandler(
+                        context: loopBoundResponseDecoder.value
+                    )
+                }
+                .flatMap {
+                    loopBoundOperations.value.removeHandler(
+                        context: loopBoundRequestEncoder.value
+                    )
+                }
+                .flatMapThrowing {
+                    try loopBoundOperations.value.addHandler(
+                        NIOSSLClientHandler(
+                            context: tlsContext,
+                            serverHostname: serverHostname
+                        )
+                    )
+                    try loopBoundOperations.value.addHandler(
+                        TLSHandshakeHandler(promise: handshakePromise)
+                    )
+                }
+        }.flatMap { $0 }
+    }
+
     static func replaceConnectHandlersWithHTTP2(
         on channel: Channel,
         tlsContext: NIOSSLContext,
@@ -7673,6 +8061,10 @@ private final class TestHTTPServer {
         state.requestURI
     }
 
+    var requestMethod: String? {
+        state.requestMethod
+    }
+
     func requestHeader(_ name: String) -> String? {
         state.headerValue(name)
     }
@@ -7850,6 +8242,7 @@ private final class TestHTTPServerState: @unchecked Sendable {
     private var activeConnectionCountValue = 0
     private var requestCountValue = 0
     private var lastRequestURI: String?
+    private var lastRequestMethod: String?
     private var lastRequestHeaders: [(String, String)] = []
 
     var requestCount: Int {
@@ -7889,11 +8282,22 @@ private final class TestHTTPServerState: @unchecked Sendable {
         return lastRequestURI
     }
 
-    func recordRequest(uri: String, headers: NIOHTTP1.HTTPHeaders) {
+    var requestMethod: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastRequestMethod
+    }
+
+    func recordRequest(
+        method: NIOHTTP1.HTTPMethod,
+        uri: String,
+        headers: NIOHTTP1.HTTPHeaders
+    ) {
         lock.lock()
         defer { lock.unlock() }
         requestCountValue += 1
         lastRequestURI = uri
+        lastRequestMethod = method.rawValue
         lastRequestHeaders = headers.map { ($0.0, $0.1) }
     }
 
@@ -7950,7 +8354,7 @@ private final class TestHTTPServerHandler: ChannelInboundHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch Self.unwrapInboundIn(data) {
         case .head(let head):
-            state.recordRequest(uri: head.uri, headers: head.headers)
+            state.recordRequest(method: head.method, uri: head.uri, headers: head.headers)
         case .body(var buffer):
             if let bytes = buffer.readBytes(length: buffer.readableBytes) {
                 requestBody.append(contentsOf: bytes)
@@ -8037,6 +8441,140 @@ private func shutdown(_ group: MultiThreadedEventLoopGroup) async {
     await withCheckedContinuation { continuation in
         group.shutdownGracefully { _ in
             continuation.resume()
+        }
+    }
+}
+
+private enum SecureWebSocketTestClient {
+    static func exchangeDetails(
+        url: String,
+        through proxy: NetworkEndpoint,
+        trustedRootCertificate: Data,
+        initialMessage: String,
+        expectedResponseCount: Int
+    ) async throws -> WebSocketTestExchange {
+        guard let target = URL(string: url), let host = target.host, let port = target.port else {
+            throw ProxyLensError.invalidURL(url)
+        }
+        let path = target.path.isEmpty ? "/" : target.path
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        do {
+            let channel = try await ClientBootstrap(group: group)
+                .connect(host: proxy.host, port: Int(proxy.port))
+                .get()
+
+            let connectPromise = channel.eventLoop.makePromise(of: UInt.self)
+            try await HTTPSTestPipeline.installConnectHandlers(
+                on: channel,
+                promise: connectPromise
+            ).get()
+
+            var connectHeaders = NIOHTTP1.HTTPHeaders()
+            connectHeaders.add(name: "Host", value: "\(host):\(port)")
+            channel.write(
+                HTTPClientRequestPart.head(
+                    HTTPRequestHead(
+                        version: .http1_1,
+                        method: .CONNECT,
+                        uri: "\(host):\(port)",
+                        headers: connectHeaders
+                    )
+                ),
+                promise: nil
+            )
+            channel.writeAndFlush(HTTPClientRequestPart.end(nil), promise: nil)
+
+            let connectStatus = try await connectPromise.futureResult.get()
+            guard connectStatus == 200 else {
+                throw ProxyLensError.unsupportedOperation(
+                    "The proxy rejected CONNECT with status \(connectStatus)"
+                )
+            }
+
+            try await channel.setOption(ChannelOptions.autoRead, value: false).get()
+
+            let trustedRoots = try NIOSSLCertificate.fromPEMBytes(Array(trustedRootCertificate))
+            var tlsConfiguration = TLSConfiguration.makeClientConfiguration()
+            tlsConfiguration.minimumTLSVersion = .tlsv12
+            tlsConfiguration.additionalTrustRoots = [.certificates(trustedRoots)]
+            let tlsContext = try NIOSSLContext(configuration: tlsConfiguration)
+            let handshakePromise = channel.eventLoop.makePromise(of: Void.self)
+
+            try await HTTPSTestPipeline.replaceConnectHandlersWithTLSOnly(
+                on: channel,
+                tlsContext: tlsContext,
+                serverHostname: host,
+                handshakePromise: handshakePromise
+            ).get()
+            try await channel.setOption(ChannelOptions.autoRead, value: true).get()
+            try await handshakePromise.futureResult.get()
+
+            let responsePromise = channel.eventLoop.makePromise(of: WebSocketTestExchange.self)
+            let upgrader = NIOWebSocketClientUpgrader(
+                requestKey: "AQIDBAUGBwgJCgsMDQ4PEC==",
+                upgradePipelineHandler: { channel, responseHead in
+                    channel.pipeline.addHandler(
+                        WebSocketTestResponseHandler(
+                            promise: responsePromise,
+                            expectedResponseCount: expectedResponseCount,
+                            responseHeaders: responseHead.headers.map { ($0.name, $0.value) }
+                        )
+                    ).flatMap {
+                        var payload = channel.allocator.buffer(capacity: initialMessage.utf8.count)
+                        payload.writeString(initialMessage)
+                        return channel.writeAndFlush(
+                            WebSocketFrame(
+                                fin: true,
+                                opcode: .text,
+                                maskKey: [1, 2, 3, 4],
+                                data: payload
+                            )
+                        )
+                    }
+                }
+            )
+            let configuration: NIOHTTPClientUpgradeSendableConfiguration = (
+                upgraders: [upgrader],
+                completionHandler: { _ in }
+            )
+            try await channel.pipeline.addHTTPClientHandlers(
+                withClientUpgrade: configuration
+            ).get()
+
+            let timeout = channel.eventLoop.scheduleTask(in: .seconds(5)) {
+                responsePromise.fail(
+                    ProxyLensError.unsupportedOperation(
+                        "Timed out waiting for the secure WebSocket echo response"
+                    )
+                )
+            }
+            responsePromise.futureResult.whenComplete { _ in
+                timeout.cancel()
+            }
+
+            var upgradeHeaders = NIOHTTP1.HTTPHeaders()
+            upgradeHeaders.add(name: "Host", value: "\(host):\(port)")
+            upgradeHeaders.add(name: "Content-Length", value: "0")
+            channel.write(
+                HTTPClientRequestPart.head(
+                    HTTPRequestHead(
+                        version: .http1_1,
+                        method: .GET,
+                        uri: path,
+                        headers: upgradeHeaders
+                    )
+                ),
+                promise: nil
+            )
+            channel.writeAndFlush(HTTPClientRequestPart.end(nil), promise: nil)
+
+            let result = try await responsePromise.futureResult.get()
+            _ = try? await channel.close().get()
+            await shutdown(group)
+            return result
+        } catch {
+            await shutdown(group)
+            throw error
         }
     }
 }

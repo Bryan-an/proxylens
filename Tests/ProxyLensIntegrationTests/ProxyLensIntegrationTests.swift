@@ -385,7 +385,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "ruleEditor.actionValue" }
             )
         )
-        XCTAssertFalse(address.isHidden)
+        XCTAssertFalse(address.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(address.accessibilityLabel(), "DNS spoof address")
         XCTAssertEqual(address.placeholderString, "127.0.0.1 or ::1")
     }
@@ -484,7 +484,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
         XCTAssertEqual(sourceEditor.string, existingSource)
-        XCTAssertFalse(sourceEditor.enclosingScrollView?.isHidden ?? true)
+        XCTAssertFalse(sourceEditor.enclosingScrollView?.isHiddenOrHasHiddenAncestor ?? true)
         XCTAssertEqual(sourceEditor.accessibilityLabel(), "JavaScript source")
 
         let newEditor = TrafficRuleEditorViewController()
@@ -507,7 +507,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
         XCTAssertTrue(newSourceEditor.string.contains("function onRequest(context)"))
-        XCTAssertFalse(newSourceEditor.enclosingScrollView?.isHidden ?? true)
+        XCTAssertFalse(newSourceEditor.enclosingScrollView?.isHiddenOrHasHiddenAncestor ?? true)
 
         let phase = try XCTUnwrap(
             Self.descendant(
@@ -4445,10 +4445,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         XCTAssertLessThan(modeSelector.frame.width, inspectorPaneFrame.width / 2)
         XCTAssertTrue(requestSectionSelector.isHidden)
-        XCTAssertFalse(requestCompactSectionSelector.isHidden)
+        XCTAssertFalse(requestCompactSectionSelector.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(requestCompactSectionSelector.selectedItem?.title, "Headers")
         XCTAssertTrue(responseSectionSelector.isHidden)
-        XCTAssertFalse(responseCompactSectionSelector.isHidden)
+        XCTAssertFalse(responseCompactSectionSelector.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(responseCompactSectionSelector.selectedItem?.title, "Headers")
         XCTAssertEqual(
             (0..<requestSectionSelector.segmentCount).map {
@@ -4839,7 +4839,19 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         await viewModel.prepare()
 
-        let flow = try Self.makeFlow(index: 12, host: "panes.example.com", statusCode: 200)
+        // The Tree section only renders rows for a JSON body. Without one JSONTreeView shows its
+        // message label and hides the scroll view, which would make the height guard below measure
+        // an outline view that is not on screen.
+        let treeBody = Data(
+            #"{"id":12,"items":[{"sku":"a","qty":1},{"sku":"b","qty":2}],"meta":{"page":1}}"#.utf8
+        )
+        let flow = try Self.makeFlow(
+            index: 12,
+            host: "panes.example.com",
+            statusCode: 200,
+            requestBody: treeBody,
+            requestContentType: "application/json"
+        )
         viewModel.receive(.finished(flow))
         viewModel.flushPendingEvents()
         viewModel.selectFlow(flow.id)
@@ -4926,7 +4938,9 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "inspector.request.tree" }
             )
         )
-        XCTAssertFalse(treeView.isHidden)
+        try await waitUntil { !treeView.isHiddenOrHasHiddenAncestor }
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertFalse(treeView.isHiddenOrHasHiddenAncestor)
         XCTAssertGreaterThan(
             treeView.frame.height,
             requestPane.frame.height - 80,
@@ -4985,7 +4999,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
 
-        XCTAssertFalse(annotationBar.isHidden)
+        XCTAssertFalse(annotationBar.isHiddenOrHasHiddenAncestor)
         XCTAssertLessThanOrEqual(
             annotationBar.frame.height,
             annotationBar.fittingSize.height + 1
@@ -5093,7 +5107,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertFalse(timingView.isHidden)
+        XCTAssertFalse(timingView.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(totalField.stringValue, "250 ms")
         XCTAssertEqual(waitingField.stringValue, "120 ms")
         XCTAssertEqual(clientProtocolField.stringValue, "HTTP/1.1")
@@ -5278,7 +5292,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         sectionSelector.selectedSegment = bodySegment
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertTrue(inspector.string.contains(compact))
-        XCTAssertFalse(inspector.enclosingScrollView?.isHidden ?? true)
+        XCTAssertFalse(inspector.enclosingScrollView?.isHiddenOrHasHiddenAncestor ?? true)
         XCTAssertTrue(tree.isHiddenOrHasHiddenAncestor)
     }
 
@@ -5449,7 +5463,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "inspector.sse.events" }
             )
         )
-        XCTAssertFalse(eventTable.isHidden)
+        XCTAssertFalse(eventTable.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(eventTable.numberOfRows, 2)
         XCTAssertEqual(eventTable.selectedRow, 0)
 
@@ -5765,7 +5779,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertFalse(frameTable.isHidden)
+        XCTAssertFalse(frameTable.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(frameTable.numberOfRows, 2)
         XCTAssertEqual(frameTable.selectedRow, 0)
 
@@ -7516,8 +7530,8 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertFalse(importButton.isHidden)
-        XCTAssertFalse(messageTypePopup.isHidden)
+        XCTAssertFalse(importButton.isHiddenOrHasHiddenAncestor)
+        XCTAssertFalse(messageTypePopup.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(messageTypePopup.itemTitles, ["Schema-less", "example.User"])
         XCTAssertEqual(messageTypePopup.titleOfSelectedItem, "example.User")
     }
@@ -7596,6 +7610,500 @@ final class ProxyLensIntegrationTests: XCTestCase {
         let stored = try await store.load()
         XCTAssertEqual(stored?.sourceName, "valid.desc")
         XCTAssertEqual(stored?.data, Self.singleMessageDescriptorSet)
+    }
+    func testProtobufDescriptorAndSelectionsHydrateFromAPrePopulatedStore() async throws {
+        let store = InMemoryTrafficProtobufDescriptorStore(
+            stored: TrafficStoredProtobufDescriptor(
+                data: Self.singleMessageDescriptorSet,
+                sourceName: "restored.desc",
+                requestMessageType: "example.User",
+                responseMessageType: "example.Missing"
+            )
+        )
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            protobufDescriptorStore: store
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 141,
+            host: "restored.protobuf.example.com",
+            statusCode: 200,
+            requestBody: Data([0x08, 0x96, 0x01]),
+            responseBody: Data([0x08, 0x07]),
+            responseContentType: "application/protobuf",
+            requestContentType: "application/protobuf"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        try await waitUntil {
+            guard
+                let request = viewModel.snapshot.inspection.request,
+                let response = viewModel.snapshot.inspection.response,
+                case .content(_, let requestProtobuf) = request.protobuf,
+                case .content(_, let responseProtobuf) = response.protobuf
+            else {
+                return false
+            }
+            return request.protobufSchema.descriptorName == "restored.desc"
+                && request.protobufSchema.selectedMessageType == "example.User"
+                && requestProtobuf.contains("1  id")
+                && requestProtobuf.contains("150")
+                && response.protobufSchema.selectedMessageType == nil
+                && responseProtobuf.contains("1  varint   7")
+        }
+
+        let request = try XCTUnwrap(viewModel.snapshot.inspection.request)
+        let response = try XCTUnwrap(viewModel.snapshot.inspection.response)
+        XCTAssertEqual(request.protobufSchema.messageTypeNames, ["example.User"])
+        XCTAssertEqual(response.protobufSchema.descriptorName, "restored.desc")
+        XCTAssertEqual(response.protobufSchema.messageTypeNames, ["example.User"])
+        XCTAssertNil(viewModel.snapshot.workspaceWarning)
+    }
+
+    func testNonProtobufInspectorSectionsHideTheDescriptorControls() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            protobufDescriptorStore: InMemoryTrafficProtobufDescriptorStore()
+        )
+        await viewModel.prepare()
+        try await viewModel.importProtobufDescriptorSet(
+            data: Self.singleMessageDescriptorSet,
+            sourceName: "example.desc"
+        )
+        try await viewModel.selectProtobufMessageType("example.User", direction: .request)
+
+        let flow = try Self.makeFlow(
+            index: 142,
+            host: "sections.protobuf.example.com",
+            statusCode: 200,
+            requestBody: Data([0x08, 0x96, 0x01]),
+            requestContentType: "application/protobuf"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        try await waitUntil {
+            viewModel.snapshot.inspection.request?.protobufSchema.selectedMessageType
+                == "example.User"
+        }
+
+        let controller = InspectorViewController(viewModel: viewModel)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.section" }
+            )
+        )
+        let importButton = try XCTUnwrap(
+            Self.descendant(
+                of: NSButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.protobuf.import"
+                }
+            )
+        )
+        let descriptorField = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.protobuf.descriptor"
+                }
+            )
+        )
+        let messageTypePopup = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.protobuf.messageType"
+                }
+            )
+        )
+
+        func selectSection(_ label: String) throws {
+            let index = try XCTUnwrap(
+                (0..<sectionSelector.segmentCount).first {
+                    sectionSelector.label(forSegment: $0) == label
+                },
+                "Missing \(label) segment"
+            )
+            sectionSelector.selectedSegment = index
+            sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        }
+
+        for section in ["Headers", "Body", "JSON", "Hex", "Raw"] {
+            try selectSection(section)
+            XCTAssertTrue(
+                importButton.isHiddenOrHasHiddenAncestor,
+                "Import button visible in \(section)"
+            )
+            XCTAssertTrue(
+                descriptorField.isHiddenOrHasHiddenAncestor,
+                "Descriptor field visible in \(section)"
+            )
+            XCTAssertTrue(
+                messageTypePopup.isHiddenOrHasHiddenAncestor,
+                "Message type popup visible in \(section)"
+            )
+        }
+
+        try selectSection("Protobuf")
+        XCTAssertFalse(importButton.isHiddenOrHasHiddenAncestor)
+        XCTAssertFalse(descriptorField.isHiddenOrHasHiddenAncestor)
+        XCTAssertFalse(messageTypePopup.isHiddenOrHasHiddenAncestor)
+        XCTAssertEqual(descriptorField.stringValue, "example.desc")
+    }
+
+    func testProtobufDescriptorFieldReportsImportStatus() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            protobufDescriptorStore: InMemoryTrafficProtobufDescriptorStore()
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 143,
+            host: "status.protobuf.example.com",
+            statusCode: 200,
+            requestBody: Data([0x08, 0x96, 0x01]),
+            requestContentType: "application/protobuf"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        try await waitUntil {
+            guard case .content = viewModel.snapshot.inspection.request?.protobuf else {
+                return false
+            }
+            return true
+        }
+
+        let controller = InspectorViewController(viewModel: viewModel)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.section" }
+            )
+        )
+        let protobufSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Protobuf"
+            }
+        )
+        sectionSelector.selectedSegment = protobufSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+        let descriptorField = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.protobuf.descriptor"
+                }
+            )
+        )
+        let messageTypePopup = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: controller.view,
+                matching: {
+                    $0.accessibilityIdentifier() == "inspector.request.protobuf.messageType"
+                }
+            )
+        )
+        XCTAssertEqual(descriptorField.stringValue, "No descriptor")
+        XCTAssertNil(descriptorField.toolTip)
+        XCTAssertEqual(messageTypePopup.itemTitles, ["Schema-less"])
+
+        try await viewModel.importProtobufDescriptorSet(
+            data: Self.singleMessageDescriptorSet,
+            sourceName: "example.desc"
+        )
+        try await viewModel.selectProtobufMessageType("example.User", direction: .request)
+        controller.render(viewModel.snapshot)
+        XCTAssertEqual(descriptorField.stringValue, "example.desc")
+        XCTAssertEqual(descriptorField.toolTip, "example.desc")
+        XCTAssertEqual(messageTypePopup.itemTitles, ["Schema-less", "example.User"])
+
+        do {
+            try await viewModel.importProtobufDescriptorSet(
+                data: Data([0x0A, 0x7F]),
+                sourceName: "broken.desc"
+            )
+            XCTFail("Expected the malformed descriptor import to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("extends past"))
+        }
+
+        controller.render(viewModel.snapshot)
+        XCTAssertEqual(descriptorField.stringValue, "example.desc")
+        XCTAssertEqual(messageTypePopup.itemTitles, ["Schema-less", "example.User"])
+        XCTAssertEqual(messageTypePopup.titleOfSelectedItem, "example.User")
+    }
+
+    func testFailedProtobufImportKeepsThePreviousSchemaActiveInTheSnapshot() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            protobufDescriptorStore: InMemoryTrafficProtobufDescriptorStore()
+        )
+        await viewModel.prepare()
+        try await viewModel.importProtobufDescriptorSet(
+            data: Self.singleMessageDescriptorSet,
+            sourceName: "valid.desc"
+        )
+        try await viewModel.selectProtobufMessageType("example.User", direction: .request)
+
+        let flow = try Self.makeFlow(
+            index: 144,
+            host: "failed-import.protobuf.example.com",
+            statusCode: 200,
+            requestBody: Data([0x08, 0x96, 0x01]),
+            requestContentType: "application/protobuf"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        try await waitUntil {
+            guard
+                let request = viewModel.snapshot.inspection.request,
+                case .content(_, let protobuf) = request.protobuf
+            else {
+                return false
+            }
+            return request.protobufSchema.selectedMessageType == "example.User"
+                && protobuf.contains("1  id")
+        }
+
+        do {
+            try await viewModel.importProtobufDescriptorSet(
+                data: Data([0x0A, 0x7F]),
+                sourceName: "broken.desc"
+            )
+            XCTFail("Expected the malformed descriptor import to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("extends past"))
+        }
+
+        let request = try XCTUnwrap(viewModel.snapshot.inspection.request)
+        XCTAssertEqual(request.protobufSchema.descriptorName, "valid.desc")
+        XCTAssertEqual(request.protobufSchema.messageTypeNames, ["example.User"])
+        XCTAssertEqual(request.protobufSchema.selectedMessageType, "example.User")
+        guard case .content(_, let protobuf) = request.protobuf else {
+            return XCTFail("Expected decoded Protobuf content, got \(request.protobuf)")
+        }
+        XCTAssertTrue(protobuf.contains("1  id"))
+        XCTAssertTrue(protobuf.contains("int32"))
+        XCTAssertTrue(protobuf.contains("150"))
+    }
+
+    func testInspectorMessageTypePopupReturnsHTTPProtobufOutputToSchemaLess() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60),
+            protobufDescriptorStore: InMemoryTrafficProtobufDescriptorStore()
+        )
+        await viewModel.prepare()
+        try await viewModel.importProtobufDescriptorSet(
+            data: Self.singleMessageDescriptorSet,
+            sourceName: "example.desc"
+        )
+
+        let flow = try Self.makeFlow(
+            index: 145,
+            host: "schemaless.protobuf.example.com",
+            statusCode: 200,
+            requestBody: Data([0x08, 0x96, 0x01]),
+            responseBody: Data([0x08, 0x07]),
+            responseContentType: "application/protobuf",
+            requestContentType: "application/protobuf"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+
+        try await waitUntil {
+            guard case .content = viewModel.snapshot.inspection.response?.protobuf else {
+                return false
+            }
+            return true
+        }
+
+        let controller = InspectorViewController(viewModel: viewModel)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+
+        for prefix in ["inspector.request", "inspector.response"] {
+            let sectionSelector = try XCTUnwrap(
+                Self.descendant(
+                    of: NSSegmentedControl.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == "\(prefix).section" }
+                )
+            )
+            let protobufSegment = try XCTUnwrap(
+                (0..<sectionSelector.segmentCount).first {
+                    sectionSelector.label(forSegment: $0) == "Protobuf"
+                }
+            )
+            sectionSelector.selectedSegment = protobufSegment
+            sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+
+            let messageTypePopup = try XCTUnwrap(
+                Self.descendant(
+                    of: NSPopUpButton.self,
+                    in: controller.view,
+                    matching: {
+                        $0.accessibilityIdentifier() == "\(prefix).protobuf.messageType"
+                    }
+                )
+            )
+            let textView = try XCTUnwrap(
+                Self.descendant(
+                    of: NSTextView.self,
+                    in: controller.view,
+                    matching: { $0.accessibilityIdentifier() == "\(prefix).content" }
+                )
+            )
+            let isRequest = prefix == "inspector.request"
+
+            messageTypePopup.selectItem(withTitle: "example.User")
+            messageTypePopup.sendAction(messageTypePopup.action, to: messageTypePopup.target)
+            try await waitUntil {
+                let message =
+                    isRequest
+                    ? viewModel.snapshot.inspection.request
+                    : viewModel.snapshot.inspection.response
+                guard case .content(_, let protobuf) = message?.protobuf else {
+                    return false
+                }
+                return message?.protobufSchema.selectedMessageType == "example.User"
+                    && protobuf.contains("1  id")
+            }
+            controller.render(viewModel.snapshot)
+            XCTAssertEqual(messageTypePopup.titleOfSelectedItem, "example.User")
+            XCTAssertTrue(textView.string.contains("1  id"))
+            XCTAssertTrue(textView.string.contains("int32"))
+
+            messageTypePopup.selectItem(at: 0)
+            messageTypePopup.sendAction(messageTypePopup.action, to: messageTypePopup.target)
+            try await waitUntil {
+                let message =
+                    isRequest
+                    ? viewModel.snapshot.inspection.request
+                    : viewModel.snapshot.inspection.response
+                guard case .content(_, let protobuf) = message?.protobuf else {
+                    return false
+                }
+                return message?.protobufSchema.selectedMessageType == nil
+                    && protobuf.contains("1  varint")
+            }
+            controller.render(viewModel.snapshot)
+            XCTAssertEqual(messageTypePopup.titleOfSelectedItem, "Schema-less")
+            XCTAssertTrue(
+                textView.string.contains(isRequest ? "1  varint   150" : "1  varint   7")
+            )
+            XCTAssertFalse(textView.string.contains("int32"))
+        }
+    }
+
+    func testRuleEditorScriptTemplatesDocumentWebSocketHandshakeSupport() throws {
+        let editor = TrafficRuleEditorViewController()
+        editor.loadView()
+
+        let action = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: editor.view,
+                matching: { $0.accessibilityIdentifier() == "ruleEditor.action" }
+            )
+        )
+        action.selectItem(withTitle: "Script")
+        action.sendAction(action.action, to: action.target)
+
+        let sourceEditor = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextView.self,
+                in: editor.view,
+                matching: { $0.accessibilityIdentifier() == "ruleEditor.scriptSource" }
+            )
+        )
+        let phase = try XCTUnwrap(
+            Self.descendant(
+                of: NSPopUpButton.self,
+                in: editor.view,
+                matching: { $0.accessibilityIdentifier() == "ruleEditor.phase" }
+            )
+        )
+
+        phase.selectItem(withTitle: "Request Headers")
+        phase.sendAction(phase.action, to: phase.target)
+        let requestTemplate = sourceEditor.string
+        XCTAssertTrue(requestTemplate.contains("function onRequest(context)"))
+        XCTAssertTrue(
+            requestTemplate.contains(
+                "WebSocket handshakes support ws/wss URL and ordinary header edits."
+            ),
+            "Request header template must advertise WebSocket handshake support"
+        )
+        XCTAssertTrue(
+            requestTemplate.contains(
+                "The method and upgrade-critical headers are protected."
+            ),
+            "Request header template must name the protected fields"
+        )
+
+        phase.selectItem(withTitle: "Response Headers")
+        phase.sendAction(phase.action, to: phase.target)
+        let responseTemplate = sourceEditor.string
+        XCTAssertTrue(responseTemplate.contains("function onResponse(context)"))
+        XCTAssertTrue(
+            responseTemplate.contains(
+                "WebSocket handshakes support ordinary response header edits."
+            ),
+            "Response header template must advertise WebSocket handshake support"
+        )
+        XCTAssertTrue(
+            responseTemplate.contains(
+                "The 101 status and upgrade-critical headers are protected."
+            ),
+            "Response header template must name the protected fields"
+        )
     }
 
     func testImageBodyPreviewBuilderCreatesABoundedNativeThumbnail() throws {
