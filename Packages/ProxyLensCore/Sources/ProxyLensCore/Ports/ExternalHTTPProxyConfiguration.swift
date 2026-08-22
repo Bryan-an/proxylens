@@ -33,7 +33,7 @@ public enum ExternalHTTPProxyConfigurationError: Error, Equatable, LocalizedErro
 }
 
 public struct ExternalHTTPProxyConfiguration: Codable, Equatable, Hashable, Sendable {
-    public static let maximumHostLength = 253
+    public static let maximumHostLength = HostPatternNormalizer.maximumHostLength
     public static let maximumBypassHostCount = 128
     public static let maximumUsernameLength = 1_024
 
@@ -116,28 +116,21 @@ public struct ExternalHTTPProxyConfiguration: Codable, Equatable, Hashable, Send
         )
     }
 
-    private static func normalizeHost(_ value: String, allowsWildcard: Bool) throws -> String {
-        var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized.hasPrefix("["), normalized.hasSuffix("]") {
-            normalized = String(normalized.dropFirst().dropLast())
-        }
-        let wildcardPrefix = allowsWildcard && normalized.hasPrefix("*.")
-        let host = wildcardPrefix ? String(normalized.dropFirst(2)) : normalized
-        guard !host.isEmpty,
-            host.count <= maximumHostLength,
-            !host.contains(where: \.isWhitespace),
-            !containsControlCharacter(host),
-            !host.contains(where: { "/?#@*".contains($0) }),
-            !host.hasPrefix("."),
-            !host.hasSuffix("."),
-            !host.contains("..")
+    private static func normalizeHost(_ value: String, allowsWildcard: Bool)
+        throws -> String
+    {
+        guard
+            let normalized = HostPatternNormalizer.normalize(
+                value,
+                allowsWildcard: allowsWildcard
+            )
         else {
             if allowsWildcard {
                 throw ExternalHTTPProxyConfigurationError.invalidBypassHost(value)
             }
             throw ExternalHTTPProxyConfigurationError.invalidEndpointHost
         }
-        return wildcardPrefix ? "*.\(host)" : host
+        return normalized
     }
 
     fileprivate static func containsControlCharacter(_ value: String) -> Bool {

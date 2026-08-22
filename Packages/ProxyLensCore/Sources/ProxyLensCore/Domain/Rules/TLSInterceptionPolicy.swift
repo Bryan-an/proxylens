@@ -30,7 +30,7 @@ public enum TLSInterceptionPolicyError: Error, Equatable, LocalizedError, Sendab
 /// leading `*.` wildcards, and a wildcard never matches the bare apex.
 public struct TLSInterceptionPolicy: Codable, Equatable, Hashable, Sendable {
     public static let maximumEntryCount = 256
-    public static let maximumHostLength = 253
+    public static let maximumHostLength = HostPatternNormalizer.maximumHostLength
 
     public let mode: TLSInterceptionMode
     public let entries: [String]
@@ -101,27 +101,6 @@ public struct TLSInterceptionPolicy: Codable, Equatable, Hashable, Sendable {
     private static func normalize(_ value: String, allowsWildcard: Bool)
         -> String?
     {
-        var normalized = value.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        ).lowercased()
-        if normalized.hasPrefix("["), normalized.hasSuffix("]") {
-            normalized = String(normalized.dropFirst().dropLast())
-        }
-        let wildcardPrefix = allowsWildcard && normalized.hasPrefix("*.")
-        let host = wildcardPrefix ? String(normalized.dropFirst(2)) : normalized
-        guard !host.isEmpty,
-            host.count <= maximumHostLength,
-            !host.contains(where: \.isWhitespace),
-            !host.unicodeScalars.contains(
-                where: { CharacterSet.controlCharacters.contains($0) }
-            ),
-            !host.contains(where: { "/?#@*".contains($0) }),
-            !host.hasPrefix("."),
-            !host.hasSuffix("."),
-            !host.contains("..")
-        else {
-            return nil
-        }
-        return wildcardPrefix ? "*.\(host)" : host
+        HostPatternNormalizer.normalize(value, allowsWildcard: allowsWildcard)
     }
 }
