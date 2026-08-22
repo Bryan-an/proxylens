@@ -158,17 +158,20 @@ final class ImagePreviewView: NSView {
         metadataField.maximumNumberOfLines = 2
         metadataField.lineBreakMode = .byTruncatingMiddle
         metadataField.setAccessibilityIdentifier("\(accessibilityPrefix).preview.metadata")
+        metadataField.setContentHuggingPriority(.init(rawValue: 1), for: .horizontal)
 
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.imageAlignment = .alignCenter
         imageView.imageScaling = .scaleProportionallyDown
         imageView.setAccessibilityIdentifier("\(accessibilityPrefix).preview.image")
+        imageView.setContentHuggingPriority(.init(rawValue: 1), for: .horizontal)
 
         messageField.translatesAutoresizingMaskIntoConstraints = false
         messageField.alignment = .center
         messageField.textColor = .secondaryLabelColor
         messageField.maximumNumberOfLines = 0
         messageField.setAccessibilityIdentifier("\(accessibilityPrefix).preview.message")
+        messageField.setContentHuggingPriority(.init(rawValue: 1), for: .horizontal)
 
         addSubview(metadataField)
         addSubview(imageView)

@@ -410,11 +410,11 @@ final class InspectorViewController: NSViewController {
         )
 
         let requestItem = NSSplitViewItem(viewController: requestPane)
-        requestItem.minimumThickness = 260
+        requestItem.minimumThickness = MessageInspectorPaneViewController.minimumThickness
         requestItem.preferredThicknessFraction = 0.5
 
         let responseItem = NSSplitViewItem(viewController: responsePane)
-        responseItem.minimumThickness = 260
+        responseItem.minimumThickness = MessageInspectorPaneViewController.minimumThickness
         responseItem.preferredThicknessFraction = 0.5
 
         contentSplitViewController.addSplitViewItem(requestItem)
@@ -1033,6 +1033,7 @@ final class InspectorViewController: NSViewController {
 
 @MainActor
 private final class MessageInspectorPaneViewController: NSViewController, NSTextViewDelegate {
+    static let minimumThickness: CGFloat = 260
     let paneTitle: String
     let accessibilityPrefix: String
     let sections: [MessageInspectorSection]
@@ -1254,6 +1255,14 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
         contentScrollView.autohidesScrollers = true
         contentScrollView.borderType = .noBorder
 
+        // The chrome row and the content view are the only flexible members of the vertical chain
+        // between the container's top and bottom edges, and a stack view publishes no intrinsic
+        // height for the solver to hug. Without a stated preference the solver is free to hand the
+        // slack to the chrome, which pins a short content view -- the image preview -- to the
+        // bottom of the pane and leaves a blank gap above it.
+        let chromeShrinkToFit = chromeStack.heightAnchor.constraint(equalToConstant: 0)
+        chromeShrinkToFit.priority = NSLayoutConstraint.Priority(700)
+
         let container = NSView()
         container.setAccessibilityIdentifier(accessibilityPrefix)
         container.addSubview(chromeStack)
@@ -1262,6 +1271,7 @@ private final class MessageInspectorPaneViewController: NSViewController, NSText
             chromeStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
             chromeStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
             headerStack.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
+            chromeShrinkToFit,
             protobufToolbar.widthAnchor.constraint(lessThanOrEqualTo: chromeStack.widthAnchor),
             protobufMessageTypePopup.widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
