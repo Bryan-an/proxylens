@@ -385,7 +385,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "ruleEditor.actionValue" }
             )
         )
-        XCTAssertFalse(address.isHidden)
+        XCTAssertFalse(address.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(address.accessibilityLabel(), "DNS spoof address")
         XCTAssertEqual(address.placeholderString, "127.0.0.1 or ::1")
     }
@@ -484,7 +484,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
         XCTAssertEqual(sourceEditor.string, existingSource)
-        XCTAssertFalse(sourceEditor.enclosingScrollView?.isHidden ?? true)
+        XCTAssertFalse(sourceEditor.enclosingScrollView?.isHiddenOrHasHiddenAncestor ?? true)
         XCTAssertEqual(sourceEditor.accessibilityLabel(), "JavaScript source")
 
         let newEditor = TrafficRuleEditorViewController()
@@ -507,7 +507,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
         XCTAssertTrue(newSourceEditor.string.contains("function onRequest(context)"))
-        XCTAssertFalse(newSourceEditor.enclosingScrollView?.isHidden ?? true)
+        XCTAssertFalse(newSourceEditor.enclosingScrollView?.isHiddenOrHasHiddenAncestor ?? true)
 
         let phase = try XCTUnwrap(
             Self.descendant(
@@ -4445,10 +4445,10 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         XCTAssertLessThan(modeSelector.frame.width, inspectorPaneFrame.width / 2)
         XCTAssertTrue(requestSectionSelector.isHidden)
-        XCTAssertFalse(requestCompactSectionSelector.isHidden)
+        XCTAssertFalse(requestCompactSectionSelector.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(requestCompactSectionSelector.selectedItem?.title, "Headers")
         XCTAssertTrue(responseSectionSelector.isHidden)
-        XCTAssertFalse(responseCompactSectionSelector.isHidden)
+        XCTAssertFalse(responseCompactSectionSelector.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(responseCompactSectionSelector.selectedItem?.title, "Headers")
         XCTAssertEqual(
             (0..<requestSectionSelector.segmentCount).map {
@@ -4839,7 +4839,19 @@ final class ProxyLensIntegrationTests: XCTestCase {
         )
         await viewModel.prepare()
 
-        let flow = try Self.makeFlow(index: 12, host: "panes.example.com", statusCode: 200)
+        // The Tree section only renders rows for a JSON body. Without one JSONTreeView shows its
+        // message label and hides the scroll view, which would make the height guard below measure
+        // an outline view that is not on screen.
+        let treeBody = Data(
+            #"{"id":12,"items":[{"sku":"a","qty":1},{"sku":"b","qty":2}],"meta":{"page":1}}"#.utf8
+        )
+        let flow = try Self.makeFlow(
+            index: 12,
+            host: "panes.example.com",
+            statusCode: 200,
+            requestBody: treeBody,
+            requestContentType: "application/json"
+        )
         viewModel.receive(.finished(flow))
         viewModel.flushPendingEvents()
         viewModel.selectFlow(flow.id)
@@ -4926,7 +4938,9 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "inspector.request.tree" }
             )
         )
-        XCTAssertFalse(treeView.isHidden)
+        try await waitUntil { !treeView.isHiddenOrHasHiddenAncestor }
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertFalse(treeView.isHiddenOrHasHiddenAncestor)
         XCTAssertGreaterThan(
             treeView.frame.height,
             requestPane.frame.height - 80,
@@ -4985,7 +4999,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
             )
         )
 
-        XCTAssertFalse(annotationBar.isHidden)
+        XCTAssertFalse(annotationBar.isHiddenOrHasHiddenAncestor)
         XCTAssertLessThanOrEqual(
             annotationBar.frame.height,
             annotationBar.fittingSize.height + 1
@@ -5093,7 +5107,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertFalse(timingView.isHidden)
+        XCTAssertFalse(timingView.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(totalField.stringValue, "250 ms")
         XCTAssertEqual(waitingField.stringValue, "120 ms")
         XCTAssertEqual(clientProtocolField.stringValue, "HTTP/1.1")
@@ -5278,7 +5292,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
         sectionSelector.selectedSegment = bodySegment
         sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
         XCTAssertTrue(inspector.string.contains(compact))
-        XCTAssertFalse(inspector.enclosingScrollView?.isHidden ?? true)
+        XCTAssertFalse(inspector.enclosingScrollView?.isHiddenOrHasHiddenAncestor ?? true)
         XCTAssertTrue(tree.isHiddenOrHasHiddenAncestor)
     }
 
@@ -5449,7 +5463,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 matching: { $0.accessibilityIdentifier() == "inspector.sse.events" }
             )
         )
-        XCTAssertFalse(eventTable.isHidden)
+        XCTAssertFalse(eventTable.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(eventTable.numberOfRows, 2)
         XCTAssertEqual(eventTable.selectedRow, 0)
 
@@ -5765,7 +5779,7 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertFalse(frameTable.isHidden)
+        XCTAssertFalse(frameTable.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(frameTable.numberOfRows, 2)
         XCTAssertEqual(frameTable.selectedRow, 0)
 
@@ -7516,8 +7530,8 @@ final class ProxyLensIntegrationTests: XCTestCase {
                 }
             )
         )
-        XCTAssertFalse(importButton.isHidden)
-        XCTAssertFalse(messageTypePopup.isHidden)
+        XCTAssertFalse(importButton.isHiddenOrHasHiddenAncestor)
+        XCTAssertFalse(messageTypePopup.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(messageTypePopup.itemTitles, ["Schema-less", "example.User"])
         XCTAssertEqual(messageTypePopup.titleOfSelectedItem, "example.User")
     }
