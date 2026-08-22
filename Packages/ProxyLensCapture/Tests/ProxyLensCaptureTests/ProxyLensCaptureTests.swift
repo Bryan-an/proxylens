@@ -6381,6 +6381,68 @@ final class ProxyLensCaptureTests: XCTestCase {
         await upstream.stop()
         try await certificateProvider.removeCertificateAuthority()
     }
+
+    func testTunnelRelayBuffersReadsUntilPeerIsConnected() throws {
+        let clientSide = EmbeddedChannel(handler: TunnelRelayHandler())
+        let upstreamSide = EmbeddedChannel()
+
+        var early = clientSide.allocator.buffer(capacity: 5)
+        early.writeString("hello")
+        try clientSide.writeInbound(early)
+        XCTAssertNil(try upstreamSide.readOutbound(as: ByteBuffer.self))
+
+        let relay = try clientSide.pipeline.syncOperations.handler(type: TunnelRelayHandler.self)
+        relay.connectPeer(upstreamSide)
+        upstreamSide.embeddedEventLoop.run()
+        var relayed = try XCTUnwrap(upstreamSide.readOutbound(as: ByteBuffer.self))
+        XCTAssertEqual(relayed.readString(length: relayed.readableBytes), "hello")
+    }
+
+    func testTunnelRelayForwardsBytesBothWaysAfterSplice() throws {
+        let clientSide = EmbeddedChannel(handler: TunnelRelayHandler())
+        let upstreamSide = EmbeddedChannel(handler: TunnelRelayHandler())
+        let clientRelay = try clientSide.pipeline.syncOperations.handler(
+            type: TunnelRelayHandler.self
+        )
+        let upstreamRelay = try upstreamSide.pipeline.syncOperations.handler(
+            type: TunnelRelayHandler.self
+        )
+        clientRelay.connectPeer(upstreamSide)
+        upstreamRelay.connectPeer(clientSide)
+
+        var clientHello = clientSide.allocator.buffer(capacity: 3)
+        clientHello.writeString("abc")
+        try clientSide.writeInbound(clientHello)
+        upstreamSide.embeddedEventLoop.run()
+        var toUpstream = try XCTUnwrap(upstreamSide.readOutbound(as: ByteBuffer.self))
+        XCTAssertEqual(toUpstream.readString(length: toUpstream.readableBytes), "abc")
+
+        var serverBytes = upstreamSide.allocator.buffer(capacity: 3)
+        serverBytes.writeString("xyz")
+        try upstreamSide.writeInbound(serverBytes)
+        clientSide.embeddedEventLoop.run()
+        var toClient = try XCTUnwrap(clientSide.readOutbound(as: ByteBuffer.self))
+        XCTAssertEqual(toClient.readString(length: toClient.readableBytes), "xyz")
+    }
+
+    func testTunnelRelayClosesPeerAndReportsCloseWhenEitherSideCloses() throws {
+        let closed = expectation(description: "onClose fired")
+        let clientSide = EmbeddedChannel(handler: TunnelRelayHandler(onClose: { closed.fulfill() }))
+        let upstreamSide = EmbeddedChannel(handler: TunnelRelayHandler())
+        let clientRelay = try clientSide.pipeline.syncOperations.handler(
+            type: TunnelRelayHandler.self
+        )
+        let upstreamRelay = try upstreamSide.pipeline.syncOperations.handler(
+            type: TunnelRelayHandler.self
+        )
+        clientRelay.connectPeer(upstreamSide)
+        upstreamRelay.connectPeer(clientSide)
+
+        clientSide.pipeline.fireChannelInactive()
+        upstreamSide.embeddedEventLoop.run()
+        wait(for: [closed], timeout: 1)
+        XCTAssertFalse(upstreamSide.isActive)
+    }
 }
 
 private actor TestExternalHTTPProxyCredentialStore: ExternalHTTPProxyCredentialStoring {
