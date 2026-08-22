@@ -171,6 +171,10 @@ final class JSONTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate
         messageField.lineBreakMode = .byWordWrapping
         messageField.maximumNumberOfLines = 0
         messageField.isSelectable = true
+        // Pinned to both edges of the view, so its hugging is a pull on the width of the whole
+        // inspector pane. At the default priority that pull ties with the split view's own
+        // preferred divider position and collapses the pane to its minimum thickness.
+        messageField.setContentHuggingPriority(.init(rawValue: 1), for: .horizontal)
     }
 
     private func makeCell(identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {

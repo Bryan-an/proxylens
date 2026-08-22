@@ -63,6 +63,10 @@ final class JSONPathView: NSView, NSTextFieldDelegate {
         queryStack.spacing = 8
         queryStack.alignment = .centerY
         queryStack.distribution = .fill
+        // Pinned to both edges of the view, so its hugging is a pull on the width of the whole
+        // inspector pane. At the default priority that pull ties with the split view's own
+        // preferred divider position and collapses the pane to its minimum thickness.
+        queryStack.setContentHuggingPriority(.init(rawValue: 1), for: .horizontal)
 
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false

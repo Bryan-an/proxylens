@@ -8492,6 +8492,119 @@ final class ProxyLensIntegrationTests: XCTestCase {
         0x28, 0x05  // type = int32
     ])
 
+    func testInspectorPreviewSectionFillsPaneWithoutCollapsingSplit() async throws {
+        let viewModel = TrafficConsoleViewModel(
+            captureController: RecordingCaptureController(),
+            eventSource: FinishedEventSource(),
+            bodyReader: InlineBodyReader(),
+            captureConfiguration: Self.captureConfiguration,
+            eventBatchDelay: .seconds(60)
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeFlow(
+            index: 11,
+            host: "images.example.com",
+            statusCode: 200,
+            requestBody: Data("not an image at all".utf8),
+            method: .post,
+            requestContentType: "image/png"
+        )
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        viewModel.selectFlow(flow.id)
+        try await waitUntil {
+            viewModel.snapshot.inspection.request?.image
+                == .none(
+                    ImageBodyPreviewBuilder.invalidImageReason
+                )
+        }
+
+        let frame = NSRect(x: 0, y: 0, width: 1_200, height: 720)
+        let controller = InspectorViewController()
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.setContentSize(frame.size)
+        defer {
+            window.orderOut(nil)
+            window.contentViewController = nil
+        }
+        window.makeKeyAndOrderFront(nil)
+        controller.render(viewModel.snapshot)
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+
+        let sectionSelector = try XCTUnwrap(
+            Self.descendant(
+                of: NSSegmentedControl.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.section" }
+            )
+        )
+        let previewSegment = try XCTUnwrap(
+            (0..<sectionSelector.segmentCount).first {
+                sectionSelector.label(forSegment: $0) == "Preview"
+            }
+        )
+        sectionSelector.selectedSegment = previewSegment
+        sectionSelector.sendAction(sectionSelector.action, to: sectionSelector.target)
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+
+        let requestPane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.request" }
+            )
+        )
+        let responsePane = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: controller.view,
+                matching: { $0.accessibilityIdentifier() == "inspector.response" }
+            )
+        )
+        let previewView = try XCTUnwrap(
+            Self.descendant(
+                of: NSView.self,
+                in: requestPane,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.preview" }
+            )
+        )
+        let messageField = try XCTUnwrap(
+            Self.descendant(
+                of: NSTextField.self,
+                in: requestPane,
+                matching: { $0.accessibilityIdentifier() == "inspector.request.preview.message" }
+            )
+        )
+        XCTAssertFalse(messageField.isHiddenOrHasHiddenAncestor)
+        XCTAssertEqual(messageField.stringValue, ImageBodyPreviewBuilder.invalidImageReason)
+
+        // The preview owns everything under the pane chrome: a short content view must stretch to
+        // fill the region instead of being pushed to the bottom edge by a chrome row that took the
+        // slack.
+        XCTAssertGreaterThan(requestPane.frame.height, 0)
+        XCTAssertGreaterThan(previewView.frame.height, requestPane.frame.height - 60)
+        let messageCenter = messageField.convert(
+            NSPoint(x: messageField.bounds.midX, y: messageField.bounds.midY),
+            to: previewView
+        )
+        XCTAssertEqual(messageCenter.y, previewView.bounds.midY, accuracy: 12)
+
+        // Selecting a section must not collapse its pane to the split view's minimum thickness.
+        XCTAssertEqual(
+            requestPane.frame.width,
+            responsePane.frame.width,
+            accuracy: 2,
+            "Selecting Preview collapsed the request pane to its minimum thickness"
+        )
+    }
+
     private static func makeFlow(
         index: Int,
         host: String,
