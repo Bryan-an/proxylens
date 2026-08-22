@@ -6443,6 +6443,58 @@ final class ProxyLensCaptureTests: XCTestCase {
         wait(for: [closed], timeout: 1)
         XCTAssertFalse(upstreamSide.isActive)
     }
+
+    func testTunnelRelayPausesPeerReadsWhenUnwritableAndResumesWhenWritable() throws {
+        let clientSide = EmbeddedChannel(handler: TunnelRelayHandler())
+        let upstreamSide = EmbeddedChannel()
+        let relay = try clientSide.pipeline.syncOperations.handler(type: TunnelRelayHandler.self)
+        relay.connectPeer(upstreamSide)
+
+        // EmbeddedChannel does not wire `isWritable` to buffered outbound bytes or a
+        // write-buffer water mark the way a socket channel would, so there is no way to
+        // cross a high watermark and have writability flip on its own. NIO's own
+        // EmbeddedChannel tests (testEmbeddedChannelWritabilityIsWritable) drive it the
+        // same way: assign `isWritable` directly, then fire the pipeline event that a
+        // real channel would fire when its writability actually changes.
+        clientSide.isWritable = false
+        clientSide.pipeline.fireChannelWritabilityChanged()
+        upstreamSide.embeddedEventLoop.run()
+
+        let autoReadWhileUnwritable = try XCTUnwrap(
+            upstreamSide.options.first { $0.option is ChannelOptions.Types.AutoReadOption }?
+                .value as? Bool
+        )
+        XCTAssertFalse(autoReadWhileUnwritable)
+
+        clientSide.isWritable = true
+        clientSide.pipeline.fireChannelWritabilityChanged()
+        upstreamSide.embeddedEventLoop.run()
+
+        let autoReadOnceWritable = try XCTUnwrap(
+            upstreamSide.options.first { $0.option is ChannelOptions.Types.AutoReadOption }?
+                .value as? Bool
+        )
+        XCTAssertTrue(autoReadOnceWritable)
+    }
+
+    func testTunnelRelayClosesPeerAndReportsCloseWhenErrorIsCaught() throws {
+        let closed = expectation(description: "onClose fired")
+        let clientSide = EmbeddedChannel(handler: TunnelRelayHandler(onClose: { closed.fulfill() }))
+        let upstreamSide = EmbeddedChannel(handler: TunnelRelayHandler())
+        let clientRelay = try clientSide.pipeline.syncOperations.handler(
+            type: TunnelRelayHandler.self
+        )
+        let upstreamRelay = try upstreamSide.pipeline.syncOperations.handler(
+            type: TunnelRelayHandler.self
+        )
+        clientRelay.connectPeer(upstreamSide)
+        upstreamRelay.connectPeer(clientSide)
+
+        clientSide.pipeline.fireErrorCaught(ProxyLensError.unsupportedOperation("boom"))
+        upstreamSide.embeddedEventLoop.run()
+        wait(for: [closed], timeout: 1)
+        XCTAssertFalse(upstreamSide.isActive)
+    }
 }
 
 private actor TestExternalHTTPProxyCredentialStore: ExternalHTTPProxyCredentialStoring {

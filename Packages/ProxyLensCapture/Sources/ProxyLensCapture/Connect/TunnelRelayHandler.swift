@@ -5,7 +5,6 @@ import NIOCore
 /// pre-splice buffer.
 final class TunnelRelayHandler: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
-    typealias OutboundOut = ByteBuffer
 
     private var peer: Channel?
     private var bufferedReads: [ByteBuffer] = []
