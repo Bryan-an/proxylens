@@ -3022,6 +3022,40 @@ final class ProxyLensCoreTests: XCTestCase {
         }
     }
 
+    func testHostPatternNormalizerStripsASingleTrailingDotButNotMoreOrLone()
+        throws
+    {
+        XCTAssertEqual(
+            HostPatternNormalizer.normalize("example.com.", allowsWildcard: false),
+            "example.com"
+        )
+        XCTAssertEqual(
+            HostPatternNormalizer.normalize("*.example.com.", allowsWildcard: true),
+            "*.example.com"
+        )
+        XCTAssertNil(HostPatternNormalizer.normalize(".", allowsWildcard: false))
+        XCTAssertNil(
+            HostPatternNormalizer.normalize("example.com..", allowsWildcard: false)
+        )
+    }
+
+    func testTLSInterceptionPolicyMatchesATrailingDotFQDNAgainstAPlainEntryAndBack()
+        throws
+    {
+        let exclusion = try TLSInterceptionPolicy(
+            mode: .interceptAllExcept,
+            entries: ["example.com"]
+        )
+        XCTAssertFalse(exclusion.shouldIntercept(host: "example.com."))
+
+        let fqdnEntry = try TLSInterceptionPolicy(
+            mode: .interceptAllExcept,
+            entries: ["example.com."]
+        )
+        XCTAssertEqual(fqdnEntry.entries, ["example.com"])
+        XCTAssertFalse(fqdnEntry.shouldIntercept(host: "example.com"))
+    }
+
     func testTLSInterceptionPolicyCodableRoundTripsAndRejectsMalformedDocuments()
         throws
     {
