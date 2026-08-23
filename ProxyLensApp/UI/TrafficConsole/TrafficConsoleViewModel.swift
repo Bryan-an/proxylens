@@ -709,14 +709,17 @@ final class TrafficConsoleViewModel: ObservableObject {
         sslProxyingStore.policy
     }
 
-    func saveTLSInterceptionPolicy(_ policy: TLSInterceptionPolicy) {
-        sslProxyingStore.save(policy)
+    /// Persists first and only publishes to the live capture policy on success, so a
+    /// rejected save (e.g. an oversized document) can never leave the running engine
+    /// out of sync with what is actually on disk.
+    func saveTLSInterceptionPolicy(_ policy: TLSInterceptionPolicy) throws {
+        try sslProxyingStore.save(policy)
         tlsInterceptionPolicySink?.replace(policy)
     }
 
     func setTLSInterceptionMode(_ mode: TLSInterceptionMode) throws {
         let current = sslProxyingStore.policy
-        saveTLSInterceptionPolicy(
+        try saveTLSInterceptionPolicy(
             try TLSInterceptionPolicy(mode: mode, entries: current.entries)
         )
     }
@@ -726,17 +729,17 @@ final class TrafficConsoleViewModel: ObservableObject {
         switch current.mode {
         case .interceptAllExcept:
             guard !current.matches(host: host) else { return }
-            saveTLSInterceptionPolicy(
+            try saveTLSInterceptionPolicy(
                 try TLSInterceptionPolicy(mode: current.mode, entries: current.entries + [host])
             )
         case .interceptOnly:
-            saveTLSInterceptionPolicy(
-                try TLSInterceptionPolicy(
-                    mode: current.mode,
-                    entries: current.entries.filter {
-                        $0.caseInsensitiveCompare(host) != .orderedSame
-                    }
-                )
+            let normalizedHost = normalizedHostForTLSInterceptionComparison(host)
+            let filteredEntries = current.entries.filter {
+                $0.caseInsensitiveCompare(normalizedHost) != .orderedSame
+            }
+            guard filteredEntries.count != current.entries.count else { return }
+            try saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: filteredEntries)
             )
         }
     }
@@ -745,17 +748,17 @@ final class TrafficConsoleViewModel: ObservableObject {
         let current = sslProxyingStore.policy
         switch current.mode {
         case .interceptAllExcept:
-            saveTLSInterceptionPolicy(
-                try TLSInterceptionPolicy(
-                    mode: current.mode,
-                    entries: current.entries.filter {
-                        $0.caseInsensitiveCompare(host) != .orderedSame
-                    }
-                )
+            let normalizedHost = normalizedHostForTLSInterceptionComparison(host)
+            let filteredEntries = current.entries.filter {
+                $0.caseInsensitiveCompare(normalizedHost) != .orderedSame
+            }
+            guard filteredEntries.count != current.entries.count else { return }
+            try saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: filteredEntries)
             )
         case .interceptOnly:
             guard !current.matches(host: host) else { return }
-            saveTLSInterceptionPolicy(
+            try saveTLSInterceptionPolicy(
                 try TLSInterceptionPolicy(mode: current.mode, entries: current.entries + [host])
             )
         }
@@ -766,9 +769,23 @@ final class TrafficConsoleViewModel: ObservableObject {
     }
 
     func hasExactTLSInterceptionEntry(_ host: String) -> Bool {
-        sslProxyingStore.policy.entries.contains {
-            $0.caseInsensitiveCompare(host) == .orderedSame
+        let normalizedHost = normalizedHostForTLSInterceptionComparison(host)
+        return sslProxyingStore.policy.entries.contains {
+            $0.caseInsensitiveCompare(normalizedHost) == .orderedSame
         }
+    }
+
+    /// Mirrors the trim/lowercase/de-bracket steps of `TLSInterceptionPolicy`'s internal
+    /// host normalization (not visible outside `ProxyLensCore`) so exact-entry
+    /// comparisons here agree with `TLSInterceptionPolicy.matches(host:)`. This does not
+    /// reproduce full validation — entries reaching this comparison are already valid,
+    /// having been normalized and checked when they were saved.
+    private func normalizedHostForTLSInterceptionComparison(_ host: String) -> String {
+        var normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.hasPrefix("["), normalized.hasSuffix("]") {
+            normalized = String(normalized.dropFirst().dropLast())
+        }
+        return normalized
     }
 
     func renameSession(_ sessionID: SessionID, to name: String?) async throws {

@@ -18,7 +18,7 @@ final class SSLProxyingListTests: XCTestCase {
             mode: .interceptAllExcept,
             entries: ["*.apple.com"]
         )
-        store.save(policy)
+        try store.save(policy)
         XCTAssertEqual(store.policy, policy)
         XCTAssertEqual(
             UserDefaultsTrafficSSLProxyingStore(defaults: defaults, key: "test.key").policy,
@@ -27,6 +27,26 @@ final class SSLProxyingListTests: XCTestCase {
 
         defaults.set(Data("not json".utf8), forKey: "test.key")
         XCTAssertEqual(store.policy, TLSInterceptionPolicy())
+    }
+
+    func testUserDefaultsStoreRoundTripsAPolicyNearCoresMaximumSize() throws {
+        let suiteName = "SSLProxyingListTests.MaxSize.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = UserDefaultsTrafficSSLProxyingStore(defaults: defaults, key: "test.key")
+
+        let policy = try TLSInterceptionPolicy(
+            mode: .interceptAllExcept,
+            entries: Self.makeMaximalTLSInterceptionEntries()
+        )
+
+        try store.save(policy)
+
+        XCTAssertEqual(store.policy, policy)
+        XCTAssertEqual(
+            UserDefaultsTrafficSSLProxyingStore(defaults: defaults, key: "test.key").policy,
+            policy
+        )
     }
 
     func testViewModelSavesPolicyToStoreAndLiveSinkWhileCaptureRuns() async throws {
@@ -116,6 +136,49 @@ final class SSLProxyingListTests: XCTestCase {
         XCTAssertFalse(viewModel.isHostIntercepted("pinned.example.com"))
     }
 
+    func testInterceptHostAgainSkipsRedundantSaveWhenOnlyWildcardCoversTheHost() throws {
+        let store = SSLProxyingCountingStore(
+            policy: try TLSInterceptionPolicy(
+                mode: .interceptAllExcept,
+                entries: ["*.example.com"]
+            )
+        )
+        let viewModel = makeViewModel(store: store, sink: MutableTLSInterceptionPolicy())
+
+        try viewModel.interceptHostAgain("pinned.example.com")
+
+        XCTAssertEqual(store.saveCount, 0)
+        XCTAssertEqual(store.policy.entries, ["*.example.com"])
+    }
+
+    func testExcludeHostFromTLSInterceptionSkipsRedundantSaveWhenHostHasNoExactEntry() throws {
+        let store = SSLProxyingCountingStore(
+            policy: try TLSInterceptionPolicy(mode: .interceptOnly, entries: ["*.example.com"])
+        )
+        let viewModel = makeViewModel(store: store, sink: MutableTLSInterceptionPolicy())
+
+        try viewModel.excludeHostFromTLSInterception("pinned.example.com")
+
+        XCTAssertEqual(store.saveCount, 0)
+        XCTAssertEqual(store.policy.entries, ["*.example.com"])
+    }
+
+    func testExactEntryOperationsNormalizeWhitespaceAndIPv6BracketsLikeMatches() throws {
+        let store = InMemoryTrafficSSLProxyingStore(
+            policy: try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["::1"])
+        )
+        let sink = MutableTLSInterceptionPolicy()
+        let viewModel = makeViewModel(store: store, sink: sink)
+
+        XCTAssertTrue(viewModel.hasExactTLSInterceptionEntry("[::1]"))
+        XCTAssertTrue(viewModel.hasExactTLSInterceptionEntry("  ::1  "))
+
+        try viewModel.interceptHostAgain(" [::1] ")
+
+        XCTAssertTrue(store.policy.entries.isEmpty)
+        XCTAssertTrue(sink.currentPolicy().shouldIntercept(host: "::1"))
+    }
+
     private func makeViewModel(
         store: any TrafficSSLProxyingStoring,
         sink: MutableTLSInterceptionPolicy
@@ -135,6 +198,20 @@ final class SSLProxyingListTests: XCTestCase {
             sslProxyingStore: store,
             tlsInterceptionPolicySink: sink
         )
+    }
+
+    /// 256 unique wildcard entries at `TLSInterceptionPolicy.maximumHostLength`, matching
+    /// the largest policy Core will accept — used to pin the persistence store's size cap
+    /// above anything a valid policy can produce.
+    private static func makeMaximalTLSInterceptionEntries() -> [String] {
+        let suffix = ".example.com"
+        let maximumHostLength = TLSInterceptionPolicy.maximumHostLength
+        return (0..<TLSInterceptionPolicy.maximumEntryCount).map { index in
+            let token = String(format: "h%03d", index)
+            let fillLength = maximumHostLength - token.count - suffix.count
+            let fill = String(repeating: "a", count: max(0, fillLength))
+            return "*." + token + fill + suffix
+        }
     }
 
     private func waitUntil(
@@ -179,4 +256,20 @@ private actor SSLProxyingFinishedEventSource: TrafficFlowEventStreaming {
 
 private actor SSLProxyingInlineBodyReader: TrafficBodyReading {
     func read(_: BodyReference) throws -> Data { Data() }
+}
+
+/// Counts `save` calls so tests can assert a no-op edit never writes.
+@MainActor
+private final class SSLProxyingCountingStore: TrafficSSLProxyingStoring {
+    private(set) var policy: TLSInterceptionPolicy
+    private(set) var saveCount = 0
+
+    init(policy: TLSInterceptionPolicy) {
+        self.policy = policy
+    }
+
+    func save(_ policy: TLSInterceptionPolicy) throws {
+        saveCount += 1
+        self.policy = policy
+    }
 }

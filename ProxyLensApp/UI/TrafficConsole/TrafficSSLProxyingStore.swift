@@ -1,11 +1,22 @@
 import Foundation
 import ProxyLensCore
 
+enum TrafficSSLProxyingStoreError: Error, Equatable, LocalizedError {
+    case documentTooLarge
+
+    var errorDescription: String? {
+        switch self {
+        case .documentTooLarge:
+            "The SSL proxying list is too large to save."
+        }
+    }
+}
+
 @MainActor
 protocol TrafficSSLProxyingStoring: AnyObject {
     var policy: TLSInterceptionPolicy { get }
 
-    func save(_ policy: TLSInterceptionPolicy)
+    func save(_ policy: TLSInterceptionPolicy) throws
 }
 
 @MainActor
@@ -16,7 +27,7 @@ final class InMemoryTrafficSSLProxyingStore: TrafficSSLProxyingStoring {
         self.policy = policy
     }
 
-    func save(_ policy: TLSInterceptionPolicy) {
+    func save(_ policy: TLSInterceptionPolicy) throws {
         self.policy = policy
     }
 }
@@ -24,7 +35,10 @@ final class InMemoryTrafficSSLProxyingStore: TrafficSSLProxyingStoring {
 @MainActor
 final class UserDefaultsTrafficSSLProxyingStore: TrafficSSLProxyingStoring {
     static let defaultKey = "TrafficConsole.sslProxyingList"
-    private static let maximumDocumentBytes = 64 * 1_024
+    // Comfortably above the largest policy Core can produce (256 entries × up to a
+    // 253-character host, plus a 2-character wildcard prefix, plus JSON overhead —
+    // roughly 66 KB), so a valid policy is never silently dropped by this cap.
+    private static let maximumDocumentBytes = 128 * 1_024
 
     private struct Document: Codable {
         let version: Int
@@ -50,12 +64,11 @@ final class UserDefaultsTrafficSSLProxyingStore: TrafficSSLProxyingStoring {
         return document.policy
     }
 
-    func save(_ policy: TLSInterceptionPolicy) {
+    func save(_ policy: TLSInterceptionPolicy) throws {
         let document = Document(version: 1, policy: policy)
-        guard let data = try? JSONEncoder().encode(document),
-            data.count <= Self.maximumDocumentBytes
-        else {
-            return
+        let data = try JSONEncoder().encode(document)
+        guard data.count <= Self.maximumDocumentBytes else {
+            throw TrafficSSLProxyingStoreError.documentTooLarge
         }
         defaults.set(data, forKey: key)
     }
