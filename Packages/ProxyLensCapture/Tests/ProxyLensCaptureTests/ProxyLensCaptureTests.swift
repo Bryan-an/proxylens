@@ -2174,6 +2174,136 @@ final class ProxyLensCaptureTests: XCTestCase {
         try await certificateProvider.removeCertificateAuthority()
     }
 
+    func testSOCKS5PassthroughForExcludedHostDeliversOriginCertificate() async throws {
+        let originProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-socks.\(UUID().uuidString)"
+            )
+        )
+        let originRoot = try await originProvider.rootCertificate()
+        let originIdentity = try await originProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "socks origin",
+            identity: originIdentity
+        )
+        let engineProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.ssl-list-socks-ca.\(UUID().uuidString)"
+            )
+        )
+        let eventSink = RecordingFlowEventSink()
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            certificateProvider: engineProvider,
+            tlsInterceptionPolicy: MutableTLSInterceptionPolicy(
+                policy: try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["localhost"])
+            )
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true,
+                    socks5Listener: SOCKS5ListenerConfiguration(
+                        listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                        isEnabled: true
+                    )
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running = await engine.state(),
+                let socksEndpoint = await engine.socks5Endpoint()
+            else {
+                XCTFail("Expected the SOCKS5 listener to be running")
+                await upstream.stop()
+                return
+            }
+
+            // Trusts ONLY the origin root: succeeds only if the proxy did not re-terminate
+            // TLS on the SOCKS path either.
+            let response = try await SOCKS5TestClient.getHTTPS(
+                path: "/pinned",
+                destinationHost: "localhost",
+                destinationPort: upstream.endpoint.port,
+                through: socksEndpoint,
+                trustedRootCertificate: originRoot
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("socks origin".utf8))
+
+            await eventSink.waitForFinished()
+            let tunnelFlow = await eventSink.lastFlow { $0.state == .completed }
+            let tunnel = try XCTUnwrap(tunnelFlow)
+            XCTAssertEqual(tunnel.request.method, .connect)
+            XCTAssertEqual(tunnel.connection?.tlsIntercepted, false)
+            XCTAssertEqual(tunnel.connection?.protocolKind, .https)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await engineProvider.removeCertificateAuthority()
+            try? await originProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await engineProvider.removeCertificateAuthority()
+        try await originProvider.removeCertificateAuthority()
+    }
+
+    func testSOCKS5PassthroughUpstreamFailureFailsTheTunnelFlow() async throws {
+        let eventSink = RecordingFlowEventSink()
+        let policy = MutableTLSInterceptionPolicy(
+            policy: try TLSInterceptionPolicy(mode: .interceptAllExcept, entries: ["127.0.0.1"])
+        )
+        let engine = NIOProxyEngine(eventSink: eventSink, tlsInterceptionPolicy: policy)
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: false,
+                    socks5Listener: SOCKS5ListenerConfiguration(
+                        listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                        isEnabled: true
+                    )
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running = await engine.state(),
+                let socksEndpoint = await engine.socks5Endpoint()
+            else {
+                XCTFail("Expected the SOCKS5 listener to be running")
+                return
+            }
+
+            // Port 1 on loopback: nothing listens there, the raw dial must fail. The SOCKS
+            // success reply is already sent by the time the dial is attempted, so the client
+            // only observes the raw connection closing once it looks enough like TLS for the
+            // server to classify and act on it.
+            try await SOCKS5TestClient.expectConnectionClosedAfterTLSPrefix(
+                destinationHost: "127.0.0.1",
+                destinationPort: 1,
+                through: socksEndpoint
+            )
+
+            await eventSink.waitForFinished()
+            let failedFlow = await eventSink.lastFlow {
+                if case .failed = $0.state { return true }
+                return false
+            }
+            let failed = try XCTUnwrap(failedFlow)
+            XCTAssertEqual(failed.request.method, .connect)
+            XCTAssertEqual(failed.state, .failed(.upstreamUnavailable))
+        } catch {
+            await engine.stop()
+            throw error
+        }
+
+        await engine.stop()
+    }
+
     func testSOCKS5ListenerStartupRollsBackAtomically() async throws {
         let occupiedListener = try await TestHTTPServer.start(responseBody: "occupied")
         let socks = try SOCKS5ListenerConfiguration(
@@ -7755,6 +7885,81 @@ private enum SOCKS5TestClient {
             throw error
         }
     }
+
+    /// Completes the SOCKS5 handshake, then writes just enough bytes to look like the start
+    /// of a TLS ClientHello (`SOCKS5ServerHandler`'s protocol sniff only needs the first
+    /// three bytes to classify `.tls`) and waits for the raw connection to close. Used to
+    /// observe passthrough-dial-failure behavior without driving a real `NIOSSLClientHandler`
+    /// handshake against a connection the server is about to abruptly close.
+    static func expectConnectionClosedAfterTLSPrefix(
+        destinationHost: String,
+        destinationPort: UInt16,
+        through proxy: NetworkEndpoint
+    ) async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        do {
+            let handshakePromise = group.next().makePromise(of: Void.self)
+            let handshakeHandler = SOCKS5ClientHandshakeHandler(
+                destinationHost: destinationHost,
+                destinationPort: destinationPort,
+                promise: handshakePromise
+            )
+            let closePromise = group.next().makePromise(of: Void.self)
+            let channel = try await ClientBootstrap(group: group)
+                .channelInitializer { channel in
+                    channel.pipeline.addHandler(handshakeHandler)
+                }
+                .connect(host: proxy.host, port: Int(proxy.port))
+                .get()
+            try await handshakePromise.futureResult.get()
+
+            try await channel.pipeline.removeHandler(handshakeHandler).flatMapThrowing {
+                try channel.pipeline.syncOperations.addHandler(
+                    ConnectionCloseObserver(promise: closePromise)
+                )
+            }.get()
+
+            var tlsPrefix = channel.allocator.buffer(capacity: 3)
+            tlsPrefix.writeBytes([0x16, 0x03, 0x01])
+            try await channel.writeAndFlush(tlsPrefix).get()
+
+            try await closePromise.futureResult.get()
+            await shutdown(group)
+        } catch {
+            await shutdown(group)
+            throw error
+        }
+    }
+}
+
+/// Resolves its promise the moment the channel closes, regardless of whether that closure
+/// carries an error — used by tests that only care whether (and roughly when) a connection
+/// was torn down.
+private final class ConnectionCloseObserver: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
+
+    private let promise: EventLoopPromise<Void>
+    private var didComplete = false
+
+    init(promise: EventLoopPromise<Void>) {
+        self.promise = promise
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        complete()
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        complete()
+        context.fireErrorCaught(error)
+    }
+
+    private func complete() {
+        guard !didComplete else { return }
+        didComplete = true
+        promise.succeed(())
+    }
 }
 
 private final class SOCKS5ClientHandshakeHandler:
@@ -8326,6 +8531,7 @@ private final class TLSHandshakeHandler: ChannelInboundHandler {
     typealias InboundIn = Any
 
     private let promise: EventLoopPromise<Void>
+    private var didComplete = false
 
     init(promise: EventLoopPromise<Void>) {
         self.promise = promise
@@ -8333,14 +8539,28 @@ private final class TLSHandshakeHandler: ChannelInboundHandler {
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let tlsEvent = event as? TLSUserEvent, case .handshakeCompleted = tlsEvent {
-            promise.succeed(())
+            complete { $0.succeed(()) }
         }
         context.fireUserInboundEventTriggered(event)
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        promise.fail(error)
+        complete { $0.fail(error) }
         context.fireErrorCaught(error)
+    }
+
+    // A peer that closes the raw connection before ever completing (or failing) the TLS
+    // handshake at the record layer — e.g. a bare TCP close with no alert — would otherwise
+    // leave `promise` unresolved forever and hang any test `await`ing it.
+    func channelInactive(context: ChannelHandlerContext) {
+        complete { $0.fail(ChannelError.eof) }
+        context.fireChannelInactive()
+    }
+
+    private func complete(_ action: (EventLoopPromise<Void>) -> Void) {
+        guard !didComplete else { return }
+        didComplete = true
+        action(promise)
     }
 }
 

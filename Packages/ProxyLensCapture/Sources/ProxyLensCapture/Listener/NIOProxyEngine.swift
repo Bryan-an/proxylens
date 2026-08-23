@@ -222,6 +222,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
                         upstreamTLSContext,
                         upstreamHTTP2Pool,
                         ruleSnapshot,
+                        tlsInterceptionPolicy,
                         scriptExecutor,
                         breakpointGate,
                         flowSourceResolver,
@@ -262,6 +263,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
                                 upstreamHTTP2Pool: upstreamHTTP2Pool,
                                 externalHTTPProxyRoute: externalHTTPProxyRoute,
                                 ruleSnapshot: ruleSnapshot,
+                                tlsInterceptionPolicy: tlsInterceptionPolicy,
                                 scriptExecutor: scriptExecutor,
                                 breakpointGate: breakpointGate,
                                 flowSource: flowSource
