@@ -202,7 +202,7 @@ final class SSLProxyingManagerViewController: NSViewController, NSTableViewDataS
 
     @objc private func addEntry() {
         let entry = entryField.stringValue
-        let current = viewModel.currentTLSInterceptionPolicy()
+        let current = currentPolicy()
         applyChange {
             let policy = try TLSInterceptionPolicy(
                 mode: current.mode,
@@ -216,9 +216,13 @@ final class SSLProxyingManagerViewController: NSViewController, NSTableViewDataS
     @objc private func removeSelectedEntry() {
         let selection = tableView.selectedRow
         guard rows.indices.contains(selection) else { return }
-        let current = viewModel.currentTLSInterceptionPolicy()
+        let current = currentPolicy()
+        // Remove by value, not by `selection` index: `selection` indexes `rows`, which was
+        // populated at the last `reloadPolicy()`, while `current.entries` is fetched fresh
+        // here. Indexing `current.entries` with a `rows` index would remove the wrong host
+        // if the two ever diverge.
         var entries = current.entries
-        entries.remove(at: selection)
+        entries.removeAll { $0 == rows[selection] }
         applyChange {
             let policy = try TLSInterceptionPolicy(mode: current.mode, entries: entries)
             try viewModel.saveTLSInterceptionPolicy(policy)
@@ -227,6 +231,10 @@ final class SSLProxyingManagerViewController: NSViewController, NSTableViewDataS
 
     @objc private func close() {
         onClose?()
+    }
+
+    private func currentPolicy() -> TLSInterceptionPolicy {
+        viewModel.currentTLSInterceptionPolicy()
     }
 
     private func applyChange(_ change: () throws -> Void) {
