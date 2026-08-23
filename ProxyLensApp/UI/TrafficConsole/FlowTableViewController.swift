@@ -47,6 +47,13 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 
         let menu = NSMenu()
         menu.delegate = self
+        // Several items in menuNeedsUpdate(_:) assign `isEnabled` explicitly (the SSL
+        // proxying "Intercept"/"Don't Intercept" pair, "Compare Selected Flows…"). With
+        // automatic enabling left on, AppKit re-validates every item once the delegate has
+        // populated the menu and force-enables any item whose target responds to its
+        // action — since `ruleMenuItem` always sets `target = self`, that silently
+        // overwrites a manual `isEnabled = false` right before the menu is drawn.
+        menu.autoenablesItems = false
         tableView.menu = menu
 
         for column in FlowColumn.allCases {

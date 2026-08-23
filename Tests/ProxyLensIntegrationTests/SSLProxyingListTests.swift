@@ -379,8 +379,16 @@ final class SSLProxyingListTests: XCTestCase {
         controller.render(viewModel.snapshot)
 
         tableView.clickedRowOverride = 0
-        let menu = NSMenu()
+        // Use the table's real context menu, not a throwaway one: its `autoenablesItems`
+        // setting (configured in `loadView()`) only matters when AppKit validates this
+        // exact menu instance, and `menuNeedsUpdate(_:)` alone does not reflect what a
+        // user actually sees. AppKit runs an automatic-enabling pass over the menu just
+        // before it is displayed (triggered here by `update()`), which can silently
+        // re-enable an item whose target responds to its action, regardless of a
+        // manually assigned `isEnabled` — unless the menu opts out of it.
+        let menu = try XCTUnwrap(tableView.menu)
         controller.menuNeedsUpdate(menu)
+        menu.update()
 
         let interceptItem = try XCTUnwrap(
             menu.items.first { $0.title == "Intercept pinned.example.com" }
@@ -409,8 +417,13 @@ final class SSLProxyingListTests: XCTestCase {
         controller.render(viewModel.snapshot)
 
         tableView.clickedRowOverride = 0
-        let menu = NSMenu()
+        // See the comment in the mirror test above: use the table's real context menu so
+        // `update()` exercises AppKit's automatic-enabling pass the way a user actually
+        // sees it, not a disconnected menu that was never configured with
+        // `autoenablesItems = false`.
+        let menu = try XCTUnwrap(tableView.menu)
         controller.menuNeedsUpdate(menu)
+        menu.update()
 
         let excludeItem = try XCTUnwrap(
             menu.items.first { $0.title == "Don't Intercept api.example.com" }
