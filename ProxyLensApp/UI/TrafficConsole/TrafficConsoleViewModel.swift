@@ -775,9 +775,15 @@ final class TrafficConsoleViewModel: ObservableObject {
         }
     }
 
-    /// Mirrors the trim/lowercase/de-bracket steps of `TLSInterceptionPolicy`'s internal
-    /// host normalization (not visible outside `ProxyLensCore`) so exact-entry
-    /// comparisons here agree with `TLSInterceptionPolicy.matches(host:)`. This does not
+    /// Mirrors only the trim/lowercase/de-bracket steps of `TLSInterceptionPolicy`'s
+    /// internal host normalization (not visible outside `ProxyLensCore`), not its
+    /// trailing-dot handling: unlike `TLSInterceptionPolicy.matches(host:)`, this does
+    /// not strip a single trailing dot, so `"api.example.com."` compares unequal to a
+    /// stored `"api.example.com"` entry here even though the two match as a policy. This
+    /// is benign for its callers (`excludeHostFromTLSInterception`,
+    /// `interceptHostAgain`, `hasExactTLSInterceptionEntry`): a trailing-dot host simply
+    /// falls through to the no-op guard already in place for "no matching entry," which
+    /// is also what disables both context-menu items for such a host. This also does not
     /// reproduce full validation — entries reaching this comparison are already valid,
     /// having been normalized and checked when they were saved.
     private func normalizedHostForTLSInterceptionComparison(_ host: String) -> String {
