@@ -2288,7 +2288,16 @@ final class ProxyLensCaptureTests: XCTestCase {
                 through: socksEndpoint
             )
 
-            await eventSink.waitForFinished()
+            // Bounded, not `waitForFinished()`: if the passthrough dial-failure branch ever
+            // regresses to closing the connection without failing the transaction, no
+            // `.finished` event is ever published and an unbounded wait here would hang the
+            // suite instead of failing this test.
+            try await eventually("the SOCKS5 tunnel flow to fail") {
+                await eventSink.lastFlow {
+                    if case .failed = $0.state { return true }
+                    return false
+                } != nil
+            }
             let failedFlow = await eventSink.lastFlow {
                 if case .failed = $0.state { return true }
                 return false
@@ -2302,6 +2311,89 @@ final class ProxyLensCaptureTests: XCTestCase {
         }
 
         await engine.stop()
+    }
+
+    func testSOCKS5InterceptAllExceptPolicyStillInterceptsUnlistedHost() async throws {
+        let certificateProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.socks-policy-unlisted.\(UUID().uuidString)"
+            )
+        )
+        let rootCertificate = try await certificateProvider.rootCertificate()
+        let upstreamIdentity = try await certificateProvider.leafCertificate(for: "localhost")
+        let upstream = try await TestHTTPServer.startHTTPS(
+            responseBody: "still intercepted",
+            identity: upstreamIdentity
+        )
+        let eventSink = RecordingFlowEventSink()
+        // A live policy object is present, but "localhost" (the destination below) is not on
+        // its exclude list — this exercises the `shouldIntercept == true` arm of the SOCKS5
+        // guard through an actual policy, not just the "no policy configured" nil default.
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            certificateProvider: certificateProvider,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [rootCertificate]
+            ),
+            tlsInterceptionPolicy: MutableTLSInterceptionPolicy(
+                policy: try TLSInterceptionPolicy(
+                    mode: .interceptAllExcept,
+                    entries: ["excluded.example.com"]
+                )
+            )
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true,
+                    socks5Listener: SOCKS5ListenerConfiguration(
+                        listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                        isEnabled: true
+                    )
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running = await engine.state(),
+                let socksEndpoint = await engine.socks5Endpoint()
+            else {
+                XCTFail("Expected the SOCKS5 listener to be running")
+                await upstream.stop()
+                return
+            }
+
+            // Trusts the ENGINE root: only succeeds if the proxy still MITM'd this
+            // destination despite a policy object being configured.
+            let response = try await SOCKS5TestClient.getHTTPS(
+                path: "/unlisted",
+                destinationHost: "localhost",
+                destinationPort: upstream.endpoint.port,
+                through: socksEndpoint,
+                trustedRootCertificate: rootCertificate
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.body, Data("still intercepted".utf8))
+
+            await eventSink.waitForFinished()
+            let events = await eventSink.snapshot()
+            let flow = try XCTUnwrap(
+                events.compactMap { event -> Flow? in
+                    guard case .finished(let flow) = event else { return nil }
+                    return flow
+                }.first
+            )
+            XCTAssertEqual(flow.connection?.tlsIntercepted, true)
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await certificateProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await certificateProvider.removeCertificateAuthority()
     }
 
     func testSOCKS5ListenerStartupRollsBackAtomically() async throws {

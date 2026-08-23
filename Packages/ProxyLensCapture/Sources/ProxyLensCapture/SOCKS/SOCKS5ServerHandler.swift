@@ -333,6 +333,11 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
             target: target
         ).map { FlowTransaction(flow: $0, eventSink: eventSink) }
         if let transaction {
+            // This Task, `clientRelay`'s `onClose` Task below, and `TunnelPassthrough.splice`'s
+            // own success-case Task all target this same `transaction` from independent,
+            // unstructured `Task {}`s with no ordering guarantee relative to one another —
+            // see `TunnelPassthrough.splice`'s doc comment for why every interleaving still
+            // ends the flow correctly.
             Task {
                 await transaction.start(at: Date())
                 await transaction.finishRequestBody(nil, at: Date())
@@ -390,45 +395,16 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
         pendingBytes: [ByteBuffer],
         transaction: FlowTransaction?
     ) {
-        let upstreamRelay = TunnelRelayHandler()
-        let loopBoundClientRelay = NIOLoopBound(clientRelay, eventLoop: clientChannel.eventLoop)
-        let loopBoundUpstreamRelay = NIOLoopBound(
-            upstreamRelay, eventLoop: clientChannel.eventLoop)
-
-        clientChannel.pipeline.removeHandler(self).flatMapThrowing {
-            let clientRelay = loopBoundClientRelay.value
-            let upstreamRelay = loopBoundUpstreamRelay.value
-            try clientChannel.pipeline.syncOperations.addHandler(clientRelay)
-            try upstreamChannel.pipeline.syncOperations.addHandler(upstreamRelay)
-            clientRelay.connectPeer(upstreamChannel)
-            upstreamRelay.connectPeer(clientChannel)
-            // The ClientHello (and anything else buffered while classifying) was consumed
-            // by this handler before the relay existed — replay it upstream directly.
-            for buffer in pendingBytes {
-                upstreamChannel.write(buffer, promise: nil)
-            }
-            upstreamChannel.flush()
-        }.flatMap {
-            // Both sides were held at autoRead false until the relays above were installed
-            // — re-enable both here, not just the client, or the upstream side never reads
-            // what the origin already has buffered.
-            clientChannel.setOption(ChannelOptions.autoRead, value: true)
-        }.flatMap {
-            upstreamChannel.setOption(ChannelOptions.autoRead, value: true)
-        }.whenComplete { result in
-            switch result {
-            case .success:
-                if let transaction {
-                    Task { await transaction.markUpstreamConnected(at: Date()) }
-                }
-            case .failure:
-                if let transaction {
-                    Task { await transaction.fail(.upstreamUnavailable) }
-                }
-                upstreamChannel.close(promise: nil)
-                clientChannel.close(promise: nil)
-            }
-        }
+        TunnelPassthrough.splice(
+            clientChannel: clientChannel,
+            upstreamChannel: upstreamChannel,
+            clientRelay: clientRelay,
+            transaction: transaction,
+            // The ClientHello (and anything else buffered while classifying) was consumed by
+            // this handler before the relay existed — replay it upstream directly.
+            extraUpstreamBytes: pendingBytes,
+            prelude: { clientChannel.pipeline.removeHandler(self) }
+        )
     }
 
     private func makeHTTPHandler(target: ConnectTarget, usesTLS: Bool) -> HTTPProxyHandler {

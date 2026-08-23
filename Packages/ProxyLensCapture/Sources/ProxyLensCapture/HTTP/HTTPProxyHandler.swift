@@ -10,8 +10,6 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
-    static let tunnelRelayHandlerName = "proxylens.tunnel.relay"
-
     private let sessionID: SessionID
     private let eventSink: any FlowEventSink
     private let serverSentEventEventSink: any ServerSentEventEventSink
@@ -934,49 +932,19 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         upstreamChannel: Channel,
         clientRelay: TunnelRelayHandler
     ) {
-        let upstreamRelay = TunnelRelayHandler()
-        let transaction = self.transaction
-        let loopBoundClientRelay = NIOLoopBound(clientRelay, eventLoop: clientChannel.eventLoop)
-        let loopBoundUpstreamRelay = NIOLoopBound(upstreamRelay, eventLoop: clientChannel.eventLoop)
-
-        HTTPServerPipeline.removePlaintextHTTPHandlers(from: clientChannel).flatMap {
-            var response = clientChannel.allocator.buffer(capacity: 39)
-            response.writeString("HTTP/1.1 200 Connection Established\r\n\r\n")
-            return clientChannel.writeAndFlush(response)
-        }.flatMapThrowing {
-            let clientRelay = loopBoundClientRelay.value
-            let upstreamRelay = loopBoundUpstreamRelay.value
-            try clientChannel.pipeline.syncOperations.addHandler(
-                clientRelay,
-                name: Self.tunnelRelayHandlerName
-            )
-            try upstreamChannel.pipeline.syncOperations.addHandler(
-                upstreamRelay,
-                name: Self.tunnelRelayHandlerName
-            )
-            clientRelay.connectPeer(upstreamChannel)
-            upstreamRelay.connectPeer(clientChannel)
-        }.flatMap {
-            // Both sides were held at autoRead false until the relay handlers above were
-            // installed — re-enable both here, not just the client, or the upstream side
-            // never reads what the origin already has buffered.
-            clientChannel.setOption(ChannelOptions.autoRead, value: true)
-        }.flatMap {
-            upstreamChannel.setOption(ChannelOptions.autoRead, value: true)
-        }.whenComplete { result in
-            switch result {
-            case .success:
-                if let transaction {
-                    Task { await transaction.markUpstreamConnected(at: Date()) }
+        TunnelPassthrough.splice(
+            clientChannel: clientChannel,
+            upstreamChannel: upstreamChannel,
+            clientRelay: clientRelay,
+            transaction: transaction,
+            prelude: {
+                HTTPServerPipeline.removePlaintextHTTPHandlers(from: clientChannel).flatMap {
+                    var response = clientChannel.allocator.buffer(capacity: 39)
+                    response.writeString("HTTP/1.1 200 Connection Established\r\n\r\n")
+                    return clientChannel.writeAndFlush(response)
                 }
-            case .failure:
-                if let transaction {
-                    Task { await transaction.fail(.upstreamUnavailable) }
-                }
-                upstreamChannel.close(promise: nil)
-                clientChannel.close(promise: nil)
             }
-        }
+        )
     }
 
     private func receiveRequestBody(_ buffer: inout ByteBuffer, context: ChannelHandlerContext) {
