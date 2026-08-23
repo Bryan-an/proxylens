@@ -780,10 +780,17 @@ final class TrafficConsoleViewModel: ObservableObject {
     /// trailing-dot handling: unlike `TLSInterceptionPolicy.matches(host:)`, this does
     /// not strip a single trailing dot, so `"api.example.com."` compares unequal to a
     /// stored `"api.example.com"` entry here even though the two match as a policy. This
-    /// is benign for its callers (`excludeHostFromTLSInterception`,
-    /// `interceptHostAgain`, `hasExactTLSInterceptionEntry`): a trailing-dot host simply
-    /// falls through to the no-op guard already in place for "no matching entry," which
-    /// is also what disables both context-menu items for such a host. This also does not
+    /// is benign for its callers (`excludeHostFromTLSInterception`, `interceptHostAgain`,
+    /// `hasExactTLSInterceptionEntry`), but for two different reasons depending on which
+    /// branch a trailing-dot host reaches: where this comparison is the only thing
+    /// guarding a "remove one host from a wildcard-covered exclusion/inclusion" edit
+    /// (interceptOnly's "Don't Intercept", interceptAllExcept's "Intercept"), the mismatch
+    /// falls through to the no-op guard already in place for "no matching entry," which is
+    /// also what disables that context-menu item. Where the mode itself already permits
+    /// the edit (interceptAllExcept's "Don't Intercept", interceptOnly's "Intercept" for an
+    /// unlisted host), the item stays enabled and the edit succeeds anyway, because
+    /// `TLSInterceptionPolicy.init` normalizes the trailing dot away when the new entry is
+    /// actually stored — this helper never enters into that path. This also does not
     /// reproduce full validation — entries reaching this comparison are already valid,
     /// having been normalized and checked when they were saved.
     private func normalizedHostForTLSInterceptionComparison(_ host: String) -> String {
