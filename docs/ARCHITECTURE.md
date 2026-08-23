@@ -394,6 +394,19 @@ An HTTP/HTTPS flow follows this sequence:
 
 The default path should stream and tee data into the body store. Buffer only when a breakpoint, body transformation, decoder, or replay operation requires complete content. Large bodies must not force the entire flow into memory.
 
+**TLS interception policy.** `HTTPProxyHandler.receiveConnectHead` and
+`SOCKS5ServerHandler.installTLSPipeline` each read a `TLSInterceptionPolicySource`
+(`MutableTLSInterceptionPolicy` in production) synchronously on the event loop before minting a
+leaf certificate. A host the policy excludes is not intercepted: the handler answers
+`200 Connection Established` (or, on SOCKS5, sends nothing further — the CONNECT reply already
+went out), dials the origin with no TLS or HTTP handlers, and splices the two channels through
+the shared `TunnelPassthrough.splice`, which both handlers call with a protocol-specific
+`prelude` (HTTP CONNECT removes its plaintext HTTP handlers and writes the 200 response; SOCKS5
+has nothing left to write). The tunnel is recorded as a single `CONNECT` flow
+(`TunnelPassthrough.makeFlow`) with `ConnectionInfo.tlsIntercepted == false`; its payload is
+never parsed or stored. Policy edits apply to the next tunnel; established tunnels keep their
+decision.
+
 ### Reverse proxy listener ownership
 
 Reverse Proxy is capture configuration, not a rule action. `ProxyConfiguration` carries a bounded,

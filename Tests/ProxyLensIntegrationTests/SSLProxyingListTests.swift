@@ -319,6 +319,156 @@ final class SSLProxyingListTests: XCTestCase {
         XCTAssertGreaterThan(scrollView.frame.height, 200)
     }
 
+    func testFlowTableContextMenuTogglesSSLProxyingForTheClickedHost() async throws {
+        let store = InMemoryTrafficSSLProxyingStore()
+        let sink = MutableTLSInterceptionPolicy()
+        let viewModel = makeViewModel(store: store, sink: sink)
+        await viewModel.prepare()
+
+        let tableView = SSLProxyingRecordingTableView()
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        let flow = try Self.makeCompletedFlow(host: "api.example.com", statusCode: 200)
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        controller.render(viewModel.snapshot)
+
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+        controller.menuNeedsUpdate(menu)
+
+        let excludeItem = try XCTUnwrap(
+            menu.items.first { $0.title == "Don't Intercept api.example.com" }
+        )
+        XCTAssertTrue(excludeItem.isEnabled)
+        _ = excludeItem.target?.perform(excludeItem.action, with: excludeItem)
+
+        try await waitUntil { store.policy.entries == ["api.example.com"] }
+        XCTAssertFalse(sink.currentPolicy().shouldIntercept(host: "api.example.com"))
+
+        let reopened = NSMenu()
+        controller.menuNeedsUpdate(reopened)
+        let interceptItem = try XCTUnwrap(
+            reopened.items.first { $0.title == "Intercept api.example.com" }
+        )
+        XCTAssertTrue(interceptItem.isEnabled)
+        _ = interceptItem.target?.perform(interceptItem.action, with: interceptItem)
+
+        try await waitUntil { store.policy.entries.isEmpty }
+    }
+
+    func testFlowTableContextMenuDisablesInterceptForAWildcardOnlyExclusion() async throws {
+        let store = InMemoryTrafficSSLProxyingStore(
+            policy: try TLSInterceptionPolicy(
+                mode: .interceptAllExcept,
+                entries: ["*.example.com"]
+            )
+        )
+        let sink = MutableTLSInterceptionPolicy()
+        let viewModel = makeViewModel(store: store, sink: sink)
+        await viewModel.prepare()
+
+        let tableView = SSLProxyingRecordingTableView()
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        let flow = try Self.makeCompletedFlow(host: "pinned.example.com", statusCode: 200)
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        controller.render(viewModel.snapshot)
+
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+        controller.menuNeedsUpdate(menu)
+
+        let interceptItem = try XCTUnwrap(
+            menu.items.first { $0.title == "Intercept pinned.example.com" }
+        )
+        XCTAssertFalse(interceptItem.isEnabled)
+    }
+
+    func testFlowTableRendersAPassthroughTunnelRow() async throws {
+        let viewModel = makeViewModel(
+            store: InMemoryTrafficSSLProxyingStore(),
+            sink: MutableTLSInterceptionPolicy()
+        )
+        await viewModel.prepare()
+
+        let flow = try Self.makeTunnelFlow(host: "pinned.example.com")
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+
+        let tableView = NSTableView()
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+        controller.render(viewModel.snapshot)
+
+        let row = try XCTUnwrap(viewModel.snapshot.visibleRows.first)
+        XCTAssertEqual(row.method, "CONNECT")
+        XCTAssertEqual(row.host, "pinned.example.com")
+        XCTAssertNil(row.statusCode)
+        XCTAssertTrue(row.usesTLS)
+        // The status cell falls back on the flow state for a response-less completed flow.
+        XCTAssertEqual(tableView.numberOfRows, 1)
+    }
+
+    /// Builds a completed HTTP flow the way `TrafficFlowRow` expects one shaped, so seeded
+    /// rows here match what the real capture path produces (see the equivalent helper in
+    /// `ProxyLensIntegrationTests.swift`, which is file-private and not reusable here).
+    private static func makeCompletedFlow(host: String, statusCode: Int) throws -> Flow {
+        var requestHeaders = HTTPHeaders()
+        try requestHeaders.append(name: "Host", value: host)
+        var flow = Flow(
+            sessionID: SessionID(),
+            source: .desktopProxy,
+            request: HTTPRequest(
+                method: .get,
+                url: try XCTUnwrap(URL(string: "https://\(host)/")),
+                headers: requestHeaders
+            ),
+            connection: ConnectionInfo(
+                protocolKind: .https,
+                upstreamHost: host,
+                upstreamPort: 443,
+                tlsIntercepted: true
+            )
+        )
+        try flow.transition(to: .receivingRequest)
+        try flow.transition(to: .connectingUpstream)
+        try flow.transition(to: .receivingResponse)
+        flow.attachResponse(try HTTPResponse(statusCode: statusCode, reasonPhrase: "OK"))
+        flow.markCompleted(at: Date())
+        try flow.transition(to: .completed)
+        return flow
+    }
+
+    /// Shapes a flow exactly the way `TunnelPassthrough.makeFlow` plus the real completion
+    /// path (`FlowTransaction.finishResponse` with a nil body) leave it: CONNECT method, no
+    /// response, `tlsIntercepted == false`, terminal state `.completed`.
+    private static func makeTunnelFlow(host: String) throws -> Flow {
+        var flow = Flow(
+            sessionID: SessionID(),
+            source: .desktopProxy,
+            request: HTTPRequest(
+                method: .connect,
+                url: try XCTUnwrap(URL(string: "https://\(host):443/")),
+                rawTarget: "\(host):443"
+            ),
+            connection: ConnectionInfo(
+                protocolKind: .https,
+                upstreamHost: host,
+                upstreamPort: 443,
+                tlsIntercepted: false
+            )
+        )
+        try flow.transition(to: .receivingRequest)
+        try flow.transition(to: .receivingResponse)
+        try flow.transition(to: .completed)
+        flow.markCompleted(at: Date())
+        return flow
+    }
+
     private func makeViewModel(
         store: any TrafficSSLProxyingStoring,
         sink: MutableTLSInterceptionPolicy
@@ -373,6 +523,17 @@ final class SSLProxyingListTests: XCTestCase {
             if let match = descendant(in: subview, identifier: identifier) { return match }
         }
         return nil
+    }
+}
+
+/// Lets the context-menu test drive `menuNeedsUpdate` against a specific row without a real
+/// click event — same technique as `RecordingTableView` in `ProxyLensIntegrationTests.swift`,
+/// which is file-private and not reusable here.
+private final class SSLProxyingRecordingTableView: NSTableView {
+    var clickedRowOverride: Int?
+
+    override var clickedRow: Int {
+        clickedRowOverride ?? super.clickedRow
     }
 }
 

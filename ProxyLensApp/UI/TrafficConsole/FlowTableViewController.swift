@@ -352,6 +352,25 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 action: #selector(dnsSpoof)
             )
         )
+        if viewModel.isHostIntercepted(host) {
+            menu.addItem(
+                ruleMenuItem(
+                    title: "Don't Intercept \(host)",
+                    host: host,
+                    action: #selector(excludeHostFromSSLProxying)
+                )
+            )
+        } else {
+            let interceptItem = ruleMenuItem(
+                title: "Intercept \(host)",
+                host: host,
+                action: #selector(interceptHostAgain)
+            )
+            // A host excluded only by a wildcard entry cannot be re-included one host at a
+            // time; the SSL Proxying List sheet is where that entry is edited.
+            interceptItem.isEnabled = viewModel.hasExactTLSInterceptionEntry(host)
+            menu.addItem(interceptItem)
+        }
         let networkConditionsItem = NSMenuItem(
             title: "Network Conditions",
             action: nil,
@@ -905,6 +924,32 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         }
         Task { @MainActor in
             await promptDNSSpoof(host: host)
+        }
+    }
+
+    @objc private func excludeHostFromSSLProxying(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        Task { @MainActor in
+            do {
+                try viewModel.excludeHostFromTLSInterception(host)
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    @objc private func interceptHostAgain(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        Task { @MainActor in
+            do {
+                try viewModel.interceptHostAgain(host)
+            } catch {
+                await presentError(error)
+            }
         }
     }
 
