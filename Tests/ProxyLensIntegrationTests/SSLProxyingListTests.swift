@@ -1,3 +1,4 @@
+import AppKit
 import ProxyLensApplication
 import ProxyLensCore
 import XCTest
@@ -179,6 +180,145 @@ final class SSLProxyingListTests: XCTestCase {
         XCTAssertTrue(sink.currentPolicy().shouldIntercept(host: "::1"))
     }
 
+    func testManagerSheetAddsAndRemovesEntriesWhileCaptureRuns() async throws {
+        let store = InMemoryTrafficSSLProxyingStore()
+        let sink = MutableTLSInterceptionPolicy()
+        let viewModel = makeViewModel(store: store, sink: sink)
+        await viewModel.prepare()
+        viewModel.toggleCapture()
+        try await waitUntil {
+            if case .running = viewModel.snapshot.capture {
+                return true
+            }
+            return false
+        }
+
+        let controller = SSLProxyingManagerViewController(viewModel: viewModel)
+        _ = controller.view
+
+        let entryField = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.entry")
+                as? NSTextField
+        )
+        let addButton = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.add") as? NSButton
+        )
+        let modeControl = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.mode")
+                as? NSSegmentedControl
+        )
+        let table = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.table")
+                as? NSTableView
+        )
+
+        // Capture is running and the controls stay enabled: this policy is hot.
+        XCTAssertTrue(addButton.isEnabled)
+        XCTAssertTrue(modeControl.isEnabled)
+
+        entryField.stringValue = "*.apple.com"
+        _ = addButton.target?.perform(addButton.action, with: addButton)
+
+        XCTAssertEqual(store.policy.entries, ["*.apple.com"])
+        XCTAssertFalse(sink.currentPolicy().shouldIntercept(host: "push.apple.com"))
+        XCTAssertEqual(table.numberOfRows, 1)
+        XCTAssertEqual(controller.numberOfEntries, 1)
+
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        let removeButton = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.remove")
+                as? NSButton
+        )
+        _ = removeButton.target?.perform(removeButton.action, with: removeButton)
+
+        XCTAssertTrue(store.policy.entries.isEmpty)
+        XCTAssertTrue(sink.currentPolicy().shouldIntercept(host: "push.apple.com"))
+        XCTAssertEqual(controller.numberOfEntries, 0)
+    }
+
+    func testManagerSheetRejectsInvalidEntriesWithVisibleValidation() async throws {
+        let store = InMemoryTrafficSSLProxyingStore()
+        let viewModel = makeViewModel(store: store, sink: MutableTLSInterceptionPolicy())
+        await viewModel.prepare()
+
+        let controller = SSLProxyingManagerViewController(viewModel: viewModel)
+        _ = controller.view
+
+        let entryField = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.entry")
+                as? NSTextField
+        )
+        let addButton = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.add") as? NSButton
+        )
+        let validation = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.validation")
+                as? NSTextField
+        )
+
+        entryField.stringValue = "not a host"
+        _ = addButton.target?.perform(addButton.action, with: addButton)
+
+        XCTAssertTrue(store.policy.entries.isEmpty)
+        XCTAssertFalse(validation.isHidden)
+        XCTAssertFalse(validation.stringValue.isEmpty)
+    }
+
+    func testManagerSheetModeControlSwitchesPolicyMode() async throws {
+        let store = InMemoryTrafficSSLProxyingStore()
+        let viewModel = makeViewModel(store: store, sink: MutableTLSInterceptionPolicy())
+        await viewModel.prepare()
+
+        let controller = SSLProxyingManagerViewController(viewModel: viewModel)
+        _ = controller.view
+
+        let modeControl = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.mode")
+                as? NSSegmentedControl
+        )
+        modeControl.selectedSegment = 1
+        _ = modeControl.target?.perform(modeControl.action, with: modeControl)
+
+        XCTAssertEqual(store.policy.mode, .interceptOnly)
+    }
+
+    /// Guards the layout pitfall this repo has hit twice: a chrome row silently absorbing
+    /// all the vertical slack and squeezing the table down to nothing. Hosts the controller
+    /// in a real window at a fixed size, as the other layout tests in this suite do.
+    func testManagerSheetGivesTheTableRealHeightNotJustChrome() async throws {
+        let store = InMemoryTrafficSSLProxyingStore(
+            policy: try TLSInterceptionPolicy(
+                mode: .interceptAllExcept,
+                entries: ["*.example.com"]
+            )
+        )
+        let viewModel = makeViewModel(store: store, sink: MutableTLSInterceptionPolicy())
+        await viewModel.prepare()
+
+        let controller = SSLProxyingManagerViewController(viewModel: viewModel)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 520),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.setContentSize(NSSize(width: 620, height: 520))
+        defer {
+            window.orderOut(nil)
+            window.contentViewController = nil
+        }
+        controller.view.layoutSubtreeIfNeeded()
+
+        let table = try XCTUnwrap(
+            descendant(in: controller.view, identifier: "sslProxyingManager.table")
+                as? NSTableView
+        )
+        let scrollView = try XCTUnwrap(table.enclosingScrollView)
+
+        XCTAssertGreaterThan(scrollView.frame.height, 200)
+    }
+
     private func makeViewModel(
         store: any TrafficSSLProxyingStoring,
         sink: MutableTLSInterceptionPolicy
@@ -225,6 +365,14 @@ final class SSLProxyingListTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Timed out waiting for the condition")
+    }
+
+    private func descendant(in view: NSView, identifier: String) -> NSView? {
+        if view.accessibilityIdentifier() == identifier { return view }
+        for subview in view.subviews {
+            if let match = descendant(in: subview, identifier: identifier) { return match }
+        }
+        return nil
     }
 }
 

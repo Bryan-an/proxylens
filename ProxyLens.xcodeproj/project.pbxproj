@@ -41,6 +41,7 @@
 		8F716C718834177D066B5E10 /* ProxyLensUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D5BA0765D03EAF524893CFC /* ProxyLensUITests.swift */; };
 		9C01985BB4429DD4DD2E6DD8 /* ProxyLensCapture in Frameworks */ = {isa = PBXBuildFile; productRef = 20B4DE37BCA1F153F20E438A /* ProxyLensCapture */; };
 		A69F8681D48194E71BAD8819 /* TrafficSOCKS5ListenerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE27071A3CA1563BDE76A63 /* TrafficSOCKS5ListenerStore.swift */; };
+		A9EE2454BBDABAD6D60AD13D /* SSLProxyingManagerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C9FD9794324A67AB8F838E6 /* SSLProxyingManagerViewController.swift */; };
 		B059A6F35C869D13265781B2 /* TrafficFilterBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEA75086146D4D5B75CE9C39 /* TrafficFilterBar.swift */; };
 		B1230416786F249A18B323FE /* WebSocketComposerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 154601C50BCE47AC5C6F619A /* WebSocketComposerViewController.swift */; };
 		B8E503B70A4CBCA655FE20A6 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B47EE0953CA762B4070214 /* main.swift */; };
@@ -95,6 +96,7 @@
 		47B5D14A8463E3566BC5DFA1 /* TrafficCustomFilterPresetStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficCustomFilterPresetStore.swift; sourceTree = "<group>"; };
 		485699450B3F68111CF42269 /* ProxyLensApplication */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProxyLensApplication; path = Packages/ProxyLensApplication; sourceTree = SOURCE_ROOT; };
 		4BE1E94AA8E3C39F60F3D91E /* TrafficPinnedDomainsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficPinnedDomainsStore.swift; sourceTree = "<group>"; };
+		4C9FD9794324A67AB8F838E6 /* SSLProxyingManagerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSLProxyingManagerViewController.swift; sourceTree = "<group>"; };
 		5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyLensIntegrationTests.swift; sourceTree = "<group>"; };
 		5431991724785D72596AB045 /* TrafficConsoleViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficConsoleViewController.swift; sourceTree = "<group>"; };
 		575D3C8C845DF8218137261D /* TrafficSourceListVisibilityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficSourceListVisibilityStore.swift; sourceTree = "<group>"; };
@@ -244,6 +246,7 @@
 				F33DFB4D2B24AD09B7284CFC /* RuleManagerViewController.swift */,
 				E6089C908BF5371EDF420474 /* ServerSentEventsViewController.swift */,
 				DA8306A5410C88C25029B8B2 /* SourceListViewController.swift */,
+				4C9FD9794324A67AB8F838E6 /* SSLProxyingManagerViewController.swift */,
 				24F1B0636038D75081A25CB1 /* TrafficConsoleModels.swift */,
 				66A7CA88E94A0EEA0C0E87DE /* TrafficConsoleView.swift */,
 				5431991724785D72596AB045 /* TrafficConsoleViewController.swift */,
@@ -459,6 +462,7 @@
 				400C806BF9630E81A3E0192E /* RequestEditorViewController.swift in Sources */,
 				CAC19A6E8E780C96B6A82C03 /* ReverseProxyManagerViewController.swift in Sources */,
 				C84263CEAC853ECBE41CDA8A /* RuleManagerViewController.swift in Sources */,
+				A9EE2454BBDABAD6D60AD13D /* SSLProxyingManagerViewController.swift in Sources */,
 				7E1E455788136B45627A3A1D /* ServerSentEventsViewController.swift in Sources */,
 				E2ADD2C913BA3F1C77422AB3 /* SourceListViewController.swift in Sources */,
 				4F198D256EC8EE56A4204437 /* TrafficConsoleModels.swift in Sources */,
