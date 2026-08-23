@@ -2232,7 +2232,12 @@ final class ProxyLensCaptureTests: XCTestCase {
             XCTAssertEqual(response.statusCode, 200)
             XCTAssertEqual(response.body, Data("socks origin".utf8))
 
-            await eventSink.waitForFinished()
+            // Bounded, not `waitForFinished()`: if the passthrough tunnel ever regressed to
+            // never publishing a `.finished` event, an unbounded wait here would hang the
+            // suite instead of failing this test.
+            try await eventually("the SOCKS5 tunnel flow to complete") {
+                await eventSink.lastFlow { $0.state == .completed } != nil
+            }
             let tunnelFlow = await eventSink.lastFlow { $0.state == .completed }
             let tunnel = try XCTUnwrap(tunnelFlow)
             XCTAssertEqual(tunnel.request.method, .connect)
@@ -2375,7 +2380,15 @@ final class ProxyLensCaptureTests: XCTestCase {
             XCTAssertEqual(response.statusCode, 200)
             XCTAssertEqual(response.body, Data("still intercepted".utf8))
 
-            await eventSink.waitForFinished()
+            // Bounded, not `waitForFinished()`: an unbounded wait would hang the suite,
+            // rather than failing this test, if this policy branch ever regressed to never
+            // publishing a `.finished` event.
+            try await eventually("a finished SOCKS5 flow") {
+                await eventSink.snapshot().contains { event in
+                    if case .finished = event { return true }
+                    return false
+                }
+            }
             let events = await eventSink.snapshot()
             let flow = try XCTUnwrap(
                 events.compactMap { event -> Flow? in
@@ -6771,7 +6784,12 @@ final class ProxyLensCaptureTests: XCTestCase {
             XCTAssertEqual(response.body, Data("origin body".utf8))
             XCTAssertEqual(upstream.requestCount, 1)
 
-            await eventSink.waitForFinished()
+            // Bounded, not `waitForFinished()`: if the passthrough tunnel ever regressed to
+            // never publishing a `.finished` event, an unbounded wait here would hang the
+            // suite instead of failing this test.
+            try await eventually("the CONNECT tunnel flow to complete") {
+                await eventSink.lastFlow { $0.state == .completed } != nil
+            }
             let tunnelFlow = await eventSink.lastFlow { $0.state == .completed }
             let tunnel = try XCTUnwrap(tunnelFlow)
             XCTAssertEqual(tunnel.request.method, .connect)
@@ -7013,7 +7031,16 @@ final class ProxyLensCaptureTests: XCTestCase {
                 )
             )
 
-            await eventSink.waitForFinished()
+            // Bounded, not `waitForFinished()`: if the passthrough dial-failure branch ever
+            // regresses to closing the connection without failing the transaction, no
+            // `.finished` event is ever published and an unbounded wait here would hang the
+            // suite instead of failing this test.
+            try await eventually("the CONNECT tunnel flow to fail") {
+                await eventSink.lastFlow {
+                    if case .failed = $0.state { return true }
+                    return false
+                } != nil
+            }
             let failedFlow = await eventSink.lastFlow {
                 if case .failed = $0.state { return true }
                 return false
