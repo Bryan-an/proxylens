@@ -431,6 +431,51 @@ final class SSLProxyingListTests: XCTestCase {
         XCTAssertFalse(excludeItem.isEnabled)
     }
 
+    func testFlowTableContextMenuEnablesInterceptForAnUnlistedHostInInterceptOnlyMode()
+        async throws
+    {
+        let store = InMemoryTrafficSSLProxyingStore(
+            policy: try TLSInterceptionPolicy(
+                mode: .interceptOnly,
+                entries: []
+            )
+        )
+        let sink = MutableTLSInterceptionPolicy()
+        let viewModel = makeViewModel(store: store, sink: sink)
+        await viewModel.prepare()
+
+        let tableView = SSLProxyingRecordingTableView()
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        let flow = try Self.makeCompletedFlow(host: "api.example.com", statusCode: 200)
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        controller.render(viewModel.snapshot)
+
+        tableView.clickedRowOverride = 0
+        // See the comment on the mirror test above: use the table's real context menu so
+        // `update()` exercises AppKit's automatic-enabling pass the way a user actually
+        // sees it. In .interceptOnly mode, an unlisted host reaches this branch with no
+        // entry at all (exact or wildcard) covering it, so "Intercept" here always means
+        // a well-defined "add this host as a new exact entry" — unlike the
+        // .interceptAllExcept mirror above, there is no wildcard-entry ambiguity to guard
+        // against, and the item must stay enabled.
+        let menu = try XCTUnwrap(tableView.menu)
+        controller.menuNeedsUpdate(menu)
+        menu.update()
+
+        let interceptItem = try XCTUnwrap(
+            menu.items.first { $0.title == "Intercept api.example.com" }
+        )
+        XCTAssertTrue(interceptItem.isEnabled)
+
+        _ = interceptItem.target?.perform(interceptItem.action, with: interceptItem)
+
+        try await waitUntil { store.policy.entries == ["api.example.com"] }
+        XCTAssertTrue(sink.currentPolicy().shouldIntercept(host: "api.example.com"))
+    }
+
     func testFlowTableRendersAPassthroughTunnelRow() async throws {
         let viewModel = makeViewModel(
             store: InMemoryTrafficSSLProxyingStore(),

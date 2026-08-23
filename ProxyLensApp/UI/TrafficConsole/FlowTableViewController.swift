@@ -378,9 +378,15 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 host: host,
                 action: #selector(interceptHostAgain)
             )
-            // A host excluded only by a wildcard entry cannot be re-included one host at a
-            // time; the SSL Proxying List sheet is where that entry is edited.
-            interceptItem.isEnabled = viewModel.hasExactTLSInterceptionEntry(host)
+            // In .interceptAllExcept mode a host excluded only by a wildcard entry
+            // cannot be re-included one host at a time; the SSL Proxying List sheet is
+            // where that entry is edited. In .interceptOnly mode this branch only ever
+            // reaches an unlisted host (no entry, exact or wildcard, covers it), so
+            // "Intercept" always means a well-defined "add a new exact entry" and must
+            // stay enabled.
+            interceptItem.isEnabled =
+                viewModel.currentTLSInterceptionPolicy().mode == .interceptOnly
+                || viewModel.hasExactTLSInterceptionEntry(host)
             menu.addItem(interceptItem)
         }
         let networkConditionsItem = NSMenuItem(
