@@ -3037,6 +3037,12 @@ final class ProxyLensCoreTests: XCTestCase {
         XCTAssertNil(
             HostPatternNormalizer.normalize("example.com..", allowsWildcard: false)
         )
+        // A trailing dot has no FQDN meaning on a bracketed IPv6 literal, and must not be
+        // stripped in a way that unmasks the brackets (which would otherwise normalize to
+        // "::1" or leave "[::1]" with its brackets literally in the string, neither of
+        // which any real dialed host ever equals). Rejected outright, same as before the
+        // trailing-dot exception existed.
+        XCTAssertNil(HostPatternNormalizer.normalize("[::1].", allowsWildcard: false))
     }
 
     func testTLSInterceptionPolicyMatchesATrailingDotFQDNAgainstAPlainEntryAndBack()
