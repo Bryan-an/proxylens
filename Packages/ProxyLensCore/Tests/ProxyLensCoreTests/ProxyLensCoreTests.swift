@@ -3041,8 +3041,12 @@ final class ProxyLensCoreTests: XCTestCase {
         // stripped in a way that unmasks the brackets (which would otherwise normalize to
         // "::1" or leave "[::1]" with its brackets literally in the string, neither of
         // which any real dialed host ever equals). Rejected outright, same as before the
-        // trailing-dot exception existed.
+        // trailing-dot exception existed. Guarded by "starts with [", not "ends with ].",
+        // so an unbalanced bracket with a trailing dot is rejected too, instead of
+        // stripping the dot and letting a bracket-retaining, unclosed value like "[::1"
+        // through.
         XCTAssertNil(HostPatternNormalizer.normalize("[::1].", allowsWildcard: false))
+        XCTAssertNil(HostPatternNormalizer.normalize("[::1.", allowsWildcard: false))
     }
 
     func testTLSInterceptionPolicyMatchesATrailingDotFQDNAgainstAPlainEntryAndBack()
