@@ -50,6 +50,7 @@ final class CompositionRoot {
         let scriptExecutor = Bundle.main.executableURL.map {
             ProcessJavaScriptExecutor(workerExecutableURL: $0)
         }
+        let tlsInterceptionPolicy = MutableTLSInterceptionPolicy()
         let proxyEngine = NIOProxyEngine(
             eventSink: persistenceSink,
             serverSentEventEventSink: serverSentEventPersistenceSink,
@@ -58,6 +59,7 @@ final class CompositionRoot {
             maximumCapturedBodyBytes: databaseConfiguration.maximumCapturedBodyBytes,
             certificateProvider: certificateProvider,
             ruleSnapshot: ruleEngine.snapshot,
+            tlsInterceptionPolicy: tlsInterceptionPolicy,
             scriptExecutor: scriptExecutor,
             breakpointGate: breakpointCoordinator,
             flowSourceResolver: flowSourceResolver,
@@ -155,7 +157,9 @@ final class CompositionRoot {
             socks5ListenerStore: UserDefaultsTrafficSOCKS5ListenerStore(),
             externalHTTPProxyStore: UserDefaultsTrafficExternalHTTPProxyStore(),
             externalHTTPProxyCredentialStore: externalHTTPProxyCredentialStore,
-            customFilterPresetStore: UserDefaultsTrafficCustomFilterPresetStore()
+            customFilterPresetStore: UserDefaultsTrafficCustomFilterPresetStore(),
+            sslProxyingStore: UserDefaultsTrafficSSLProxyingStore(),
+            tlsInterceptionPolicySink: tlsInterceptionPolicy
         )
     }
 

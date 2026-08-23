@@ -185,6 +185,8 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let externalHTTPProxyStore: any TrafficExternalHTTPProxyStoring
     private let externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)?
     private let customFilterPresetStore: any TrafficCustomFilterPresetStoring
+    private let sslProxyingStore: any TrafficSSLProxyingStoring
+    private let tlsInterceptionPolicySink: MutableTLSInterceptionPolicy?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -274,7 +276,9 @@ final class TrafficConsoleViewModel: ObservableObject {
             InMemoryTrafficExternalHTTPProxyStore(),
         externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)? = nil,
         customFilterPresetStore: any TrafficCustomFilterPresetStoring =
-            InMemoryTrafficCustomFilterPresetStore()
+            InMemoryTrafficCustomFilterPresetStore(),
+        sslProxyingStore: any TrafficSSLProxyingStoring = InMemoryTrafficSSLProxyingStore(),
+        tlsInterceptionPolicySink: MutableTLSInterceptionPolicy? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -338,6 +342,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.externalHTTPProxyStore = externalHTTPProxyStore
         self.externalHTTPProxyCredentialStore = externalHTTPProxyCredentialStore
         self.customFilterPresetStore = customFilterPresetStore
+        self.sslProxyingStore = sslProxyingStore
+        self.tlsInterceptionPolicySink = tlsInterceptionPolicySink
         for domain in pinnedDomainsStore.domains {
             store.setPinnedDomain(domain, isPinned: true)
         }
@@ -368,6 +374,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         isPrepared = true
         capturePresentation = .recovering
         publishSnapshot()
+        tlsInterceptionPolicySink?.replace(sslProxyingStore.policy)
 
         do {
             try await captureController.recoverInterruptedCapture()
@@ -693,6 +700,75 @@ final class TrafficConsoleViewModel: ObservableObject {
             configuresSystemProxy: captureConfiguration.configuresSystemProxy,
             bypassDomains: captureConfiguration.bypassDomains
         )
+    }
+
+    // SSL proxying list edits apply live, while capture is running — unlike the reverse
+    // proxy and listener settings above, there is no stopped-capture guard here.
+
+    func currentTLSInterceptionPolicy() -> TLSInterceptionPolicy {
+        sslProxyingStore.policy
+    }
+
+    func saveTLSInterceptionPolicy(_ policy: TLSInterceptionPolicy) {
+        sslProxyingStore.save(policy)
+        tlsInterceptionPolicySink?.replace(policy)
+    }
+
+    func setTLSInterceptionMode(_ mode: TLSInterceptionMode) throws {
+        let current = sslProxyingStore.policy
+        saveTLSInterceptionPolicy(
+            try TLSInterceptionPolicy(mode: mode, entries: current.entries)
+        )
+    }
+
+    func excludeHostFromTLSInterception(_ host: String) throws {
+        let current = sslProxyingStore.policy
+        switch current.mode {
+        case .interceptAllExcept:
+            guard !current.matches(host: host) else { return }
+            saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: current.entries + [host])
+            )
+        case .interceptOnly:
+            saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(
+                    mode: current.mode,
+                    entries: current.entries.filter {
+                        $0.caseInsensitiveCompare(host) != .orderedSame
+                    }
+                )
+            )
+        }
+    }
+
+    func interceptHostAgain(_ host: String) throws {
+        let current = sslProxyingStore.policy
+        switch current.mode {
+        case .interceptAllExcept:
+            saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(
+                    mode: current.mode,
+                    entries: current.entries.filter {
+                        $0.caseInsensitiveCompare(host) != .orderedSame
+                    }
+                )
+            )
+        case .interceptOnly:
+            guard !current.matches(host: host) else { return }
+            saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: current.entries + [host])
+            )
+        }
+    }
+
+    func isHostIntercepted(_ host: String) -> Bool {
+        sslProxyingStore.policy.shouldIntercept(host: host)
+    }
+
+    func hasExactTLSInterceptionEntry(_ host: String) -> Bool {
+        sslProxyingStore.policy.entries.contains {
+            $0.caseInsensitiveCompare(host) == .orderedSame
+        }
     }
 
     func renameSession(_ sessionID: SessionID, to name: String?) async throws {
