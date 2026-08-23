@@ -353,13 +353,18 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
             )
         )
         if viewModel.isHostIntercepted(host) {
-            menu.addItem(
-                ruleMenuItem(
-                    title: "Don't Intercept \(host)",
-                    host: host,
-                    action: #selector(excludeHostFromSSLProxying)
-                )
+            let excludeItem = ruleMenuItem(
+                title: "Don't Intercept \(host)",
+                host: host,
+                action: #selector(excludeHostFromSSLProxying)
             )
+            // In .interceptOnly mode a host intercepted only through a wildcard entry
+            // cannot be excluded one host at a time; the SSL Proxying List sheet is
+            // where that entry is edited.
+            excludeItem.isEnabled =
+                viewModel.currentTLSInterceptionPolicy().mode == .interceptAllExcept
+                || viewModel.hasExactTLSInterceptionEntry(host)
+            menu.addItem(excludeItem)
         } else {
             let interceptItem = ruleMenuItem(
                 title: "Intercept \(host)",

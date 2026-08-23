@@ -388,6 +388,36 @@ final class SSLProxyingListTests: XCTestCase {
         XCTAssertFalse(interceptItem.isEnabled)
     }
 
+    func testFlowTableContextMenuDisablesExcludeForAWildcardOnlyInterceptOnlyHost() async throws {
+        let store = InMemoryTrafficSSLProxyingStore(
+            policy: try TLSInterceptionPolicy(
+                mode: .interceptOnly,
+                entries: ["*.example.com"]
+            )
+        )
+        let sink = MutableTLSInterceptionPolicy()
+        let viewModel = makeViewModel(store: store, sink: sink)
+        await viewModel.prepare()
+
+        let tableView = SSLProxyingRecordingTableView()
+        let controller = FlowTableViewController(viewModel: viewModel, tableView: tableView)
+        _ = controller.view
+
+        let flow = try Self.makeCompletedFlow(host: "api.example.com", statusCode: 200)
+        viewModel.receive(.finished(flow))
+        viewModel.flushPendingEvents()
+        controller.render(viewModel.snapshot)
+
+        tableView.clickedRowOverride = 0
+        let menu = NSMenu()
+        controller.menuNeedsUpdate(menu)
+
+        let excludeItem = try XCTUnwrap(
+            menu.items.first { $0.title == "Don't Intercept api.example.com" }
+        )
+        XCTAssertFalse(excludeItem.isEnabled)
+    }
+
     func testFlowTableRendersAPassthroughTunnelRow() async throws {
         let viewModel = makeViewModel(
             store: InMemoryTrafficSSLProxyingStore(),
