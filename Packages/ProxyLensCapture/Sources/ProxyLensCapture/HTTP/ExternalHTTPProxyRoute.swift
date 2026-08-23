@@ -61,8 +61,7 @@ struct ExternalHTTPProxyRoute: Sendable {
         port: Int,
         allocator: ByteBufferAllocator
     ) -> ByteBuffer {
-        let formattedHost = host.contains(":") ? "[\(host)]" : host
-        let authority = "\(formattedHost):\(port)"
+        let authority = "\(Self.bracketedHost(host)):\(port)"
         var request = "CONNECT \(authority) HTTP/1.1\r\nHost: \(authority)\r\n"
         request += "Proxy-Connection: keep-alive\r\n"
         if let authorizationValue {
@@ -120,8 +119,12 @@ struct ExternalHTTPProxyRoute: Sendable {
     }
 
     private func bracketedConnectionHost(for target: ProxyTarget) -> String {
-        target.connectionHost.contains(":") && !target.connectionHost.hasPrefix("[")
-            ? "[\(target.connectionHost)]"
-            : target.connectionHost
+        Self.bracketedHost(target.connectionHost)
+    }
+
+    /// A CONNECT/absolute-form authority never double-brackets an IPv6 literal that is
+    /// already bracketed, and only brackets a literal that actually needs it.
+    private static func bracketedHost(_ host: String) -> String {
+        host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
     }
 }

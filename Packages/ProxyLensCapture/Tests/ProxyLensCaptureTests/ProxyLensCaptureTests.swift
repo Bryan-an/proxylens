@@ -1707,7 +1707,7 @@ final class ProxyLensCaptureTests: XCTestCase {
         )
     }
 
-    func testConnectAttemptsATunnelWhenInterceptionIsDisabled() throws {
+    func testConnectDoesNotRejectCONNECTWhenInterceptionIsDisabled() throws {
         let channel = EmbeddedChannel()
         try channel.pipeline.syncOperations.addHandler(
             HTTPProxyHandler(

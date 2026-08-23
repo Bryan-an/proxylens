@@ -45,7 +45,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private var transaction: FlowTransaction?
     private var pendingConnectTarget: ConnectTarget?
     private var pendingConnectIsPassthrough = false
-    private var isPreparingTLSIntercept = false
+    private var isPreparingConnectTunnel = false
     private var requestBodyRecorder: StreamingBodyRecorder?
     private var requestBodyWriteTask: Task<Void, Error>?
     private var captureWritesInFlight = 0
@@ -706,10 +706,10 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     }
 
     private func beginTLSIntercept(target: ConnectTarget, context: ChannelHandlerContext) {
-        guard !isPreparingTLSIntercept, let certificateProvider, let upstreamTLSContext else {
+        guard !isPreparingConnectTunnel, let certificateProvider, let upstreamTLSContext else {
             return
         }
-        isPreparingTLSIntercept = true
+        isPreparingConnectTunnel = true
 
         let channel = context.channel
         channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
@@ -828,17 +828,28 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     }
 
     private func beginTunnelPassthrough(target: ConnectTarget, context: ChannelHandlerContext) {
-        guard !isPreparingTLSIntercept else { return }
-        isPreparingTLSIntercept = true
+        guard !isPreparingConnectTunnel else { return }
+        isPreparingConnectTunnel = true
 
         let channel = context.channel
         channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
             channel.close(promise: nil)
         }
 
+        // `ConnectTarget.init` already validates host and port the same way the URL built
+        // in `TunnelPassthrough.makeFlow` does, so a `nil` transaction here is unreachable
+        // in practice — this is a defensive fallback, not a real "no flow recorded" path.
         let transaction = makeTunnelFlowTransaction(target: target)
         self.transaction = transaction
         if let transaction {
+            // This Task, `clientRelay`'s `onClose` Task below (`finishResponse`), and
+            // `spliceTunnel`'s success-case Task (`markUpstreamConnected`) all target this
+            // same `transaction` from independent, unstructured `Task {}`s with no ordering
+            // guarantee relative to one another. Every interleaving still ends the flow
+            // correctly: `FlowTransaction.start` only acts while the flow is still
+            // `.created`, and `finishResponse` defers completion until the request side has
+            // also finished — so whichever of these three lands first, the flow still
+            // reaches exactly one terminal event.
             Task {
                 await transaction.start(at: Date())
                 await transaction.finishRequestBody(nil, at: Date())
@@ -894,7 +905,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                                 request: connectBytes,
                                 readyPromise: readyPromise,
                                 configureTunnel: { channel in
-                                    channel.eventLoop.makeSucceededFuture(())
+                                    // Autoread stays on through the CONNECT handshake so
+                                    // `HTTPUpstreamProxyConnectHandler` can read the proxy's
+                                    // response; it must be off again before this future
+                                    // completes, or the origin's first bytes can arrive
+                                    // before `spliceTunnel` has installed the relay handler.
+                                    channel.setOption(ChannelOptions.autoRead, value: false)
                                 }
                             )
                         )
@@ -905,7 +921,11 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             return readyPromise.futureResult
         }
 
+        // No handler is ever installed on the direct-dial path before `spliceTunnel`, so
+        // autoRead must start off — otherwise a server-first origin (SMTP, IMAP, SSH) can
+        // write its banner before the relay handler exists to catch it.
         return ClientBootstrap(group: eventLoop)
+            .channelOption(ChannelOptions.autoRead, value: false)
             .connect(host: target.host, port: target.port)
     }
 
@@ -937,7 +957,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             clientRelay.connectPeer(upstreamChannel)
             upstreamRelay.connectPeer(clientChannel)
         }.flatMap {
+            // Both sides were held at autoRead false until the relay handlers above were
+            // installed — re-enable both here, not just the client, or the upstream side
+            // never reads what the origin already has buffered.
             clientChannel.setOption(ChannelOptions.autoRead, value: true)
+        }.flatMap {
+            upstreamChannel.setOption(ChannelOptions.autoRead, value: true)
         }.whenComplete { result in
             switch result {
             case .success:
