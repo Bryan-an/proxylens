@@ -111,8 +111,16 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.flowSource = flowSource
     }
 
+    private var isServingLocalResource = false
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let requestPart = Self.unwrapInboundIn(data)
+
+        // ProxyLens is answering this request itself, so the remaining parts of it are not
+        // proxied, recorded, or matched against rules.
+        guard !isServingLocalResource else {
+            return
+        }
 
         switch requestPart {
         case .head(let head):
@@ -202,6 +210,16 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 return
             }
             receiveConnectHead(head, context: context)
+            return
+        }
+
+        if let resource = CertificateDistribution.resource(
+            requestTarget: head.uri,
+            isTunnelled: tunnelTarget != nil,
+            isReverseProxyListener: reverseProxyRoute != nil
+        ) {
+            isServingLocalResource = true
+            serveCertificateDistribution(resource, context: context)
             return
         }
 
@@ -2223,6 +2241,114 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in
             channel.close(promise: nil)
         }
+    }
+
+    /// Answers one of ProxyLens' own routes: the on-device setup page, or the root CA in
+    /// the encoding the device expects. Only the public certificate is ever served.
+    private func serveCertificateDistribution(
+        _ resource: CertificateDistributionResource,
+        context: ChannelHandlerContext
+    ) {
+        let channel = context.channel
+
+        if resource == .setupPage {
+            let endpoint = Self.localEndpoint(of: channel)
+            let html = CertificateSetupPage.html(
+                proxyHost: endpoint.host,
+                proxyPort: endpoint.port
+            )
+            sendDistributionResponse(
+                body: Data(html.utf8),
+                contentType: "text/html; charset=utf-8",
+                filename: nil,
+                channel: channel
+            )
+            return
+        }
+
+        guard let certificateProvider else {
+            sendError(
+                statusCode: 503,
+                reason: "Service Unavailable",
+                message: "ProxyLens has no certificate authority to distribute.",
+                channel: channel
+            )
+            return
+        }
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        Task {
+            do {
+                let pem = try await certificateProvider.rootCertificate()
+                let body: Data
+                let contentType: String
+                let filename: String
+                if resource == .derCertificate {
+                    body = try CertificateDistribution.derEncodedCertificate(fromPEM: pem)
+                    contentType = "application/x-x509-ca-cert"
+                    filename = "proxylens.crt"
+                } else {
+                    body = pem
+                    contentType = "application/x-pem-file"
+                    filename = "proxylens.pem"
+                }
+                channel.eventLoop.execute {
+                    loopBoundSelf.value.sendDistributionResponse(
+                        body: body,
+                        contentType: contentType,
+                        filename: filename,
+                        channel: channel
+                    )
+                }
+            } catch {
+                let message = error.localizedDescription
+                channel.eventLoop.execute {
+                    loopBoundSelf.value.sendError(
+                        statusCode: 503,
+                        reason: "Service Unavailable",
+                        message: message,
+                        channel: channel
+                    )
+                }
+            }
+        }
+    }
+
+    private func sendDistributionResponse(
+        body: Data,
+        contentType: String,
+        filename: String?,
+        channel: Channel
+    ) {
+        var buffer = channel.allocator.buffer(capacity: body.count)
+        buffer.writeBytes(body)
+
+        var headers = NIOHTTP1.HTTPHeaders()
+        headers.add(name: "Content-Type", value: contentType)
+        headers.add(name: "Content-Length", value: "\(buffer.readableBytes)")
+        headers.add(name: "Cache-Control", value: "no-store")
+        headers.add(name: "Connection", value: "close")
+        if let filename {
+            headers.add(
+                name: "Content-Disposition",
+                value: "attachment; filename=\"\(filename)\""
+            )
+        }
+
+        let head = HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)
+        channel.write(HTTPServerResponsePart.head(head), promise: nil)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in
+            channel.close(promise: nil)
+        }
+    }
+
+    /// The address the device actually reached, which is what its proxy settings need.
+    private static func localEndpoint(of channel: Channel) -> (host: String, port: UInt16) {
+        guard let address = channel.localAddress else {
+            return ("127.0.0.1", 0)
+        }
+        return (address.ipAddress ?? "127.0.0.1", UInt16(address.port ?? 0))
     }
 
     private func sendError(

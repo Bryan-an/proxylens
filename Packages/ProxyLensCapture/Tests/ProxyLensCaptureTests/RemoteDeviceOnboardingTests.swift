@@ -116,6 +116,121 @@ final class RemoteDeviceOnboardingTests: XCTestCase {
         await engine.stop()
     }
 
+    // MARK: - Certificate distribution
+
+    func testSetupPageIsServedInOriginFormToADeviceThatIsNotProxyingYet() async throws {
+        let engine = NIOProxyEngine(certificateProvider: StubCertificateProvider())
+        let proxy = try await start(engine)
+
+        let response = try await ProxyHTTPClient.send(uri: "/ssl", to: proxy)
+
+        XCTAssertEqual(response?.statusCode, 200)
+        XCTAssertEqual(response?.headerValue("Content-Type"), "text/html; charset=utf-8")
+        let html = String(decoding: response?.body ?? Data(), as: UTF8.self)
+        XCTAssertTrue(html.contains("127.0.0.1"))
+        XCTAssertTrue(html.contains(String(proxy.port)))
+        XCTAssertTrue(html.contains(CertificateDistribution.derCertificatePath))
+
+        await engine.stop()
+    }
+
+    func testSetupPageIsServedInAbsoluteFormThroughTheReservedHost() async throws {
+        let engine = NIOProxyEngine(certificateProvider: StubCertificateProvider())
+        let proxy = try await start(engine)
+
+        let response = try await ProxyHTTPClient.send(
+            uri: "http://proxy.lens/ssl",
+            to: proxy
+        )
+
+        XCTAssertEqual(response?.statusCode, 200)
+        XCTAssertEqual(response?.headerValue("Content-Type"), "text/html; charset=utf-8")
+
+        await engine.stop()
+    }
+
+    func testCertificateDownloadsCarryTheRootCertificateInBothEncodings() async throws {
+        let provider = StubCertificateProvider()
+        let engine = NIOProxyEngine(certificateProvider: provider)
+        let proxy = try await start(engine)
+
+        let der = try await ProxyHTTPClient.send(uri: "/proxylens.crt", to: proxy)
+        let pem = try await ProxyHTTPClient.send(uri: "/proxylens.pem", to: proxy)
+
+        XCTAssertEqual(der?.statusCode, 200)
+        XCTAssertEqual(der?.headerValue("Content-Type"), "application/x-x509-ca-cert")
+        XCTAssertEqual(
+            der?.headerValue("Content-Disposition"),
+            "attachment; filename=\"proxylens.crt\""
+        )
+        XCTAssertEqual(
+            der?.body,
+            try CertificateDistribution.derEncodedCertificate(
+                fromPEM: StubCertificateProvider.rootPEM
+            )
+        )
+
+        XCTAssertEqual(pem?.statusCode, 200)
+        XCTAssertEqual(pem?.headerValue("Content-Type"), "application/x-pem-file")
+        XCTAssertEqual(pem?.body, StubCertificateProvider.rootPEM)
+
+        await engine.stop()
+    }
+
+    func testARealRequestForTheSamePathIsStillProxied() async throws {
+        let upstream = try await LocalHTTPServer.start(body: "upstream response")
+        let eventSink = RecordingEventSink()
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            certificateProvider: StubCertificateProvider()
+        )
+        let proxy = try await start(engine)
+
+        do {
+            let response = try await ProxyHTTPClient.send(
+                uri: "http://127.0.0.1:\(upstream.endpoint.port)/ssl",
+                to: proxy
+            )
+
+            XCTAssertEqual(response?.statusCode, 200)
+            XCTAssertEqual(response?.body, Data("upstream response".utf8))
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+    }
+
+    func testCertificateDownloadIsUnavailableWithoutACertificateProvider() async throws {
+        let engine = NIOProxyEngine()
+        let proxy = try await start(engine)
+
+        let response = try await ProxyHTTPClient.send(uri: "/proxylens.crt", to: proxy)
+
+        XCTAssertEqual(response?.statusCode, 503)
+
+        await engine.stop()
+    }
+
+    func testTheSetupPageIsNotRecordedAsAFlow() async throws {
+        let eventSink = RecordingEventSink()
+        let engine = NIOProxyEngine(
+            eventSink: eventSink,
+            certificateProvider: StubCertificateProvider()
+        )
+        let proxy = try await start(engine)
+
+        _ = try await ProxyHTTPClient.send(uri: "/ssl", to: proxy)
+
+        let events = await eventSink.events()
+        XCTAssertTrue(events.isEmpty, "Serving ProxyLens' own page is not captured traffic")
+
+        await engine.stop()
+    }
+
     // MARK: - Helpers
 
     /// Binds an ephemeral loopback port and releases it, so a listener that needs a known
@@ -180,6 +295,28 @@ private actor RecordingRemoteAccessGate: RemoteAccessGate {
 
     func clients() -> [RemoteAccessClient] {
         recorded
+    }
+}
+
+/// Returns fixed material so certificate distribution can be tested without a keychain.
+private struct StubCertificateProvider: CertificateProvider {
+    static let rootDER = Data([0x30, 0x82, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04])
+
+    static let rootPEM = Data(
+        """
+        -----BEGIN CERTIFICATE-----
+        \(rootDER.base64EncodedString())
+        -----END CERTIFICATE-----
+
+        """.utf8
+    )
+
+    func rootCertificate() async throws -> Data {
+        Self.rootPEM
+    }
+
+    func leafCertificate(for _: String) async throws -> CertificateIdentity {
+        throw ProxyLensError.unsupportedOperation("The stub provider issues no leaves")
     }
 }
 
