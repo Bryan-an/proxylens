@@ -1,5 +1,6 @@
 import Foundation
 import NIOCore
+import NIOPosix
 import NIOSSL
 import ProxyLensCore
 
@@ -37,6 +38,7 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
     private let upstreamHTTP2Pool: HTTP2UpstreamConnectionPool
     private let externalHTTPProxyRoute: ExternalHTTPProxyRoute?
     private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let tlsInterceptionPolicy: (any TLSInterceptionPolicySource)?
     private let scriptExecutor: (any ScriptExecutor)?
     private let breakpointGate: any BreakpointGate
     private let flowSource: FlowSource
@@ -64,6 +66,7 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
         upstreamHTTP2Pool: HTTP2UpstreamConnectionPool,
         externalHTTPProxyRoute: ExternalHTTPProxyRoute?,
         ruleSnapshot: (any RuleSnapshotSource)?,
+        tlsInterceptionPolicy: (any TLSInterceptionPolicySource)?,
         scriptExecutor: (any ScriptExecutor)?,
         breakpointGate: any BreakpointGate,
         flowSource: FlowSource
@@ -83,6 +86,7 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
         self.upstreamHTTP2Pool = upstreamHTTP2Pool
         self.externalHTTPProxyRoute = externalHTTPProxyRoute
         self.ruleSnapshot = ruleSnapshot
+        self.tlsInterceptionPolicy = tlsInterceptionPolicy
         self.scriptExecutor = scriptExecutor
         self.breakpointGate = breakpointGate
         self.flowSource = flowSource
@@ -191,9 +195,21 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
     }
 
     private func installTLSPipeline(context: ChannelHandlerContext) {
-        guard interceptHTTPS, let certificateProvider, let target else {
+        guard let target else {
             isClosing = true
             context.close(promise: nil)
+            return
+        }
+        // `interceptHTTPS && certificateProvider != nil` are already guaranteed together by
+        // `NIOProxyEngine.start` (it refuses to start with `interceptHTTPS: true` and no
+        // certificate provider); the extra check here is defensive, matching
+        // `HTTPProxyHandler`'s equivalent guard rather than trusting that invariant blindly.
+        let policy = tlsInterceptionPolicy?.currentPolicy() ?? TLSInterceptionPolicy()
+        let wantsInterception =
+            interceptHTTPS && certificateProvider != nil
+            && policy.shouldIntercept(host: target.host)
+        guard wantsInterception, let certificateProvider else {
+            beginTunnelPassthrough(target: target, context: context)
             return
         }
         isPreparingTLS = true
@@ -292,6 +308,103 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, RemovableChannelHandler,
         }.whenFailure { _ in
             channel.close(promise: nil)
         }
+    }
+
+    /// Splices a TLS destination the policy excludes from interception straight through to
+    /// the origin, with no certificate work. Unlike the CONNECT path, the SOCKS success
+    /// reply — and, by the time this runs, the client's first TLS record — have already
+    /// gone out: there is no local response left to withhold, so the buffered ClientHello
+    /// must be replayed upstream verbatim once the origin dial succeeds.
+    private func beginTunnelPassthrough(target: ConnectTarget, context: ChannelHandlerContext) {
+        guard !isPreparingTLS else { return }
+        isPreparingTLS = true
+
+        let channel = context.channel
+        channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
+            channel.close(promise: nil)
+        }
+
+        // `ConnectTarget.init` already validates host and port the same way the URL built
+        // in `TunnelPassthrough.makeFlow` does, so a `nil` transaction here is unreachable
+        // in practice — this is a defensive fallback, not a real "no flow recorded" path.
+        let transaction: FlowTransaction? = TunnelPassthrough.makeFlow(
+            sessionID: sessionID,
+            source: flowSource,
+            target: target
+        ).map { FlowTransaction(flow: $0, eventSink: eventSink) }
+        if let transaction {
+            // This Task, `clientRelay`'s `onClose` Task below, and `TunnelPassthrough.splice`'s
+            // own success-case Task all target this same `transaction` from independent,
+            // unstructured `Task {}`s with no ordering guarantee relative to one another —
+            // see `TunnelPassthrough.splice`'s doc comment for why every interleaving still
+            // ends the flow correctly.
+            Task {
+                await transaction.start(at: Date())
+                await transaction.finishRequestBody(nil, at: Date())
+            }
+        }
+
+        let pendingBytes = applicationBuffers
+        applicationBuffers.removeAll(keepingCapacity: false)
+        applicationPrefix.removeAll(keepingCapacity: false)
+
+        let clientRelay = TunnelRelayHandler(onClose: { [transaction] in
+            guard let transaction else { return }
+            Task { await transaction.finishResponse(nil, at: Date()) }
+        })
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        let loopBoundClientRelay = NIOLoopBound(clientRelay, eventLoop: channel.eventLoop)
+
+        // No handler is ever installed on this direct dial before the relay is spliced in
+        // below, so autoRead must start off — otherwise a server-first origin could write
+        // its banner before anything exists to catch it. External-proxy chaining is
+        // deliberately not applied here: it is not applied for MITM'd SOCKS flows either
+        // (their per-request upstream dial happens later, inside the decrypted
+        // `HTTPProxyHandler`), so this keeps the two paths consistent.
+        ClientBootstrap(group: channel.eventLoop)
+            .channelOption(ChannelOptions.autoRead, value: false)
+            .connect(host: target.host, port: target.port)
+            .whenComplete { result in
+                switch result {
+                case .success(let upstreamChannel):
+                    loopBoundSelf.value.spliceTunnelPassthrough(
+                        clientChannel: channel,
+                        upstreamChannel: upstreamChannel,
+                        clientRelay: loopBoundClientRelay.value,
+                        pendingBytes: pendingBytes,
+                        transaction: transaction
+                    )
+                case .failure:
+                    // The client already believes the tunnel is open — the SOCKS success
+                    // reply went out before this branch could have known better — so there
+                    // is nothing meaningful left to send back. Closing is the correct
+                    // client-visible behavior here; the flow must still resolve, though.
+                    if let transaction {
+                        Task { await transaction.fail(.upstreamUnavailable) }
+                    }
+                    channel.close(promise: nil)
+                }
+            }
+    }
+
+    private func spliceTunnelPassthrough(
+        clientChannel: Channel,
+        upstreamChannel: Channel,
+        clientRelay: TunnelRelayHandler,
+        pendingBytes: [ByteBuffer],
+        transaction: FlowTransaction?
+    ) {
+        TunnelPassthrough.splice(
+            clientChannel: clientChannel,
+            upstreamChannel: upstreamChannel,
+            clientRelay: clientRelay,
+            transaction: transaction,
+            // The ClientHello (and anything else buffered while classifying) was consumed by
+            // this handler before the relay existed — replay it upstream directly.
+            extraUpstreamBytes: pendingBytes,
+            prelude: { clientChannel.pipeline.removeHandler(self) }
+        )
     }
 
     private func makeHTTPHandler(target: ConnectTarget, usesTLS: Bool) -> HTTPProxyHandler {

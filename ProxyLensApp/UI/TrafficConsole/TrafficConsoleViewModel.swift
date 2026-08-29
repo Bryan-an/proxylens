@@ -185,6 +185,8 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let externalHTTPProxyStore: any TrafficExternalHTTPProxyStoring
     private let externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)?
     private let customFilterPresetStore: any TrafficCustomFilterPresetStoring
+    private let sslProxyingStore: any TrafficSSLProxyingStoring
+    private let tlsInterceptionPolicySink: MutableTLSInterceptionPolicy?
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -274,7 +276,9 @@ final class TrafficConsoleViewModel: ObservableObject {
             InMemoryTrafficExternalHTTPProxyStore(),
         externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)? = nil,
         customFilterPresetStore: any TrafficCustomFilterPresetStoring =
-            InMemoryTrafficCustomFilterPresetStore()
+            InMemoryTrafficCustomFilterPresetStore(),
+        sslProxyingStore: any TrafficSSLProxyingStoring = InMemoryTrafficSSLProxyingStore(),
+        tlsInterceptionPolicySink: MutableTLSInterceptionPolicy? = nil
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -338,6 +342,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.externalHTTPProxyStore = externalHTTPProxyStore
         self.externalHTTPProxyCredentialStore = externalHTTPProxyCredentialStore
         self.customFilterPresetStore = customFilterPresetStore
+        self.sslProxyingStore = sslProxyingStore
+        self.tlsInterceptionPolicySink = tlsInterceptionPolicySink
         for domain in pinnedDomainsStore.domains {
             store.setPinnedDomain(domain, isPinned: true)
         }
@@ -368,6 +374,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         isPrepared = true
         capturePresentation = .recovering
         publishSnapshot()
+        tlsInterceptionPolicySink?.replace(sslProxyingStore.policy)
 
         do {
             try await captureController.recoverInterruptedCapture()
@@ -693,6 +700,105 @@ final class TrafficConsoleViewModel: ObservableObject {
             configuresSystemProxy: captureConfiguration.configuresSystemProxy,
             bypassDomains: captureConfiguration.bypassDomains
         )
+    }
+
+    // SSL proxying list edits apply live, while capture is running — unlike the reverse
+    // proxy and listener settings above, there is no stopped-capture guard here.
+
+    func currentTLSInterceptionPolicy() -> TLSInterceptionPolicy {
+        sslProxyingStore.policy
+    }
+
+    /// Persists first and only publishes to the live capture policy on success, so a
+    /// rejected save (e.g. an oversized document) can never leave the running engine
+    /// out of sync with what is actually on disk.
+    func saveTLSInterceptionPolicy(_ policy: TLSInterceptionPolicy) throws {
+        try sslProxyingStore.save(policy)
+        tlsInterceptionPolicySink?.replace(policy)
+    }
+
+    func setTLSInterceptionMode(_ mode: TLSInterceptionMode) throws {
+        let current = sslProxyingStore.policy
+        try saveTLSInterceptionPolicy(
+            try TLSInterceptionPolicy(mode: mode, entries: current.entries)
+        )
+    }
+
+    func excludeHostFromTLSInterception(_ host: String) throws {
+        let current = sslProxyingStore.policy
+        switch current.mode {
+        case .interceptAllExcept:
+            guard !current.matches(host: host) else { return }
+            try saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: current.entries + [host])
+            )
+        case .interceptOnly:
+            let normalizedHost = normalizedHostForTLSInterceptionComparison(host)
+            let filteredEntries = current.entries.filter {
+                $0.caseInsensitiveCompare(normalizedHost) != .orderedSame
+            }
+            guard filteredEntries.count != current.entries.count else { return }
+            try saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: filteredEntries)
+            )
+        }
+    }
+
+    func interceptHostAgain(_ host: String) throws {
+        let current = sslProxyingStore.policy
+        switch current.mode {
+        case .interceptAllExcept:
+            let normalizedHost = normalizedHostForTLSInterceptionComparison(host)
+            let filteredEntries = current.entries.filter {
+                $0.caseInsensitiveCompare(normalizedHost) != .orderedSame
+            }
+            guard filteredEntries.count != current.entries.count else { return }
+            try saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: filteredEntries)
+            )
+        case .interceptOnly:
+            guard !current.matches(host: host) else { return }
+            try saveTLSInterceptionPolicy(
+                try TLSInterceptionPolicy(mode: current.mode, entries: current.entries + [host])
+            )
+        }
+    }
+
+    func isHostIntercepted(_ host: String) -> Bool {
+        sslProxyingStore.policy.shouldIntercept(host: host)
+    }
+
+    func hasExactTLSInterceptionEntry(_ host: String) -> Bool {
+        let normalizedHost = normalizedHostForTLSInterceptionComparison(host)
+        return sslProxyingStore.policy.entries.contains {
+            $0.caseInsensitiveCompare(normalizedHost) == .orderedSame
+        }
+    }
+
+    /// Mirrors only the trim/lowercase/de-bracket steps of `TLSInterceptionPolicy`'s
+    /// internal host normalization (not visible outside `ProxyLensCore`), not its
+    /// trailing-dot handling: unlike `TLSInterceptionPolicy.matches(host:)`, this does
+    /// not strip a single trailing dot, so `"api.example.com."` compares unequal to a
+    /// stored `"api.example.com"` entry here even though the two match as a policy. This
+    /// is benign for its callers (`excludeHostFromTLSInterception`, `interceptHostAgain`,
+    /// `hasExactTLSInterceptionEntry`), but for two different reasons depending on which
+    /// branch a trailing-dot host reaches: where this comparison is the only thing
+    /// guarding a "remove one host from a wildcard-covered exclusion/inclusion" edit
+    /// (interceptOnly's "Don't Intercept", interceptAllExcept's "Intercept"), the mismatch
+    /// falls through to the no-op guard already in place for "no matching entry," which is
+    /// also what disables that context-menu item. Where the mode itself already permits
+    /// the edit (interceptAllExcept's "Don't Intercept", interceptOnly's "Intercept" for an
+    /// unlisted host), the item stays enabled and the edit succeeds anyway, because
+    /// `TLSInterceptionPolicy.init` normalizes the trailing dot away when the new entry is
+    /// actually stored — this helper never enters into that path. This also does not
+    /// reproduce full validation — entries reaching this comparison are already valid,
+    /// having been normalized and checked when they were saved.
+    private func normalizedHostForTLSInterceptionComparison(_ host: String) -> String {
+        var normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.hasPrefix("["), normalized.hasSuffix("]") {
+            normalized = String(normalized.dropFirst().dropLast())
+        }
+        return normalized
     }
 
     func renameSession(_ sessionID: SessionID, to name: String?) async throws {

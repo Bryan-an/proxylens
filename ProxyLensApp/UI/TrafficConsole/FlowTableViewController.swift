@@ -47,6 +47,13 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
 
         let menu = NSMenu()
         menu.delegate = self
+        // Several items in menuNeedsUpdate(_:) assign `isEnabled` explicitly (the SSL
+        // proxying "Intercept"/"Don't Intercept" pair, "Compare Selected Flows…"). With
+        // automatic enabling left on, AppKit re-validates every item once the delegate has
+        // populated the menu and force-enables any item whose target responds to its
+        // action — since `ruleMenuItem` always sets `target = self`, that silently
+        // overwrites a manual `isEnabled = false` right before the menu is drawn.
+        menu.autoenablesItems = false
         tableView.menu = menu
 
         for column in FlowColumn.allCases {
@@ -352,6 +359,36 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
                 action: #selector(dnsSpoof)
             )
         )
+        if viewModel.isHostIntercepted(host) {
+            let excludeItem = ruleMenuItem(
+                title: "Don't Intercept \(host)",
+                host: host,
+                action: #selector(excludeHostFromSSLProxying)
+            )
+            // In .interceptOnly mode a host intercepted only through a wildcard entry
+            // cannot be excluded one host at a time; the SSL Proxying List sheet is
+            // where that entry is edited.
+            excludeItem.isEnabled =
+                viewModel.currentTLSInterceptionPolicy().mode == .interceptAllExcept
+                || viewModel.hasExactTLSInterceptionEntry(host)
+            menu.addItem(excludeItem)
+        } else {
+            let interceptItem = ruleMenuItem(
+                title: "Intercept \(host)",
+                host: host,
+                action: #selector(interceptHostAgain)
+            )
+            // In .interceptAllExcept mode a host excluded only by a wildcard entry
+            // cannot be re-included one host at a time; the SSL Proxying List sheet is
+            // where that entry is edited. In .interceptOnly mode this branch only ever
+            // reaches an unlisted host (no entry, exact or wildcard, covers it), so
+            // "Intercept" always means a well-defined "add a new exact entry" and must
+            // stay enabled.
+            interceptItem.isEnabled =
+                viewModel.currentTLSInterceptionPolicy().mode == .interceptOnly
+                || viewModel.hasExactTLSInterceptionEntry(host)
+            menu.addItem(interceptItem)
+        }
         let networkConditionsItem = NSMenuItem(
             title: "Network Conditions",
             action: nil,
@@ -905,6 +942,32 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         }
         Task { @MainActor in
             await promptDNSSpoof(host: host)
+        }
+    }
+
+    @objc private func excludeHostFromSSLProxying(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        Task { @MainActor in
+            do {
+                try viewModel.excludeHostFromTLSInterception(host)
+            } catch {
+                await presentError(error)
+            }
+        }
+    }
+
+    @objc private func interceptHostAgain(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else {
+            return
+        }
+        Task { @MainActor in
+            do {
+                try viewModel.interceptHostAgain(host)
+            } catch {
+                await presentError(error)
+            }
         }
     }
 

@@ -19,6 +19,7 @@ final class TrafficConsoleViewController: NSViewController {
     private let composeButton = NSButton()
     private let importButton = NSButton()
     private let reverseProxyButton = NSButton()
+    private let sslProxyingButton = NSButton()
     private let rulesButton = NSButton()
     private let certificateButton = NSButton()
     private let sourceToggleButton = NSButton()
@@ -153,6 +154,20 @@ final class TrafficConsoleViewController: NSViewController {
         reverseProxyButton.setAccessibilityIdentifier("reverseProxy.manage")
         reverseProxyButton.setAccessibilityLabel("Manage Proxy Listeners")
 
+        sslProxyingButton.translatesAutoresizingMaskIntoConstraints = false
+        sslProxyingButton.image = NSImage(
+            systemSymbolName: "lock.open",
+            accessibilityDescription: "SSL Proxying List"
+        )
+        sslProxyingButton.imagePosition = .imageOnly
+        sslProxyingButton.bezelStyle = .texturedRounded
+        sslProxyingButton.isBordered = false
+        sslProxyingButton.target = self
+        sslProxyingButton.action = #selector(showSSLProxying)
+        sslProxyingButton.toolTip = "SSL Proxying List"
+        sslProxyingButton.setAccessibilityIdentifier("sslProxying.manage")
+        sslProxyingButton.setAccessibilityLabel("Manage SSL Proxying List")
+
         rulesButton.translatesAutoresizingMaskIntoConstraints = false
         rulesButton.image = NSImage(
             systemSymbolName: "slider.horizontal.3",
@@ -181,6 +196,7 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(statusImage)
         header.addSubview(statusField)
         header.addSubview(reverseProxyButton)
+        header.addSubview(sslProxyingButton)
         header.addSubview(rulesButton)
         header.addSubview(importButton)
         header.addSubview(composeButton)
@@ -204,10 +220,15 @@ final class TrafficConsoleViewController: NSViewController {
             statusField.trailingAnchor.constraint(
                 lessThanOrEqualTo: reverseProxyButton.leadingAnchor, constant: -12),
             reverseProxyButton.trailingAnchor.constraint(
-                equalTo: rulesButton.leadingAnchor, constant: -8),
+                equalTo: sslProxyingButton.leadingAnchor, constant: -8),
             reverseProxyButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             reverseProxyButton.widthAnchor.constraint(equalToConstant: 28),
             reverseProxyButton.heightAnchor.constraint(equalToConstant: 28),
+            sslProxyingButton.trailingAnchor.constraint(
+                equalTo: rulesButton.leadingAnchor, constant: -8),
+            sslProxyingButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            sslProxyingButton.widthAnchor.constraint(equalToConstant: 28),
+            sslProxyingButton.heightAnchor.constraint(equalToConstant: 28),
             rulesButton.trailingAnchor.constraint(
                 equalTo: importButton.leadingAnchor, constant: -8),
             rulesButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -502,6 +523,17 @@ final class TrafficConsoleViewController: NSViewController {
 
     @objc private func showReverseProxy() {
         let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else {
+                return
+            }
+            self.dismiss(controller)
+        }
+        presentAsSheet(controller)
+    }
+
+    @objc private func showSSLProxying() {
+        let controller = SSLProxyingManagerViewController(viewModel: viewModel)
         controller.onClose = { [weak self, weak controller] in
             guard let self, let controller else {
                 return

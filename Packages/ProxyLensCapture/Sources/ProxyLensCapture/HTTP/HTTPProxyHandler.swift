@@ -28,6 +28,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private let reverseProxyRoute: ReverseProxyRoute?
     private let externalHTTPProxyRoute: ExternalHTTPProxyRoute?
     private let ruleSnapshot: (any RuleSnapshotSource)?
+    private let tlsInterceptionPolicy: (any TLSInterceptionPolicySource)?
     private let scriptExecutor: (any ScriptExecutor)?
     private let breakpointGate: any BreakpointGate
     private let flowSource: FlowSource
@@ -41,7 +42,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     private var responseStarted = false
     private var transaction: FlowTransaction?
     private var pendingConnectTarget: ConnectTarget?
-    private var isPreparingTLSIntercept = false
+    private var pendingConnectIsPassthrough = false
+    private var isPreparingConnectTunnel = false
     private var requestBodyRecorder: StreamingBodyRecorder?
     private var requestBodyWriteTask: Task<Void, Error>?
     private var captureWritesInFlight = 0
@@ -80,6 +82,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         reverseProxyRoute: ReverseProxyRoute? = nil,
         externalHTTPProxyRoute: ExternalHTTPProxyRoute? = nil,
         ruleSnapshot: (any RuleSnapshotSource)? = nil,
+        tlsInterceptionPolicy: (any TLSInterceptionPolicySource)? = nil,
         scriptExecutor: (any ScriptExecutor)? = nil,
         breakpointGate: any BreakpointGate = ImmediateBreakpointGate(),
         flowSource: FlowSource = .desktopProxy
@@ -102,6 +105,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.reverseProxyRoute = reverseProxyRoute
         self.externalHTTPProxyRoute = externalHTTPProxyRoute
         self.ruleSnapshot = ruleSnapshot
+        self.tlsInterceptionPolicy = tlsInterceptionPolicy
         self.scriptExecutor = scriptExecutor
         self.breakpointGate = breakpointGate
         self.flowSource = flowSource
@@ -667,30 +671,9 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             return
         }
 
-        guard interceptHTTPS else {
-            sendError(
-                statusCode: 501,
-                reason: "Not Implemented",
-                message: "HTTPS interception is disabled for this proxy listener.",
-                context: context
-            )
-            return
-        }
-
-        guard certificateProvider != nil, upstreamTLSContext != nil else {
-            sendError(
-                statusCode: 503,
-                reason: "Service Unavailable",
-                message: "HTTPS interception is not configured.",
-                context: context
-            )
-            return
-        }
-
+        let target: ConnectTarget
         do {
-            let target = try ConnectTarget(authority: head.uri)
-            requestHead = head
-            pendingConnectTarget = target
+            target = try ConnectTarget(authority: head.uri)
         } catch {
             sendError(
                 statusCode: 400,
@@ -698,14 +681,33 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 message: error.localizedDescription,
                 context: context
             )
+            return
         }
+
+        let policy = tlsInterceptionPolicy?.currentPolicy() ?? TLSInterceptionPolicy()
+        let wantsInterception = interceptHTTPS && policy.shouldIntercept(host: target.host)
+        if wantsInterception {
+            guard certificateProvider != nil, upstreamTLSContext != nil else {
+                sendError(
+                    statusCode: 503,
+                    reason: "Service Unavailable",
+                    message: "HTTPS interception is not configured.",
+                    context: context
+                )
+                return
+            }
+        }
+
+        requestHead = head
+        pendingConnectTarget = target
+        pendingConnectIsPassthrough = !wantsInterception
     }
 
     private func beginTLSIntercept(target: ConnectTarget, context: ChannelHandlerContext) {
-        guard !isPreparingTLSIntercept, let certificateProvider, let upstreamTLSContext else {
+        guard !isPreparingConnectTunnel, let certificateProvider, let upstreamTLSContext else {
             return
         }
-        isPreparingTLSIntercept = true
+        isPreparingConnectTunnel = true
 
         let channel = context.channel
         channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
@@ -810,6 +812,141 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         )
     }
 
+    private func makeTunnelFlowTransaction(target: ConnectTarget) -> FlowTransaction? {
+        guard
+            let flow = TunnelPassthrough.makeFlow(
+                sessionID: sessionID,
+                source: flowSource,
+                target: target
+            )
+        else {
+            return nil
+        }
+        return FlowTransaction(flow: flow, eventSink: eventSink)
+    }
+
+    private func beginTunnelPassthrough(target: ConnectTarget, context: ChannelHandlerContext) {
+        guard !isPreparingConnectTunnel else { return }
+        isPreparingConnectTunnel = true
+
+        let channel = context.channel
+        channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
+            channel.close(promise: nil)
+        }
+
+        // `ConnectTarget.init` already validates host and port the same way the URL built
+        // in `TunnelPassthrough.makeFlow` does, so a `nil` transaction here is unreachable
+        // in practice — this is a defensive fallback, not a real "no flow recorded" path.
+        let transaction = makeTunnelFlowTransaction(target: target)
+        self.transaction = transaction
+        if let transaction {
+            // This Task, `clientRelay`'s `onClose` Task below (`finishResponse`), and
+            // `spliceTunnel`'s success-case Task (`markUpstreamConnected`) all target this
+            // same `transaction` from independent, unstructured `Task {}`s with no ordering
+            // guarantee relative to one another. Every interleaving still ends the flow
+            // correctly: `FlowTransaction.start` only acts while the flow is still
+            // `.created`, and `finishResponse` defers completion until the request side has
+            // also finished — so whichever of these three lands first, the flow still
+            // reaches exactly one terminal event.
+            Task {
+                await transaction.start(at: Date())
+                await transaction.finishRequestBody(nil, at: Date())
+            }
+        }
+
+        let clientRelay = TunnelRelayHandler(onClose: { [transaction] in
+            guard let transaction else { return }
+            Task { await transaction.finishResponse(nil, at: Date()) }
+        })
+
+        let loopBoundSelf = NIOLoopBound(self, eventLoop: channel.eventLoop)
+        let loopBoundClientRelay = NIOLoopBound(clientRelay, eventLoop: channel.eventLoop)
+        connectPassthroughUpstream(target: target, clientChannel: channel)
+            .whenComplete { result in
+                switch result {
+                case .success(let upstreamChannel):
+                    loopBoundSelf.value.spliceTunnel(
+                        clientChannel: channel,
+                        upstreamChannel: upstreamChannel,
+                        clientRelay: loopBoundClientRelay.value
+                    )
+                case .failure(let error):
+                    // A bare close leaves an HTTP client's response parser waiting
+                    // forever, since nothing signals that the CONNECT failed — write the
+                    // same Bad Gateway response every other upstream-connect failure
+                    // path in this handler already sends.
+                    loopBoundSelf.value.handleUpstreamFailure(error, clientChannel: channel)
+                }
+            }
+    }
+
+    /// Dials the origin (or the external proxy's CONNECT tunnel) with no TLS and no HTTP
+    /// handlers — the channel must carry raw bytes only.
+    private func connectPassthroughUpstream(
+        target: ConnectTarget,
+        clientChannel: Channel
+    ) -> EventLoopFuture<Channel> {
+        let eventLoop = clientChannel.eventLoop
+        if let externalHTTPProxyRoute, externalHTTPProxyRoute.shouldProxy(host: target.host) {
+            let connectBytes = externalHTTPProxyRoute.connectRequestBytes(
+                host: target.host,
+                port: target.port,
+                allocator: clientChannel.allocator
+            )
+            let readyPromise = eventLoop.makePromise(of: Channel.self)
+            let proxyEndpoint = externalHTTPProxyRoute.endpoint
+            ClientBootstrap(group: eventLoop)
+                .channelInitializer { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations.addHandler(
+                            HTTPUpstreamProxyConnectHandler(
+                                request: connectBytes,
+                                readyPromise: readyPromise,
+                                configureTunnel: { channel in
+                                    // Autoread stays on through the CONNECT handshake so
+                                    // `HTTPUpstreamProxyConnectHandler` can read the proxy's
+                                    // response; it must be off again before this future
+                                    // completes, or the origin's first bytes can arrive
+                                    // before `spliceTunnel` has installed the relay handler.
+                                    channel.setOption(ChannelOptions.autoRead, value: false)
+                                }
+                            )
+                        )
+                    }
+                }
+                .connect(host: proxyEndpoint.host, port: Int(proxyEndpoint.port))
+                .whenFailure { readyPromise.fail($0) }
+            return readyPromise.futureResult
+        }
+
+        // No handler is ever installed on the direct-dial path before `spliceTunnel`, so
+        // autoRead must start off — otherwise a server-first origin (SMTP, IMAP, SSH) can
+        // write its banner before the relay handler exists to catch it.
+        return ClientBootstrap(group: eventLoop)
+            .channelOption(ChannelOptions.autoRead, value: false)
+            .connect(host: target.host, port: target.port)
+    }
+
+    private func spliceTunnel(
+        clientChannel: Channel,
+        upstreamChannel: Channel,
+        clientRelay: TunnelRelayHandler
+    ) {
+        TunnelPassthrough.splice(
+            clientChannel: clientChannel,
+            upstreamChannel: upstreamChannel,
+            clientRelay: clientRelay,
+            transaction: transaction,
+            prelude: {
+                HTTPServerPipeline.removePlaintextHTTPHandlers(from: clientChannel).flatMap {
+                    var response = clientChannel.allocator.buffer(capacity: 39)
+                    response.writeString("HTTP/1.1 200 Connection Established\r\n\r\n")
+                    return clientChannel.writeAndFlush(response)
+                }
+            }
+        )
+    }
+
     private func receiveRequestBody(_ buffer: inout ByteBuffer, context: ChannelHandlerContext) {
         if didFinishLocally {
             return
@@ -859,7 +996,11 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         context: ChannelHandlerContext
     ) {
         if let target = pendingConnectTarget {
-            beginTLSIntercept(target: target, context: context)
+            if pendingConnectIsPassthrough {
+                beginTunnelPassthrough(target: target, context: context)
+            } else {
+                beginTLSIntercept(target: target, context: context)
+            }
             return
         }
         if didFinishLocally {
