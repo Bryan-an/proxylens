@@ -54,48 +54,21 @@ public struct ProxyConfiguration: Codable, Equatable, Hashable, Sendable {
     public let reverseProxyRoutes: [ReverseProxyRoute]
     public let socks5Listener: SOCKS5ListenerConfiguration?
     public let externalHTTPProxy: ExternalHTTPProxyConfiguration?
+    public let remoteAccess: RemoteAccessConfiguration
 
     public init(
         listenEndpoint: NetworkEndpoint,
         interceptHTTPS: Bool = true,
-        reverseProxyRoutes: [ReverseProxyRoute] = []
+        reverseProxyRoutes: [ReverseProxyRoute] = [],
+        remoteAccess: RemoteAccessConfiguration = .disabled
     ) {
         self.init(
             listenEndpoint: listenEndpoint,
             interceptHTTPS: interceptHTTPS,
             reverseProxyRoutes: reverseProxyRoutes,
             socks5Listener: nil,
-            externalHTTPProxy: nil
-        )
-    }
-
-    public init(
-        listenEndpoint: NetworkEndpoint,
-        interceptHTTPS: Bool = true,
-        reverseProxyRoutes: [ReverseProxyRoute] = [],
-        socks5Listener: SOCKS5ListenerConfiguration?
-    ) {
-        self.init(
-            listenEndpoint: listenEndpoint,
-            interceptHTTPS: interceptHTTPS,
-            reverseProxyRoutes: reverseProxyRoutes,
-            socks5Listener: socks5Listener,
-            externalHTTPProxy: nil
-        )
-    }
-
-    public init(
-        listenEndpoint: NetworkEndpoint,
-        interceptHTTPS: Bool = true,
-        reverseProxyRoutes: [ReverseProxyRoute] = [],
-        externalHTTPProxy: ExternalHTTPProxyConfiguration?
-    ) {
-        self.init(
-            listenEndpoint: listenEndpoint,
-            interceptHTTPS: interceptHTTPS,
-            reverseProxyRoutes: reverseProxyRoutes,
-            socks5Listener: nil,
-            externalHTTPProxy: externalHTTPProxy
+            externalHTTPProxy: nil,
+            remoteAccess: remoteAccess
         )
     }
 
@@ -104,13 +77,57 @@ public struct ProxyConfiguration: Codable, Equatable, Hashable, Sendable {
         interceptHTTPS: Bool = true,
         reverseProxyRoutes: [ReverseProxyRoute] = [],
         socks5Listener: SOCKS5ListenerConfiguration?,
-        externalHTTPProxy: ExternalHTTPProxyConfiguration?
+        remoteAccess: RemoteAccessConfiguration = .disabled
+    ) {
+        self.init(
+            listenEndpoint: listenEndpoint,
+            interceptHTTPS: interceptHTTPS,
+            reverseProxyRoutes: reverseProxyRoutes,
+            socks5Listener: socks5Listener,
+            externalHTTPProxy: nil,
+            remoteAccess: remoteAccess
+        )
+    }
+
+    public init(
+        listenEndpoint: NetworkEndpoint,
+        interceptHTTPS: Bool = true,
+        reverseProxyRoutes: [ReverseProxyRoute] = [],
+        externalHTTPProxy: ExternalHTTPProxyConfiguration?,
+        remoteAccess: RemoteAccessConfiguration = .disabled
+    ) {
+        self.init(
+            listenEndpoint: listenEndpoint,
+            interceptHTTPS: interceptHTTPS,
+            reverseProxyRoutes: reverseProxyRoutes,
+            socks5Listener: nil,
+            externalHTTPProxy: externalHTTPProxy,
+            remoteAccess: remoteAccess
+        )
+    }
+
+    public init(
+        listenEndpoint: NetworkEndpoint,
+        interceptHTTPS: Bool = true,
+        reverseProxyRoutes: [ReverseProxyRoute] = [],
+        socks5Listener: SOCKS5ListenerConfiguration?,
+        externalHTTPProxy: ExternalHTTPProxyConfiguration?,
+        remoteAccess: RemoteAccessConfiguration = .disabled
     ) {
         self.listenEndpoint = listenEndpoint
         self.interceptHTTPS = interceptHTTPS
         self.reverseProxyRoutes = reverseProxyRoutes
         self.socks5Listener = socks5Listener
         self.externalHTTPProxy = externalHTTPProxy
+        self.remoteAccess = remoteAccess
+    }
+
+    /// The address the forward listener binds.
+    ///
+    /// Remote access widens only this listener. Reverse-proxy and SOCKS5 listeners keep
+    /// their own configured loopback endpoints.
+    public var forwardListenHost: String {
+        remoteAccess.isEnabled ? RemoteAccessConfiguration.anyIPv4Host : listenEndpoint.host
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -119,6 +136,7 @@ public struct ProxyConfiguration: Codable, Equatable, Hashable, Sendable {
         case reverseProxyRoutes
         case socks5Listener
         case externalHTTPProxy
+        case remoteAccess
     }
 
     public init(from decoder: Decoder) throws {
@@ -137,7 +155,11 @@ public struct ProxyConfiguration: Codable, Equatable, Hashable, Sendable {
             externalHTTPProxy: try container.decodeIfPresent(
                 ExternalHTTPProxyConfiguration.self,
                 forKey: .externalHTTPProxy
-            )
+            ),
+            remoteAccess: try container.decodeIfPresent(
+                RemoteAccessConfiguration.self,
+                forKey: .remoteAccess
+            ) ?? .disabled
         )
         try validateListeners()
     }
