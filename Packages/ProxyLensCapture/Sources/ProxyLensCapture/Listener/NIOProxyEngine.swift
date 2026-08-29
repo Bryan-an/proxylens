@@ -22,6 +22,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
     private let scriptExecutor: (any ScriptExecutor)?
     private let breakpointGate: any BreakpointGate
     private let flowSourceResolver: any FlowSourceResolver
+    private let remoteAccessGate: any RemoteAccessGate
     private let externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)?
     private let webSocketConnections = NIOWebSocketConnectionRegistry()
 
@@ -48,6 +49,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
         scriptExecutor: (any ScriptExecutor)? = nil,
         breakpointGate: any BreakpointGate = ImmediateBreakpointGate(),
         flowSourceResolver: any FlowSourceResolver = UnknownFlowSourceResolver(),
+        remoteAccessGate: any RemoteAccessGate = AllowAllRemoteAccessGate(),
         externalHTTPProxyCredentialStore: (any ExternalHTTPProxyCredentialStoring)? = nil
     ) {
         self.eventLoopThreadCount = max(1, eventLoopThreads)
@@ -69,6 +71,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
         self.scriptExecutor = scriptExecutor
         self.breakpointGate = breakpointGate
         self.flowSourceResolver = flowSourceResolver
+        self.remoteAccessGate = remoteAccessGate
         self.externalHTTPProxyCredentialStore = externalHTTPProxyCredentialStore
     }
 
@@ -123,6 +126,7 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
         )
         self.upstreamHTTP2Pool = upstreamHTTP2Pool
         let interceptHTTPS = configuration.interceptHTTPS
+        let remoteAccessEnabled = configuration.remoteAccess.isEnabled
 
         func makeBootstrap(reverseProxyRoute: ReverseProxyRoute?) -> ServerBootstrap {
             ServerBootstrap(group: group)
@@ -147,30 +151,50 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
                         scriptExecutor,
                         breakpointGate,
                         flowSourceResolver,
+                        remoteAccessGate,
                         reverseProxyRoute,
                         externalHTTPProxyRoute
                     ] channel in
-                    let sourceFuture: EventLoopFuture<FlowSource>
+                    // A `nil` source means the gate refused this client: the channel is
+                    // closed before any application byte is read.
+                    let admissionFuture: EventLoopFuture<FlowSource?>
                     if let clientEndpoint = Self.endpoint(channel.remoteAddress),
                         let proxyEndpoint = Self.endpoint(channel.localAddress)
                     {
-                        sourceFuture = channel.eventLoop.makeFutureWithTask {
-                            await flowSourceResolver.resolveSource(
+                        admissionFuture = channel.eventLoop.makeFutureWithTask {
+                            if reverseProxyRoute == nil {
+                                let client = RemoteAccessClient(
+                                    address: clientEndpoint.host,
+                                    port: clientEndpoint.port
+                                )
+                                guard await remoteAccessGate.authorize(client) == .allow else {
+                                    return nil
+                                }
+                            }
+                            return await flowSourceResolver.resolveSource(
                                 clientEndpoint: clientEndpoint,
                                 proxyEndpoint: proxyEndpoint
                             )
                         }
+                    } else if reverseProxyRoute == nil, remoteAccessEnabled {
+                        // An unidentifiable peer cannot be authorized, so fail closed while
+                        // the listener is reachable from the network.
+                        admissionFuture = channel.eventLoop.makeSucceededFuture(nil)
                     } else {
-                        sourceFuture = channel.eventLoop.makeSucceededFuture(.desktopProxy)
+                        admissionFuture = channel.eventLoop.makeSucceededFuture(.desktopProxy)
                     }
-                    return sourceFuture.map { flowSource in
-                        guard let reverseProxyRoute else { return flowSource }
+                    return admissionFuture.map { admitted -> FlowSource? in
+                        guard let admitted, let reverseProxyRoute else { return admitted }
                         return FlowSource.reverseProxy(
                             name: reverseProxyRoute.name,
-                            clientAddress: flowSource.clientAddress,
-                            application: flowSource.application
+                            clientAddress: admitted.clientAddress,
+                            application: admitted.application
                         )
-                    }.flatMapThrowing { flowSource in
+                    }.flatMapThrowing { admitted in
+                        guard let flowSource = admitted else {
+                            channel.close(promise: nil)
+                            return
+                        }
                         try HTTPServerPipeline.install(
                             on: channel,
                             handler: HTTPProxyHandler(
@@ -277,14 +301,14 @@ public actor NIOProxyEngine: ProxyEngine, WebSocketFrameTransmitter {
 
         do {
             let channel = try await makeBootstrap(reverseProxyRoute: nil).bind(
-                host: configuration.listenEndpoint.host,
+                host: configuration.forwardListenHost,
                 port: Int(configuration.listenEndpoint.port)
             ).get()
             serverChannel = channel
 
             let forwardEndpoint = try Self.boundEndpoint(
                 channel,
-                fallbackHost: configuration.listenEndpoint.host
+                fallbackHost: configuration.forwardListenHost
             )
             if let socks5Listener = configuration.socks5Listener,
                 socks5Listener.isEnabled
