@@ -51,6 +51,11 @@ P2 is an authorized expansion milestone after the relevant P0/P1 foundations:
 
 - Mobile capture, transparent/VPN routing, HTTP/3/QUIC, cloud sync, collaboration, team accounts, hosted telemetry, MCP/Raycast integrations, and App Store distribution.
 
+Remote device onboarding was pulled forward from that P2 line by explicit decision: a device on the
+local network can point at the forward listener, be admitted by the user, and install the CA from a
+local page. It adds no Network Extension, no VPN, and no second target — on-device capture is still
+P2 and still deferred.
+
 P0, P1, and P2 are all in product scope. Preserve the staged dependency order and land thin,
 tested vertical slices rather than mixing unrelated milestone work into one change.
 
@@ -195,6 +200,10 @@ Keep matching and rule planning deterministic and side-effect-free in core. Put 
 - If a privileged helper becomes necessary, make it a separate signed target with a narrow XPC interface; do not move the whole proxy into it.
 - Bound body sizes, decompression, decoded output, retained history, and diagnostics exports.
 - Do not add Network Extension, mobile entitlements, or cloud authentication to P0.
+- Only the forward listener may bind beyond loopback, only while the user has enabled remote access,
+  and only with every non-loopback client admitted through `RemoteAccessGate`. Reverse-proxy and
+  SOCKS5 listeners stay loopback-only.
+- Serve the public root certificate to devices; never the root private key.
 
 ## Testing and verification
 
@@ -230,7 +239,9 @@ When code exists:
 7. Add filters, Map Local, Map Remote, Breakpoint, Block/Allow, and no-cache.
 8. Add HAR/cURL export and signed/notarized packaging.
 
-Defer HTTP/2, HTTP/3, mobile/VPN capture, scripting, cloud, collaboration, and team features until P0 is reliable or the user explicitly changes the roadmap.
+Defer HTTP/3, mobile/VPN capture, cloud, collaboration, and team features until P0 is reliable or
+the user explicitly changes the roadmap. Remote device onboarding is such a change and has landed;
+on-device capture has not.
 
 ## Working agreements
 

@@ -36,6 +36,8 @@ xcodebuild ... -only-testing:ProxyLensIntegrationTests/ProxyLensIntegrationTests
 
 Manual HTTPS check once capture is running and the CA is trusted (**Trust HTTPS Certificate…** in the app): `curl -x http://127.0.0.1:9090 https://example.com/`.
 
+Remote device onboarding is only partly covered by tests: binding beyond loopback is not exercised automatically, because a test that binds `0.0.0.0` can trip the macOS application firewall and hang the gate. Verify it by hand with **Remote Devices** enabled and capture running: `curl http://<lan-ip>:9090/proxylens.crt | openssl x509 -inform der -noout -subject` from another machine, then `curl -x http://<lan-ip>:9090 http://example.com/` and approve the device in the console's approval bar.
+
 ## Architecture
 
 Modular monolith, ports and adapters. `ProxyLensCore` declares domain types plus the `Ports/` protocols; `ProxyLensApplication` owns use cases and actors; `ProxyLensCapture`, `ProxyLensPersistence`, and `ProxyLensPlatform` implement the ports; `ProxyLensApp` is the only place that knows about all of them.
