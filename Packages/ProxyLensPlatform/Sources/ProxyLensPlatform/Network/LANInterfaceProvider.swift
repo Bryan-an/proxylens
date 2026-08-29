@@ -96,7 +96,12 @@ public enum LANInterfaceProvider {
         guard status == 0 else {
             return nil
         }
-        let address = String(cString: host)
+        let address = host.withUnsafeBufferPointer { buffer -> String in
+            guard let base = buffer.baseAddress else {
+                return ""
+            }
+            return String(cString: base)
+        }
         return address.isEmpty ? nil : address
     }
 }

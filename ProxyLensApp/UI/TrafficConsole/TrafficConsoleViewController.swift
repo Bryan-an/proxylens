@@ -20,12 +20,15 @@ final class TrafficConsoleViewController: NSViewController {
     private let importButton = NSButton()
     private let reverseProxyButton = NSButton()
     private let sslProxyingButton = NSButton()
+    private let remoteDevicesButton = NSButton()
     private let rulesButton = NSButton()
     private let certificateButton = NSButton()
     private let sourceToggleButton = NSButton()
     private let statusImage = NSImageView()
     private let statusField = NSTextField(labelWithString: "Preparing capture…")
     private lazy var filterBar = TrafficFilterBar(viewModel: viewModel)
+    private lazy var approvalBar = RemoteDeviceApprovalBar(viewModel: viewModel)
+    private lazy var approvalBarHeight = approvalBar.heightAnchor.constraint(equalToConstant: 0)
     private lazy var inspectorSplitViewItem: NSSplitViewItem = {
         let item = NSSplitViewItem(viewController: inspectorController)
         item.minimumThickness = 240
@@ -168,6 +171,20 @@ final class TrafficConsoleViewController: NSViewController {
         sslProxyingButton.setAccessibilityIdentifier("sslProxying.manage")
         sslProxyingButton.setAccessibilityLabel("Manage SSL Proxying List")
 
+        remoteDevicesButton.translatesAutoresizingMaskIntoConstraints = false
+        remoteDevicesButton.image = NSImage(
+            systemSymbolName: "iphone.gen3.radiowaves.left.and.right",
+            accessibilityDescription: "Remote Devices"
+        )
+        remoteDevicesButton.imagePosition = .imageOnly
+        remoteDevicesButton.bezelStyle = .texturedRounded
+        remoteDevicesButton.isBordered = false
+        remoteDevicesButton.target = self
+        remoteDevicesButton.action = #selector(showRemoteDevices)
+        remoteDevicesButton.toolTip = "Remote Devices"
+        remoteDevicesButton.setAccessibilityIdentifier("remoteDevices.manage")
+        remoteDevicesButton.setAccessibilityLabel("Set up devices on this network")
+
         rulesButton.translatesAutoresizingMaskIntoConstraints = false
         rulesButton.image = NSImage(
             systemSymbolName: "slider.horizontal.3",
@@ -197,6 +214,7 @@ final class TrafficConsoleViewController: NSViewController {
         header.addSubview(statusField)
         header.addSubview(reverseProxyButton)
         header.addSubview(sslProxyingButton)
+        header.addSubview(remoteDevicesButton)
         header.addSubview(rulesButton)
         header.addSubview(importButton)
         header.addSubview(composeButton)
@@ -225,10 +243,15 @@ final class TrafficConsoleViewController: NSViewController {
             reverseProxyButton.widthAnchor.constraint(equalToConstant: 28),
             reverseProxyButton.heightAnchor.constraint(equalToConstant: 28),
             sslProxyingButton.trailingAnchor.constraint(
-                equalTo: rulesButton.leadingAnchor, constant: -8),
+                equalTo: remoteDevicesButton.leadingAnchor, constant: -8),
             sslProxyingButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             sslProxyingButton.widthAnchor.constraint(equalToConstant: 28),
             sslProxyingButton.heightAnchor.constraint(equalToConstant: 28),
+            remoteDevicesButton.trailingAnchor.constraint(
+                equalTo: rulesButton.leadingAnchor, constant: -8),
+            remoteDevicesButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            remoteDevicesButton.widthAnchor.constraint(equalToConstant: 28),
+            remoteDevicesButton.heightAnchor.constraint(equalToConstant: 28),
             rulesButton.trailingAnchor.constraint(
                 equalTo: importButton.leadingAnchor, constant: -8),
             rulesButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -266,6 +289,7 @@ final class TrafficConsoleViewController: NSViewController {
         container.addSubview(header)
         container.addSubview(headerSeparator)
         container.addSubview(filterBar)
+        container.addSubview(approvalBar)
         container.addSubview(separator)
         container.addSubview(splitView)
         NSLayoutConstraint.activate([
@@ -280,9 +304,15 @@ final class TrafficConsoleViewController: NSViewController {
             filterBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             filterBar.topAnchor.constraint(equalTo: headerSeparator.bottomAnchor),
             filterBar.heightAnchor.constraint(equalToConstant: 40),
+            approvalBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            approvalBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            approvalBar.topAnchor.constraint(equalTo: filterBar.bottomAnchor),
+            // A hidden view still occupies its constrained height, so the row is collapsed
+            // to zero while no device is waiting.
+            approvalBarHeight,
             separator.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            separator.topAnchor.constraint(equalTo: filterBar.bottomAnchor),
+            separator.topAnchor.constraint(equalTo: approvalBar.bottomAnchor),
             splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             splitView.topAnchor.constraint(equalTo: separator.bottomAnchor),
@@ -469,6 +499,8 @@ final class TrafficConsoleViewController: NSViewController {
             accessibilityDescription: presentation.status
         )
         filterBar.render(snapshot)
+        approvalBar.render(snapshot)
+        approvalBarHeight.constant = snapshot.remoteAccess.pendingApproval == nil ? 0 : 32
         captureButton.title = presentation.buttonTitle
         captureButton.isEnabled = presentation.buttonEnabled
         if case .failed = snapshot.capture {
@@ -523,6 +555,17 @@ final class TrafficConsoleViewController: NSViewController {
 
     @objc private func showReverseProxy() {
         let controller = ReverseProxyManagerViewController(viewModel: viewModel)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else {
+                return
+            }
+            self.dismiss(controller)
+        }
+        presentAsSheet(controller)
+    }
+
+    @objc private func showRemoteDevices() {
+        let controller = RemoteDeviceManagerViewController(viewModel: viewModel)
         controller.onClose = { [weak self, weak controller] in
             guard let self, let controller else {
                 return

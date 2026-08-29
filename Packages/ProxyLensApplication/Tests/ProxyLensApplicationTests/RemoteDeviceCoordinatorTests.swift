@@ -31,7 +31,7 @@ final class RemoteDeviceCoordinatorTests: XCTestCase {
         let coordinator = RemoteDeviceCoordinator()
         await coordinator.setRemoteAccessEnabled(true)
         let requests = RequestRecorder()
-        let stream = await coordinator.requests()
+        let stream = await coordinator.approvalChanges()
         let subscription = Task { await requests.consume(stream) }
 
         async let first = coordinator.authorize(
@@ -110,7 +110,7 @@ final class RemoteDeviceCoordinatorTests: XCTestCase {
         let coordinator = RemoteDeviceCoordinator()
         await coordinator.setRemoteAccessEnabled(true)
         let requests = RequestRecorder()
-        let stream = await coordinator.requests()
+        let stream = await coordinator.approvalChanges()
         let subscription = Task { await requests.consume(stream) }
 
         async let first = coordinator.authorize(
@@ -158,7 +158,7 @@ final class RemoteDeviceCoordinatorTests: XCTestCase {
         let coordinator = RemoteDeviceCoordinator()
         await coordinator.setRemoteAccessEnabled(true)
         let requests = RequestRecorder()
-        let stream = await coordinator.requests()
+        let stream = await coordinator.approvalChanges()
         let subscription = Task { await requests.consume(stream) }
 
         await coordinator.resolve(address: "192.168.1.8", approval: .allowOnce)
@@ -206,11 +206,21 @@ final class RemoteDeviceCoordinatorTests: XCTestCase {
 
 /// Collects the approval requests the coordinator publishes.
 private actor RequestRecorder {
-    private var requests: [RemoteAccessRequest] = []
+    private var changes: [RemoteAccessApprovalChange] = []
 
-    func consume(_ stream: AsyncStream<RemoteAccessRequest>) async {
-        for await request in stream {
-            requests.append(request)
+    func consume(_ stream: AsyncStream<RemoteAccessApprovalChange>) async {
+        for await change in stream {
+            changes.append(change)
+        }
+    }
+
+    /// Only the arrivals: a prompt shown to the user.
+    private var requests: [RemoteAccessRequest] {
+        changes.compactMap { change in
+            guard case .requested(let request) = change else {
+                return nil
+            }
+            return request
         }
     }
 

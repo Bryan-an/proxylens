@@ -98,6 +98,7 @@ enum TrafficSourceSelection: Equatable, Hashable, Sendable {
     case session(SessionID)
     case application(String)
     case domain(String)
+    case device(String)
 }
 
 struct TrafficSessionSummary: Equatable, Identifiable, Sendable {
@@ -114,6 +115,59 @@ struct TrafficApplicationSummary: Equatable, Identifiable, Sendable {
     let name: String
     let bundlePath: String?
     let flowCount: Int
+}
+
+struct TrafficRemoteDeviceSummary: Equatable, Identifiable, Sendable {
+    /// The device's address, which is also its identity.
+    let id: String
+    let name: String?
+    let isTrusted: Bool
+    let flowCount: Int
+
+    var displayName: String {
+        guard let name, !name.isEmpty else {
+            return id
+        }
+        return name
+    }
+}
+
+/// A device waiting for the user to admit it.
+struct TrafficRemoteDeviceApproval: Equatable, Sendable {
+    let address: String
+}
+
+struct TrafficRemoteAccessSnapshot: Equatable, Sendable {
+    let isEnabled: Bool
+    let listenPort: UInt16
+    /// The addresses of this Mac a device could be pointed at.
+    let addresses: [String]
+    let devices: [TrafficRemoteDeviceSummary]
+    let pendingApproval: TrafficRemoteDeviceApproval?
+
+    init(
+        isEnabled: Bool = false,
+        listenPort: UInt16 = 0,
+        addresses: [String] = [],
+        devices: [TrafficRemoteDeviceSummary] = [],
+        pendingApproval: TrafficRemoteDeviceApproval? = nil
+    ) {
+        self.isEnabled = isEnabled
+        self.listenPort = listenPort
+        self.addresses = addresses
+        self.devices = devices
+        self.pendingApproval = pendingApproval
+    }
+
+    static let disabled = TrafficRemoteAccessSnapshot()
+
+    /// The URL a device opens to install the certificate, using the first usable address.
+    var setupURL: String? {
+        guard let address = addresses.first, listenPort > 0 else {
+            return nil
+        }
+        return CertificateSetupPage.setupURL(proxyHost: address, proxyPort: listenPort)
+    }
 }
 
 struct TrafficDomainSummary: Equatable, Identifiable, Sendable {
@@ -792,6 +846,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
     let selectedFlowIDs: [FlowID]
     let selectedFlowID: FlowID?
     let inspection: TrafficFlowInspection
+    let remoteAccess: TrafficRemoteAccessSnapshot
 
     init(
         capture: TrafficCapturePresentation,
@@ -807,7 +862,8 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
         visibleRows: [TrafficFlowRow],
         selectedFlowIDs: [FlowID]? = nil,
         selectedFlowID: FlowID?,
-        inspection: TrafficFlowInspection
+        inspection: TrafficFlowInspection,
+        remoteAccess: TrafficRemoteAccessSnapshot = .disabled
     ) {
         self.capture = capture
         self.workspaceWarning = workspaceWarning
@@ -823,6 +879,7 @@ struct TrafficConsoleSnapshot: Equatable, Sendable {
         self.selectedFlowIDs = selectedFlowIDs ?? selectedFlowID.map { [$0] } ?? []
         self.selectedFlowID = selectedFlowID
         self.inspection = inspection
+        self.remoteAccess = remoteAccess
     }
 
     static let initial = TrafficConsoleSnapshot(
@@ -852,6 +909,7 @@ struct TrafficConsoleStore {
     private var applicationSummaries: [TrafficApplicationSummary] = []
     private var domainCounts: [String: Int] = [:]
     private var domainSummaries: [TrafficDomainSummary] = []
+    private var deviceCounts: [String: Int] = [:]
     private(set) var pinnedDomainHosts: Set<String> = []
     private var visibleRows: [TrafficFlowRow] = []
     private var visibleFlowIDs: Set<FlowID> = []
@@ -914,6 +972,7 @@ struct TrafficConsoleStore {
             domainProjectionChanged =
                 updateDomainCounts(previousFlow: previousFlow, currentFlow: flow)
                 || domainProjectionChanged
+            updateDeviceCounts(previousFlow: previousFlow, currentFlow: flow)
 
             let wasVisible = visibleFlowIDs.contains(flow.id)
             let isVisible = matchesCurrentProjection(flow)
@@ -977,6 +1036,7 @@ struct TrafficConsoleStore {
         applicationSummaries = []
         domainCounts = [:]
         domainSummaries = []
+        deviceCounts = [:]
         visibleRows = []
         visibleFlowIDs = []
         selectedFlowIDs = []
@@ -1079,7 +1139,8 @@ struct TrafficConsoleStore {
         capture: TrafficCapturePresentation,
         inspection: TrafficFlowInspection,
         workspaceWarning: String? = nil,
-        certificateTrust: CertificateTrustState? = nil
+        certificateTrust: CertificateTrustState? = nil,
+        remoteAccess: TrafficRemoteAccessSnapshot = .disabled
     ) -> TrafficConsoleSnapshot {
         TrafficConsoleSnapshot(
             capture: capture,
@@ -1100,7 +1161,8 @@ struct TrafficConsoleStore {
             visibleRows: visibleRows,
             selectedFlowIDs: orderedSelectedFlowIDs,
             selectedFlowID: selectedFlowID,
-            inspection: inspection
+            inspection: inspection,
+            remoteAccess: remoteAccess
         )
     }
 
@@ -1118,6 +1180,10 @@ struct TrafficConsoleStore {
             }
         case .domain(let host):
             guard TrafficFlowRow.host(for: flow) == host else {
+                return false
+            }
+        case .device(let address):
+            guard Self.deviceAddress(for: flow) == address else {
                 return false
             }
         }
@@ -1187,6 +1253,50 @@ struct TrafficConsoleStore {
         visibleRows = rebuiltRows
         visibleFlowIDs = Set(rebuiltRows.map(\.id))
         restoreVisibleOrder()
+    }
+
+    /// Flow counts per remote device, keyed by the device's address.
+    var deviceFlowCounts: [String: Int] {
+        deviceCounts
+    }
+
+    static func deviceAddress(for flow: Flow) -> String? {
+        guard flow.source.kind == .remoteDevice else {
+            return nil
+        }
+        return flow.source.label
+    }
+
+    private mutating func updateDeviceCounts(previousFlow: Flow?, currentFlow: Flow) {
+        let current = Self.deviceAddress(for: currentFlow)
+        guard let previousFlow else {
+            if let current {
+                deviceCounts[current, default: 0] += 1
+            }
+            return
+        }
+
+        let previous = Self.deviceAddress(for: previousFlow)
+        guard previous != current else {
+            return
+        }
+        if let previous {
+            decrementDeviceCount(previous)
+        }
+        if let current {
+            deviceCounts[current, default: 0] += 1
+        }
+    }
+
+    private mutating func decrementDeviceCount(_ address: String) {
+        guard let count = deviceCounts[address] else {
+            return
+        }
+        if count == 1 {
+            deviceCounts.removeValue(forKey: address)
+        } else {
+            deviceCounts[address] = count - 1
+        }
     }
 
     private mutating func updateDomainCounts(

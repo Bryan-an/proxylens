@@ -12,6 +12,14 @@ public struct RemoteAccessRequest: Equatable, Hashable, Sendable {
     }
 }
 
+/// A change to what is waiting for the user, so a console can show and then withdraw a
+/// prompt without polling. A request settles when it is answered, times out, or the session
+/// ends.
+public enum RemoteAccessApprovalChange: Equatable, Hashable, Sendable {
+    case requested(RemoteAccessRequest)
+    case settled(address: String)
+}
+
 /// What the user chose for a device asking to be admitted.
 public enum RemoteDeviceApproval: Equatable, Hashable, Sendable {
     /// Admit it until capture stops.
@@ -28,7 +36,7 @@ public enum RemoteDeviceApproval: Equatable, Hashable, Sendable {
 /// is admitted here rather than in the listener so the refusal path stays exercisable in
 /// tests, and so every admission decision is stated in one place.
 public actor RemoteDeviceCoordinator: RemoteAccessGate {
-    public typealias BufferingPolicy = AsyncStream<RemoteAccessRequest>.Continuation
+    public typealias BufferingPolicy = AsyncStream<RemoteAccessApprovalChange>.Continuation
         .BufferingPolicy
 
     private let store: any RemoteDeviceStore
@@ -38,7 +46,8 @@ public actor RemoteDeviceCoordinator: RemoteAccessGate {
     private var devicesByAddress: [String: RemoteDevice] = [:]
     private var sessionDecisions: [String: RemoteAccessDecision] = [:]
     private var pending: [String: PendingApproval] = [:]
-    private var subscriptions: [UUID: AsyncStream<RemoteAccessRequest>.Continuation] = [:]
+    private var subscriptions: [UUID: AsyncStream<RemoteAccessApprovalChange>.Continuation] =
+        [:]
     private var isRemoteAccessEnabled = false
     private var didLoadStoredDevices = false
 
@@ -147,12 +156,12 @@ public actor RemoteDeviceCoordinator: RemoteAccessGate {
         return devicesByAddress.values.sorted { $0.address < $1.address }
     }
 
-    public func requests(
+    public func approvalChanges(
         bufferingPolicy: BufferingPolicy = .bufferingNewest(32)
-    ) -> AsyncStream<RemoteAccessRequest> {
+    ) -> AsyncStream<RemoteAccessApprovalChange> {
         let subscriptionID = UUID()
         let (stream, continuation) = AsyncStream.makeStream(
-            of: RemoteAccessRequest.self,
+            of: RemoteAccessApprovalChange.self,
             bufferingPolicy: bufferingPolicy
         )
         subscriptions[subscriptionID] = continuation
@@ -164,7 +173,9 @@ public actor RemoteDeviceCoordinator: RemoteAccessGate {
 
         // A device that connected before the console subscribed is still waiting.
         for address in pending.keys.sorted() {
-            continuation.yield(RemoteAccessRequest(address: address, requestedAt: now()))
+            continuation.yield(
+                .requested(RemoteAccessRequest(address: address, requestedAt: now()))
+            )
         }
 
         return stream
@@ -197,7 +208,7 @@ public actor RemoteDeviceCoordinator: RemoteAccessGate {
             await self?.timeOut(address: address)
         }
         pending[address] = PendingApproval(continuations: [continuation], timeout: timeout)
-        publish(RemoteAccessRequest(address: address, requestedAt: now()))
+        publish(.requested(RemoteAccessRequest(address: address, requestedAt: now())))
     }
 
     /// An unanswered request is refused, but the silence is not recorded as a decision: the
@@ -214,11 +225,12 @@ public actor RemoteDeviceCoordinator: RemoteAccessGate {
         for continuation in approval.continuations {
             continuation.resume(returning: decision)
         }
+        publish(.settled(address: address))
     }
 
-    private func publish(_ request: RemoteAccessRequest) {
+    private func publish(_ change: RemoteAccessApprovalChange) {
         for continuation in subscriptions.values {
-            continuation.yield(request)
+            continuation.yield(change)
         }
     }
 

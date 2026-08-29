@@ -137,6 +137,23 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
                 )
             }
         )
+        let devices = SourceOutlineNode(
+            id: "devices",
+            title: "Devices",
+            count: snapshot.remoteAccess.devices.count,
+            countSingular: "device",
+            symbolName: "iphone.gen3",
+            selection: nil,
+            children: snapshot.remoteAccess.devices.map {
+                SourceOutlineNode(
+                    id: "device:\($0.id)",
+                    title: $0.displayName,
+                    count: $0.flowCount,
+                    symbolName: $0.isTrusted ? "checkmark.shield" : "iphone.gen3",
+                    selection: .device($0.id)
+                )
+            }
+        )
         roots = [allTraffic]
         if !sessions.children.isEmpty {
             roots.append(sessions)
@@ -145,6 +162,11 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
             roots.append(pinned)
         }
         roots.append(contentsOf: [applications, domains])
+        // Devices only appear once one has connected, so the sidebar stays as it was for a
+        // desktop-only session.
+        if !devices.children.isEmpty {
+            roots.append(devices)
+        }
         outlineView.reloadData()
         if !pinned.children.isEmpty {
             outlineView.expandItem(pinned)
@@ -154,6 +176,9 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
         }
         outlineView.expandItem(applications)
         outlineView.expandItem(domains)
+        if !devices.children.isEmpty {
+            outlineView.expandItem(devices)
+        }
 
         let nodes = roots.flatMap { root in
             [root] + root.children
