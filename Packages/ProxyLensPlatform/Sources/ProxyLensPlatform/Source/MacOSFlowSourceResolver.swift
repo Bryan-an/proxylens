@@ -40,7 +40,16 @@ public final class MacOSFlowSourceResolver: FlowSourceResolver, @unchecked Senda
         clientEndpoint: NetworkEndpoint,
         proxyEndpoint: NetworkEndpoint
     ) async -> FlowSource {
-        await withCheckedContinuation { continuation in
+        // A client on the local network has no process on this Mac, so the socket lookup
+        // would scan every process to find nothing.
+        guard NetworkAddress.isLoopback(clientEndpoint.host) else {
+            return FlowSource.remoteDevice(
+                address: clientEndpoint.host,
+                port: clientEndpoint.port
+            )
+        }
+
+        return await withCheckedContinuation { continuation in
             queue.async { [socketLocator, applicationInspector] in
                 let clientAddress = Self.address(clientEndpoint)
                 guard
