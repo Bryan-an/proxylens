@@ -45,6 +45,7 @@
 		9C01985BB4429DD4DD2E6DD8 /* ProxyLensCapture in Frameworks */ = {isa = PBXBuildFile; productRef = 20B4DE37BCA1F153F20E438A /* ProxyLensCapture */; };
 		A69F8681D48194E71BAD8819 /* TrafficSOCKS5ListenerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE27071A3CA1563BDE76A63 /* TrafficSOCKS5ListenerStore.swift */; };
 		A9EE2454BBDABAD6D60AD13D /* SSLProxyingManagerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C9FD9794324A67AB8F838E6 /* SSLProxyingManagerViewController.swift */; };
+		ADC2FBF743B88BB71D268B52 /* FlowTableScrollTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 229A3EEA4FF911C1BC980003 /* FlowTableScrollTests.swift */; };
 		B059A6F35C869D13265781B2 /* TrafficFilterBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEA75086146D4D5B75CE9C39 /* TrafficFilterBar.swift */; };
 		B1230416786F249A18B323FE /* WebSocketComposerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 154601C50BCE47AC5C6F619A /* WebSocketComposerViewController.swift */; };
 		B438B9E160B823649714C34A /* RemoteDeviceApprovalBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0987AEBCD1F634E6632127F /* RemoteDeviceApprovalBar.swift */; };
@@ -93,6 +94,7 @@
 		0E12CC40779A6FCE6502DDAF /* InspectorSyntaxHighlighter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InspectorSyntaxHighlighter.swift; sourceTree = "<group>"; };
 		122B2D73B54A8517A7900962 /* ReverseProxyManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReverseProxyManagerTests.swift; sourceTree = "<group>"; };
 		154601C50BCE47AC5C6F619A /* WebSocketComposerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSocketComposerViewController.swift; sourceTree = "<group>"; };
+		229A3EEA4FF911C1BC980003 /* FlowTableScrollTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowTableScrollTests.swift; sourceTree = "<group>"; };
 		2301F462EA5B6DF84A6E5963 /* RequestCodeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RequestCodeViewController.swift; sourceTree = "<group>"; };
 		24F1B0636038D75081A25CB1 /* TrafficConsoleModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficConsoleModels.swift; sourceTree = "<group>"; };
 		2E4484C00B16ECAD577547E7 /* ReverseProxyManagerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReverseProxyManagerViewController.swift; sourceTree = "<group>"; };
@@ -290,6 +292,7 @@
 		ADA7BF26DCA280261421A468 /* ProxyLensIntegrationTests */ = {
 			isa = PBXGroup;
 			children = (
+				229A3EEA4FF911C1BC980003 /* FlowTableScrollTests.swift */,
 				AD3F594423C38E94C9B9171B /* InspectorSyntaxHighlighterTests.swift */,
 				5331A527935610BDB492FE9C /* ProxyLensIntegrationTests.swift */,
 				A75E3220B8D710A469344805 /* RemoteDeviceOnboardingTests.swift */,
@@ -441,6 +444,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				ADC2FBF743B88BB71D268B52 /* FlowTableScrollTests.swift in Sources */,
 				F54AA97088095502C3ED139A /* InspectorSyntaxHighlighterTests.swift in Sources */,
 				02AA3E5CF2D3A84FDEDDA24C /* ProxyLensIntegrationTests.swift in Sources */,
 				75362247E3B434188D34A8AF /* RemoteDeviceOnboardingTests.swift in Sources */,
