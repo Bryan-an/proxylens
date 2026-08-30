@@ -427,9 +427,10 @@ address without changing that logical identity.
 
 The `@MainActor` route store owns the versioned local configuration document. UI changes are allowed
 only while capture is stopped or failed, and a validated route snapshot is injected into the next
-capture start. Listener addresses remain loopback-only to avoid silently exposing an unauthenticated
-debugging proxy to the LAN; local TLS termination, LAN exposure, dynamic routing, and load balancing
-require separate security and lifecycle specifications.
+capture start. Reverse listener addresses remain loopback-only to avoid silently exposing an
+unauthenticated debugging proxy to the LAN; local TLS termination, LAN exposure, dynamic routing, and
+load balancing require separate security and lifecycle specifications. Only the forward listener may
+be widened, through remote device onboarding below.
 
 ### SOCKS5 listener ownership
 
@@ -453,6 +454,32 @@ successful HTTP/TLS traffic inherits the existing authoritative raw-byte, body-b
 WebSocket, SSE, scripting, breakpoint, and throttling paths. A distinct `FlowSource` labels it
 `SOCKS5 Proxy`. The `@MainActor` listener store persists a versioned disabled-by-default preference,
 and the native Listeners sheet permits changes only while capture is stopped or failed.
+
+### Remote device onboarding
+
+`ProxyConfiguration.remoteAccess` decides where the forward listener binds: loopback while disabled,
+`0.0.0.0` while enabled. It is disabled by default and, like the other listener settings, may only be
+changed while capture is stopped. Reverse and SOCKS5 listeners keep their own loopback endpoints.
+
+Admission is a port, not listener logic. `NIOProxyEngine` consults `RemoteAccessGate` for every
+accepted forward connection, inside the task that already resolves the flow source, and closes a
+refused channel before installing the HTTP pipeline — no application byte is read. The listener has
+no opinion about loopback: `RemoteDeviceCoordinator` in the application layer owns that policy, which
+keeps the refusal path exercisable over loopback in tests and states every admission rule in one
+place. The coordinator caches decisions by client IP so the burst of connections a phone opens
+produces one prompt, persists always-allow through `RemoteDeviceStore`, keeps allow-once and deny for
+the session, and refuses an unanswered prompt after a timeout without recording it as a decision.
+
+Certificate distribution is served by the forward listener itself. `HTTPProxyHandler` answers `/ssl`,
+`/proxylens.crt`, and `/proxylens.pem` before building a `ProxyTarget`, in origin form for a device
+that is not proxying yet and through the reserved host `proxy.lens` for one that is. Those responses
+are synthesized locally, are not recorded as flows, and carry only the public root certificate. A
+proxied request for the same path on a real host is forwarded normally.
+
+Remote clients are attributed to a device: both flow-source resolvers return `FlowSourceKind`
+`.remoteDevice` for a non-loopback peer and skip the local process lookup that could never match it.
+Friendly names stay in the app layer, resolved from the device store, so core carries no name
+registry.
 
 ### External HTTP proxy routing
 
@@ -968,7 +995,9 @@ All macOS-specific security behavior belongs in `ProxyLensPlatform`:
 
 The main proxy should remain unprivileged. If a privileged helper becomes necessary, add a separate target later with a narrow XPC interface. Do not let the helper own the entire application or proxy engine.
 
-`NetworkExtension` is intentionally outside P0. It should be introduced only for transparent capture, VPN-based routing, or mobile-device support.
+`NetworkExtension` is intentionally outside P0 and is still unused. Remote device onboarding needs
+none of it: a device is configured with an ordinary HTTP proxy. `NetworkExtension` should be
+introduced only for transparent capture, VPN-based routing, or on-device capture.
 
 The root CA private key, authorization headers, cookies, request bodies, and full URLs must not appear in normal logs or diagnostics exports. Imported HAR and session files should be treated as untrusted input.
 

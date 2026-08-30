@@ -12,6 +12,12 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
     private let networkConditionProfileStore: any TrafficNetworkConditionProfileStoring
     private let emptyLabel = NSTextField(labelWithString: "No traffic captured yet")
     private var rows: [TrafficFlowRow] = []
+    /// The selection the view was last scrolled to, so a flow that stays selected does not
+    /// pull the table back on every batch of new traffic.
+    private var lastScrolledSelectionID: FlowID?
+    /// How close to the bottom still counts as "at the bottom" when deciding to follow new
+    /// flows, in points.
+    private static let tailFollowTolerance: CGFloat = 2
     private var isRendering = false
     private lazy var annotationMenuController = FlowAnnotationMenuController(
         viewModel: viewModel,
@@ -100,6 +106,9 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         isRendering = true
         defer { isRendering = false }
 
+        // Measured before the rows change: following new flows is only wanted for someone
+        // already parked at the newest row.
+        let wasScrolledToBottom = isScrolledToBottom()
         let oldRows = rows
         let oldIDs = oldRows.map(\.id)
         let newRows = snapshot.visibleRows
@@ -140,16 +149,41 @@ final class FlowTableViewController: NSViewController, NSTableViewDataSource, NS
         let selectedRowIndexes = IndexSet(
             snapshot.selectedFlowIDs.compactMap { rowIndexByFlowID[$0] }
         )
+        var didScrollForSelection = false
         if selectedRowIndexes.isEmpty {
             tableView.deselectAll(nil)
+            lastScrolledSelectionID = nil
         } else {
             tableView.selectRowIndexes(selectedRowIndexes, byExtendingSelection: false)
+            // Reveal a flow when it becomes the selection, not on every later render: the
+            // user may well have scrolled away from it since.
             if let selectedFlowID = snapshot.selectedFlowID,
+                selectedFlowID != lastScrolledSelectionID,
                 let row = rows.firstIndex(where: { $0.id == selectedFlowID })
             {
                 tableView.scrollRowToVisible(row)
+                didScrollForSelection = true
             }
+            lastScrolledSelectionID = snapshot.selectedFlowID
         }
+
+        if wasScrolledToBottom, !didScrollForSelection, !rows.isEmpty {
+            tableView.scrollRowToVisible(rows.count - 1)
+        }
+    }
+
+    /// Whether the newest row is in view, which is what makes new traffic worth following.
+    private func isScrolledToBottom() -> Bool {
+        guard let scrollView = tableView.enclosingScrollView else {
+            return false
+        }
+        let visible = scrollView.contentView.documentVisibleRect
+        let contentHeight = tableView.bounds.height
+        guard contentHeight > visible.height else {
+            // Everything fits, so the newest row is already visible.
+            return true
+        }
+        return visible.maxY >= contentHeight - Self.tailFollowTolerance
     }
 
     private func applyStructuralChanges(

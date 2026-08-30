@@ -6,6 +6,7 @@ public enum FlowSourceKind: String, Codable, Equatable, Hashable, Sendable {
     case importedSession
     case replay
     case socks5Proxy
+    case remoteDevice
 }
 
 public struct FlowApplication: Codable, Equatable, Hashable, Sendable {
@@ -73,6 +74,20 @@ public struct FlowSource: Codable, Equatable, Hashable, Sendable {
             label: "SOCKS5 Proxy",
             clientAddress: clientAddress,
             application: application
+        )
+    }
+
+    /// A client on the local network, admitted through the remote-access gate.
+    ///
+    /// The label is the bare address; a friendly name is presentation state resolved from the
+    /// device store, so core carries no name registry.
+    public static func remoteDevice(address: String, port: UInt16) -> FlowSource {
+        let host = NetworkAddress.normalizedHost(address)
+        let clientAddress = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+        return FlowSource(
+            kind: .remoteDevice,
+            label: host,
+            clientAddress: clientAddress
         )
     }
 

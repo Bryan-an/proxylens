@@ -14,7 +14,13 @@ public struct UnknownFlowSourceResolver: FlowSourceResolver {
         clientEndpoint: NetworkEndpoint,
         proxyEndpoint _: NetworkEndpoint
     ) async -> FlowSource {
-        FlowSource(
+        guard NetworkAddress.isLoopback(clientEndpoint.host) else {
+            return FlowSource.remoteDevice(
+                address: clientEndpoint.host,
+                port: clientEndpoint.port
+            )
+        }
+        return FlowSource(
             kind: .desktopProxy,
             label: "Desktop proxy",
             clientAddress: Self.address(clientEndpoint)

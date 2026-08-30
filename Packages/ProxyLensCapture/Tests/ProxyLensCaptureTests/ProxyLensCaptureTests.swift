@@ -5747,6 +5747,164 @@ final class ProxyLensCaptureTests: XCTestCase {
         try await certificateProvider.removeCertificateAuthority()
     }
 
+    /// A response larger than HTTP/2's default 65,535-byte flow-control window must still
+    /// arrive whole. Every other HTTP/2 test in this file uses a body that fits inside a
+    /// single window, so a stall at the window boundary would go unnoticed.
+    func testHTTPSConnectInterceptionDeliversAResponseLargerThanTheHTTP2Window() async throws {
+        let certificateProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.capture-tests.\(UUID().uuidString)"
+            )
+        )
+        let rootCertificate = try await certificateProvider.rootCertificate()
+        let upstreamIdentity = try await certificateProvider.leafCertificate(for: "localhost")
+        let responseBody = String(repeating: "d", count: 256 * 1_024)
+        let upstream = try await TestHTTPServer.startHTTP2(
+            responseBody: responseBody,
+            identity: upstreamIdentity
+        )
+        let engine = NIOProxyEngine(
+            certificateProvider: certificateProvider,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [rootCertificate]
+            )
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                try await certificateProvider.removeCertificateAuthority()
+                return
+            }
+
+            // A stalled body would otherwise hang this test forever and take the next test
+            // down with it, so the read races an explicit deadline.
+            let requestURL = "https://localhost:\(upstream.endpoint.port)/large"
+            let responses = try await withThrowingTaskGroup(of: [HTTPTestResponse].self) {
+                group in
+                group.addTask { [requestURL, proxyEndpoint, rootCertificate] in
+                    try await HTTP2TestClient.send(
+                        urls: [requestURL],
+                        through: proxyEndpoint,
+                        trustedRootCertificate: rootCertificate
+                    )
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(20))
+                    throw ProxyLensError.unsupportedOperation(
+                        "The large HTTP/2 response never completed"
+                    )
+                }
+                guard let first = try await group.next() else {
+                    throw ProxyLensError.unsupportedOperation("No result")
+                }
+                group.cancelAll()
+                return first
+            }
+
+            XCTAssertEqual(responses.first?.statusCode, 200)
+            XCTAssertEqual(responses.first?.body.count, responseBody.utf8.count)
+            XCTAssertEqual(responses.first?.body, Data(responseBody.utf8))
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await certificateProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await certificateProvider.removeCertificateAuthority()
+    }
+
+    /// Two large responses sharing one pooled upstream connection. The HTTP/2 connection
+    /// window is shared by every stream on it, so a connection that is not replenished
+    /// stalls the second request even though the first succeeded.
+    func testPooledHTTP2ConnectionDeliversTwoLargeResponses() async throws {
+        let certificateProvider = KeychainCertificateProvider(
+            configuration: .init(
+                keychainNamespace: "com.proxylens.capture-tests.\(UUID().uuidString)"
+            )
+        )
+        let rootCertificate = try await certificateProvider.rootCertificate()
+        let upstreamIdentity = try await certificateProvider.leafCertificate(for: "localhost")
+        let responseBody = String(repeating: "d", count: 256 * 1_024)
+        let upstream = try await TestHTTPServer.startHTTP2(
+            responseBody: responseBody,
+            identity: upstreamIdentity
+        )
+        let engine = NIOProxyEngine(
+            certificateProvider: certificateProvider,
+            upstreamTLSConfiguration: UpstreamTLSConfiguration(
+                additionalTrustRootCertificates: [rootCertificate]
+            )
+        )
+
+        do {
+            try await engine.start(
+                configuration: ProxyConfiguration(
+                    listenEndpoint: NetworkEndpoint(host: "127.0.0.1", port: 0),
+                    interceptHTTPS: true
+                ),
+                sessionID: SessionID()
+            )
+            guard case .running(let proxyEndpoint) = await engine.state() else {
+                XCTFail("Expected the proxy engine to be running")
+                await upstream.stop()
+                try await certificateProvider.removeCertificateAuthority()
+                return
+            }
+
+            let baseURL = "https://localhost:\(upstream.endpoint.port)"
+            let urls = ["\(baseURL)/large/first", "\(baseURL)/large/second"]
+            let responses = try await withThrowingTaskGroup(of: [HTTPTestResponse].self) {
+                group in
+                group.addTask { [urls, proxyEndpoint, rootCertificate] in
+                    try await HTTP2TestClient.send(
+                        urls: urls,
+                        through: proxyEndpoint,
+                        trustedRootCertificate: rootCertificate
+                    )
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(20))
+                    throw ProxyLensError.unsupportedOperation(
+                        "A pooled large HTTP/2 response never completed"
+                    )
+                }
+                guard let first = try await group.next() else {
+                    throw ProxyLensError.unsupportedOperation("No result")
+                }
+                group.cancelAll()
+                return first
+            }
+
+            XCTAssertEqual(responses.map(\.statusCode), [200, 200])
+            XCTAssertEqual(
+                responses.map(\.body.count),
+                [responseBody.utf8.count, responseBody.utf8.count]
+            )
+            XCTAssertEqual(upstream.connectionCount, 1, "Both streams must share one connection")
+        } catch {
+            await engine.stop()
+            await upstream.stop()
+            try? await certificateProvider.removeCertificateAuthority()
+            throw error
+        }
+
+        await engine.stop()
+        await upstream.stop()
+        try await certificateProvider.removeCertificateAuthority()
+    }
+
     func testHTTPSConnectInterceptionUsesPooledUpstreamHTTP2ForHTTP1Client() async throws {
         let certificateProvider = KeychainCertificateProvider(
             configuration: .init(

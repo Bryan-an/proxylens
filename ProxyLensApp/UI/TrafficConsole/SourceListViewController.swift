@@ -12,6 +12,11 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
     private var roots: [SourceOutlineNode] = []
     private var pinnedDomainHosts: Set<String> = []
     private var isRendering = false
+    /// Groups the user collapsed, by node id. Nodes are rebuilt on every render, so
+    /// AppKit's own expansion state cannot survive; this is what restores it.
+    private var collapsedNodeIDs: Set<String> = []
+    /// What the outline currently shows, so an unchanged sidebar is not reloaded at all.
+    private var renderedSignature: String?
 
     init(viewModel: TrafficConsoleViewModel) {
         self.viewModel = viewModel
@@ -137,33 +142,114 @@ final class SourceListViewController: NSViewController, NSOutlineViewDataSource,
                 )
             }
         )
-        roots = [allTraffic]
+        let devices = SourceOutlineNode(
+            id: "devices",
+            title: "Devices",
+            count: snapshot.remoteAccess.devices.count,
+            countSingular: "device",
+            symbolName: "iphone.gen3",
+            selection: nil,
+            children: snapshot.remoteAccess.devices.map {
+                SourceOutlineNode(
+                    id: "device:\($0.id)",
+                    title: $0.displayName,
+                    count: $0.flowCount,
+                    symbolName: $0.isTrusted ? "checkmark.shield" : "iphone.gen3",
+                    selection: .device($0.id)
+                )
+            }
+        )
+        var updatedRoots = [allTraffic]
         if !sessions.children.isEmpty {
-            roots.append(sessions)
+            updatedRoots.append(sessions)
         }
         if !pinned.children.isEmpty {
-            roots.append(pinned)
+            updatedRoots.append(pinned)
         }
-        roots.append(contentsOf: [applications, domains])
-        outlineView.reloadData()
-        if !pinned.children.isEmpty {
-            outlineView.expandItem(pinned)
+        updatedRoots.append(contentsOf: [applications, domains])
+        // Devices only appear once one has connected, so the sidebar stays as it was for a
+        // desktop-only session.
+        if !devices.children.isEmpty {
+            updatedRoots.append(devices)
         }
-        if !sessions.children.isEmpty {
-            outlineView.expandItem(sessions)
+
+        // Flow counts change on nearly every batch, so this only skips work while traffic is
+        // idle; the state restored below is what makes the frequent reloads survivable.
+        let signature = Self.signature(of: updatedRoots)
+        if signature != renderedSignature {
+            let scrollOrigin = enclosingScrollView?.contentView.bounds.origin
+            roots = updatedRoots
+            outlineView.reloadData()
+            restoreExpansionState()
+            if let scrollOrigin {
+                restoreScrollOrigin(scrollOrigin)
+            }
+            renderedSignature = signature
         }
-        outlineView.expandItem(applications)
-        outlineView.expandItem(domains)
 
         let nodes = roots.flatMap { root in
             [root] + root.children
         }
         if let node = nodes.first(where: { $0.selection == snapshot.selectedSource }) {
             let row = outlineView.row(forItem: node)
-            if row >= 0 {
+            if row >= 0, outlineView.selectedRow != row {
                 outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
         }
+    }
+
+    /// Re-expands every group except the ones the user collapsed. New groups start expanded,
+    /// which is how the sidebar has always behaved.
+    private func restoreExpansionState() {
+        for root in roots where !root.children.isEmpty {
+            if collapsedNodeIDs.contains(root.id) {
+                outlineView.collapseItem(root)
+            } else {
+                outlineView.expandItem(root)
+            }
+        }
+    }
+
+    private func restoreScrollOrigin(_ origin: NSPoint) {
+        guard let scrollView = enclosingScrollView, origin.y > 0 else {
+            return
+        }
+        outlineView.layoutSubtreeIfNeeded()
+        scrollView.contentView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private var enclosingScrollView: NSScrollView? {
+        view as? NSScrollView
+    }
+
+    private static func signature(of roots: [SourceOutlineNode]) -> String {
+        var parts: [String] = []
+        for root in roots {
+            parts.append("\(root.id)#\(root.title)#\(root.count)")
+            for child in root.children {
+                parts.append("\(child.id)#\(child.title)#\(child.count)")
+            }
+        }
+        return parts.joined(separator: "|")
+    }
+
+    func outlineViewItemDidExpand(_ notification: Notification) {
+        guard !isRendering,
+            let node = notification.userInfo?["NSObject"] as? SourceOutlineNode
+        else {
+            return
+        }
+        collapsedNodeIDs.remove(node.id)
+    }
+
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        guard !isRendering,
+            let node = notification.userInfo?["NSObject"] as? SourceOutlineNode
+        else {
+            return
+        }
+        collapsedNodeIDs.insert(node.id)
     }
 
     func outlineView(

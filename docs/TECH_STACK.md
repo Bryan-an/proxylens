@@ -183,7 +183,9 @@ Use `ServiceManagement.SMAppService` later for a login item or launch-agent styl
 
 ### Deliberately deferred: Network Extension
 
-`NetworkExtension` is reserved for a later transparent-capture or mobile-device architecture. It introduces a different permission, entitlement, lifecycle, and debugging model. It is unnecessary for a user-configured desktop HTTP/HTTPS proxy and should not be a P0 dependency.
+`NetworkExtension` is reserved for a later transparent-capture or on-device-capture architecture. It introduces a different permission, entitlement, lifecycle, and debugging model. It is unnecessary for a user-configured desktop HTTP/HTTPS proxy and should not be a P0 dependency.
+
+Remote device onboarding does not change this. A phone or tablet on the local network is configured with an ordinary HTTP proxy pointed at the forward listener, so it needs no entitlement, no VPN, and no second target. The only platform addition is `getifaddrs` for listing the Mac's usable IPv4 addresses and CoreImage's `CIQRCodeGenerator` for the setup QR code, both already in the SDK.
 
 ## Storage architecture: GRDB and SQLite
 
@@ -393,7 +395,7 @@ Keep the initial dependency set intentionally small:
 ### Add only when a feature earns it
 
 - HTTP/2 support through `NIOHTTP2`.
-- Mobile/transparent routing through `NetworkExtension`.
+- On-device or transparent routing through `NetworkExtension`.
 - Protobuf/GraphQL decoders.
 - Broader JavaScript capabilities such as modules, async networking, and controlled local files.
 - Cloud sync, authentication, team workspaces, or hosted telemetry.
@@ -725,7 +727,7 @@ Useful internal metrics include:
 
 ### P2 — expansion beyond desktop proxying
 
-- Mobile device capture.
+- On-device capture on iOS and Android.
 - Transparent proxy or VPN-based routing.
 - HTTP/3/QUIC investigation.
 - Collaboration and cloud synchronization.

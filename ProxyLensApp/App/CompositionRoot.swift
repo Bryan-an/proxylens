@@ -46,6 +46,8 @@ final class CompositionRoot {
         let ruleEngine = RuleEngine()
         let breakpointCoordinator = BreakpointCoordinator()
         let flowSourceResolver = MacOSFlowSourceResolver()
+        let remoteDeviceStore = UserDefaultsRemoteDeviceStore()
+        let remoteDeviceCoordinator = RemoteDeviceCoordinator(store: remoteDeviceStore)
         let externalHTTPProxyCredentialStore = KeychainExternalHTTPProxyCredentialStore()
         let scriptExecutor = Bundle.main.executableURL.map {
             ProcessJavaScriptExecutor(workerExecutableURL: $0)
@@ -63,6 +65,7 @@ final class CompositionRoot {
             scriptExecutor: scriptExecutor,
             breakpointGate: breakpointCoordinator,
             flowSourceResolver: flowSourceResolver,
+            remoteAccessGate: remoteDeviceCoordinator,
             externalHTTPProxyCredentialStore: externalHTTPProxyCredentialStore
         )
         let systemProxyController = MacOSSystemProxyController(
@@ -159,7 +162,11 @@ final class CompositionRoot {
             externalHTTPProxyCredentialStore: externalHTTPProxyCredentialStore,
             customFilterPresetStore: UserDefaultsTrafficCustomFilterPresetStore(),
             sslProxyingStore: UserDefaultsTrafficSSLProxyingStore(),
-            tlsInterceptionPolicySink: tlsInterceptionPolicy
+            tlsInterceptionPolicySink: tlsInterceptionPolicy,
+            systemProxyStore: UserDefaultsTrafficSystemProxyStore(),
+            remoteAccessStore: UserDefaultsTrafficRemoteAccessStore(),
+            remoteAccessController: remoteDeviceCoordinator,
+            lanAddressProvider: MacOSLANAddressProvider()
         )
     }
 

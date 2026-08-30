@@ -120,6 +120,44 @@ protocol TrafficRuleProfileArchiving: Sendable {
 
 extension RuleProfileArchiveService: TrafficRuleProfileArchiving {}
 
+/// The console's view of remote-device approval. The coordinator owns the policy; this is
+/// only what the UI needs to show and answer prompts.
+protocol TrafficRemoteAccessControlling: Sendable {
+    func setRemoteAccessEnabled(_ isEnabled: Bool) async
+    func endRemoteAccessSession() async
+    func remoteDevices() async -> [RemoteDevice]
+    func makeApprovalChangeStream() async -> AsyncStream<RemoteAccessApprovalChange>
+    func resolveApproval(address: String, approval: RemoteDeviceApproval) async
+    func renameRemoteDevice(address: String, to name: String?) async
+    func revokeRemoteDevice(address: String) async
+}
+
+extension RemoteDeviceCoordinator: TrafficRemoteAccessControlling {
+    func endRemoteAccessSession() async {
+        endSession()
+    }
+
+    func remoteDevices() async -> [RemoteDevice] {
+        await devices()
+    }
+
+    func makeApprovalChangeStream() async -> AsyncStream<RemoteAccessApprovalChange> {
+        approvalChanges()
+    }
+
+    func resolveApproval(address: String, approval: RemoteDeviceApproval) async {
+        await resolve(address: address, approval: approval)
+    }
+
+    func renameRemoteDevice(address: String, to name: String?) async {
+        await rename(address: address, to: name)
+    }
+
+    func revokeRemoteDevice(address: String) async {
+        await revoke(address: address)
+    }
+}
+
 protocol TrafficCertificateTrusting: Sendable {
     func state() async throws -> CertificateTrustState
     func install() async throws
@@ -187,6 +225,10 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let customFilterPresetStore: any TrafficCustomFilterPresetStoring
     private let sslProxyingStore: any TrafficSSLProxyingStoring
     private let tlsInterceptionPolicySink: MutableTLSInterceptionPolicy?
+    private let systemProxyStore: any TrafficSystemProxyStoring
+    private let remoteAccessStore: any TrafficRemoteAccessStoring
+    private let remoteAccessController: (any TrafficRemoteAccessControlling)?
+    private let lanAddressProvider: any TrafficLANAddressProviding
 
     private var store = TrafficConsoleStore()
     private var capturePresentation: TrafficCapturePresentation = .recovering
@@ -196,6 +238,10 @@ final class TrafficConsoleViewModel: ObservableObject {
     private var isClearingSession = false
     private var workspaceWarning: String?
     private var certificateTrustState: CertificateTrustState?
+    private var remoteDevices: [RemoteDevice] = []
+    private var pendingRemoteApprovals: [String] = []
+    private var lanAddresses: [String] = []
+    private var remoteApprovalTask: Task<Void, Never>?
     private var eventTask: Task<Void, Never>?
     private var eventBatchTask: Task<Void, Never>?
     private var bodyTask: Task<Void, Never>?
@@ -278,7 +324,13 @@ final class TrafficConsoleViewModel: ObservableObject {
         customFilterPresetStore: any TrafficCustomFilterPresetStoring =
             InMemoryTrafficCustomFilterPresetStore(),
         sslProxyingStore: any TrafficSSLProxyingStoring = InMemoryTrafficSSLProxyingStore(),
-        tlsInterceptionPolicySink: MutableTLSInterceptionPolicy? = nil
+        tlsInterceptionPolicySink: MutableTLSInterceptionPolicy? = nil,
+        systemProxyStore: any TrafficSystemProxyStoring = InMemoryTrafficSystemProxyStore(),
+        remoteAccessStore: any TrafficRemoteAccessStoring = InMemoryTrafficRemoteAccessStore(),
+        remoteAccessController: (any TrafficRemoteAccessControlling)? = nil,
+        lanAddressProvider: any TrafficLANAddressProviding = StaticLANAddressProvider(
+            addresses: []
+        )
     ) {
         self.captureController = captureController
         self.eventSource = eventSource
@@ -344,6 +396,10 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.customFilterPresetStore = customFilterPresetStore
         self.sslProxyingStore = sslProxyingStore
         self.tlsInterceptionPolicySink = tlsInterceptionPolicySink
+        self.systemProxyStore = systemProxyStore
+        self.remoteAccessStore = remoteAccessStore
+        self.remoteAccessController = remoteAccessController
+        self.lanAddressProvider = lanAddressProvider
         for domain in pinnedDomainsStore.domains {
             store.setPinnedDomain(domain, isPinned: true)
         }
@@ -365,6 +421,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         serverSentEventSearchTask?.cancel()
         serverSentEventAccumulationTask?.cancel()
         captureTask?.cancel()
+        remoteApprovalTask?.cancel()
     }
 
     func prepare() async {
@@ -389,6 +446,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         subscribeToFlowEvents()
         subscribeToWebSocketFrameEvents()
         subscribeToServerSentEventEvents()
+        await refreshRemoteAccess()
+        subscribeToRemoteApprovalChanges()
     }
 
     func importProtobufDescriptorSet(from url: URL) async throws {
@@ -560,6 +619,70 @@ final class TrafficConsoleViewModel: ObservableObject {
         try socks5ListenerStore.save(configuration)
     }
 
+    func currentConfiguresSystemProxy() -> Bool {
+        systemProxyStore.configuresSystemProxy
+    }
+
+    /// Whether capture rewrites the macOS system proxy is decided when capture starts, so it
+    /// follows the same stopped-capture rule as the listener settings.
+    func saveConfiguresSystemProxy(_ configuresSystemProxy: Bool) throws {
+        guard canEditListenerConfiguration else {
+            throw TrafficSystemProxyStoreError.captureMustBeStopped
+        }
+        systemProxyStore.save(configuresSystemProxy: configuresSystemProxy)
+    }
+
+    func currentRemoteAccessConfiguration() -> RemoteAccessConfiguration {
+        remoteAccessStore.configuration
+    }
+
+    /// Widening the listener beyond loopback is a listener change, so it follows the same
+    /// stopped-capture rule as the SOCKS5 and reverse-proxy settings.
+    func saveRemoteAccessConfiguration(_ configuration: RemoteAccessConfiguration) throws {
+        guard canEditListenerConfiguration else {
+            throw TrafficRemoteAccessStoreError.captureMustBeStopped
+        }
+        _ = try captureConfiguration(
+            with: reverseProxyRouteStore.routes,
+            remoteAccess: configuration
+        )
+        remoteAccessStore.save(configuration)
+        lanAddresses = lanAddressProvider.currentAddresses()
+        publishSnapshot()
+    }
+
+    func resolveRemoteDeviceApproval(address: String, approval: RemoteDeviceApproval) {
+        guard let remoteAccessController else {
+            return
+        }
+        pendingRemoteApprovals.removeAll { $0 == address }
+        publishSnapshot()
+        Task { [weak self] in
+            await remoteAccessController.resolveApproval(address: address, approval: approval)
+            await self?.refreshRemoteDevices()
+        }
+    }
+
+    func renameRemoteDevice(address: String, to name: String?) {
+        guard let remoteAccessController else {
+            return
+        }
+        Task { [weak self] in
+            await remoteAccessController.renameRemoteDevice(address: address, to: name)
+            await self?.refreshRemoteDevices()
+        }
+    }
+
+    func revokeRemoteDevice(address: String) {
+        guard let remoteAccessController else {
+            return
+        }
+        Task { [weak self] in
+            await remoteAccessController.revokeRemoteDevice(address: address)
+            await self?.refreshRemoteDevices()
+        }
+    }
+
     func currentExternalHTTPProxyConfiguration() -> ExternalHTTPProxyConfiguration {
         externalHTTPProxyStore.configuration
     }
@@ -685,19 +808,21 @@ final class TrafficConsoleViewModel: ObservableObject {
     private func captureConfiguration(
         with reverseProxyRoutes: [ReverseProxyRoute],
         socks5Listener: SOCKS5ListenerConfiguration? = nil,
-        externalHTTPProxy: ExternalHTTPProxyConfiguration? = nil
+        externalHTTPProxy: ExternalHTTPProxyConfiguration? = nil,
+        remoteAccess: RemoteAccessConfiguration? = nil
     ) throws -> CaptureConfiguration {
         let proxy = ProxyConfiguration(
             listenEndpoint: captureConfiguration.proxy.listenEndpoint,
             interceptHTTPS: captureConfiguration.proxy.interceptHTTPS,
             reverseProxyRoutes: reverseProxyRoutes,
             socks5Listener: socks5Listener ?? socks5ListenerStore.configuration,
-            externalHTTPProxy: externalHTTPProxy ?? externalHTTPProxyStore.configuration
+            externalHTTPProxy: externalHTTPProxy ?? externalHTTPProxyStore.configuration,
+            remoteAccess: remoteAccess ?? remoteAccessStore.configuration
         )
         try proxy.validateListeners()
         return CaptureConfiguration(
             proxy: proxy,
-            configuresSystemProxy: captureConfiguration.configuresSystemProxy,
+            configuresSystemProxy: systemProxyStore.configuresSystemProxy,
             bypassDomains: captureConfiguration.bypassDomains
         )
     }
@@ -2013,6 +2138,10 @@ final class TrafficConsoleViewModel: ObservableObject {
             let configuration = try captureConfiguration(
                 with: reverseProxyRouteStore.routes
             )
+            await remoteAccessController?.setRemoteAccessEnabled(
+                configuration.proxy.remoteAccess.isEnabled
+            )
+            lanAddresses = lanAddressProvider.currentAddresses()
             let context = try await captureController.start(configuration: configuration)
             capturePresentation = .running(context, warning: nil)
         } catch {
@@ -2031,6 +2160,8 @@ final class TrafficConsoleViewModel: ObservableObject {
         capturePresentation = .stopping
         publishSnapshot()
         await breakpointCoordinator?.abortAll()
+        await remoteAccessController?.endRemoteAccessSession()
+        pendingRemoteApprovals.removeAll()
         do {
             try await captureController.stop()
             capturePresentation = .stopped
@@ -4034,12 +4165,89 @@ final class TrafficConsoleViewModel: ObservableObject {
         publishSnapshot()
     }
 
+    private func subscribeToRemoteApprovalChanges() {
+        guard remoteApprovalTask == nil, let remoteAccessController else {
+            return
+        }
+        remoteApprovalTask = Task { [weak self] in
+            let stream = await remoteAccessController.makeApprovalChangeStream()
+            for await change in stream {
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.receiveRemoteApprovalChange(change)
+            }
+        }
+    }
+
+    private func receiveRemoteApprovalChange(_ change: RemoteAccessApprovalChange) {
+        switch change {
+        case .requested(let request):
+            guard !pendingRemoteApprovals.contains(request.address) else {
+                return
+            }
+            pendingRemoteApprovals.append(request.address)
+        case .settled(let address):
+            pendingRemoteApprovals.removeAll { $0 == address }
+        }
+        publishSnapshot()
+        Task { [weak self] in
+            await self?.refreshRemoteDevices()
+        }
+    }
+
+    private func refreshRemoteAccess() async {
+        lanAddresses = lanAddressProvider.currentAddresses()
+        await refreshRemoteDevices()
+    }
+
+    private func refreshRemoteDevices() async {
+        guard let remoteAccessController else {
+            return
+        }
+        remoteDevices = await remoteAccessController.remoteDevices()
+        publishSnapshot()
+    }
+
+    /// Merges what the console has seen (flow counts, keyed by address) with what the
+    /// coordinator knows (names and trust).
+    private func remoteAccessSnapshot() -> TrafficRemoteAccessSnapshot {
+        let flowCounts = store.deviceFlowCounts
+        let knownDevices = Dictionary(
+            remoteDevices.map { ($0.address, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let addresses = Set(flowCounts.keys).union(knownDevices.keys)
+        let devices =
+            addresses
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            .map { address in
+                TrafficRemoteDeviceSummary(
+                    id: address,
+                    name: knownDevices[address]?.name,
+                    isTrusted: knownDevices[address]?.isTrusted ?? false,
+                    flowCount: flowCounts[address] ?? 0
+                )
+            }
+
+        return TrafficRemoteAccessSnapshot(
+            isEnabled: remoteAccessStore.configuration.isEnabled,
+            listenPort: captureConfiguration.proxy.listenEndpoint.port,
+            addresses: lanAddresses,
+            devices: devices,
+            pendingApproval: pendingRemoteApprovals.first.map(
+                TrafficRemoteDeviceApproval.init(address:)
+            )
+        )
+    }
+
     private func publishSnapshot() {
         snapshot = store.snapshot(
             capture: capturePresentation,
             inspection: inspection,
             workspaceWarning: workspaceWarning,
-            certificateTrust: certificateTrustState
+            certificateTrust: certificateTrustState,
+            remoteAccess: remoteAccessSnapshot()
         )
     }
 
