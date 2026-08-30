@@ -225,6 +225,7 @@ final class TrafficConsoleViewModel: ObservableObject {
     private let customFilterPresetStore: any TrafficCustomFilterPresetStoring
     private let sslProxyingStore: any TrafficSSLProxyingStoring
     private let tlsInterceptionPolicySink: MutableTLSInterceptionPolicy?
+    private let systemProxyStore: any TrafficSystemProxyStoring
     private let remoteAccessStore: any TrafficRemoteAccessStoring
     private let remoteAccessController: (any TrafficRemoteAccessControlling)?
     private let lanAddressProvider: any TrafficLANAddressProviding
@@ -324,6 +325,7 @@ final class TrafficConsoleViewModel: ObservableObject {
             InMemoryTrafficCustomFilterPresetStore(),
         sslProxyingStore: any TrafficSSLProxyingStoring = InMemoryTrafficSSLProxyingStore(),
         tlsInterceptionPolicySink: MutableTLSInterceptionPolicy? = nil,
+        systemProxyStore: any TrafficSystemProxyStoring = InMemoryTrafficSystemProxyStore(),
         remoteAccessStore: any TrafficRemoteAccessStoring = InMemoryTrafficRemoteAccessStore(),
         remoteAccessController: (any TrafficRemoteAccessControlling)? = nil,
         lanAddressProvider: any TrafficLANAddressProviding = StaticLANAddressProvider(
@@ -394,6 +396,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         self.customFilterPresetStore = customFilterPresetStore
         self.sslProxyingStore = sslProxyingStore
         self.tlsInterceptionPolicySink = tlsInterceptionPolicySink
+        self.systemProxyStore = systemProxyStore
         self.remoteAccessStore = remoteAccessStore
         self.remoteAccessController = remoteAccessController
         self.lanAddressProvider = lanAddressProvider
@@ -616,6 +619,19 @@ final class TrafficConsoleViewModel: ObservableObject {
         try socks5ListenerStore.save(configuration)
     }
 
+    func currentConfiguresSystemProxy() -> Bool {
+        systemProxyStore.configuresSystemProxy
+    }
+
+    /// Whether capture rewrites the macOS system proxy is decided when capture starts, so it
+    /// follows the same stopped-capture rule as the listener settings.
+    func saveConfiguresSystemProxy(_ configuresSystemProxy: Bool) throws {
+        guard canEditListenerConfiguration else {
+            throw TrafficSystemProxyStoreError.captureMustBeStopped
+        }
+        systemProxyStore.save(configuresSystemProxy: configuresSystemProxy)
+    }
+
     func currentRemoteAccessConfiguration() -> RemoteAccessConfiguration {
         remoteAccessStore.configuration
     }
@@ -806,7 +822,7 @@ final class TrafficConsoleViewModel: ObservableObject {
         try proxy.validateListeners()
         return CaptureConfiguration(
             proxy: proxy,
-            configuresSystemProxy: captureConfiguration.configuresSystemProxy,
+            configuresSystemProxy: systemProxyStore.configuresSystemProxy,
             bypassDomains: captureConfiguration.bypassDomains
         )
     }

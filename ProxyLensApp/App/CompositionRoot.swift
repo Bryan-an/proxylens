@@ -163,6 +163,7 @@ final class CompositionRoot {
             customFilterPresetStore: UserDefaultsTrafficCustomFilterPresetStore(),
             sslProxyingStore: UserDefaultsTrafficSSLProxyingStore(),
             tlsInterceptionPolicySink: tlsInterceptionPolicy,
+            systemProxyStore: UserDefaultsTrafficSystemProxyStore(),
             remoteAccessStore: UserDefaultsTrafficRemoteAccessStore(),
             remoteAccessController: remoteDeviceCoordinator,
             lanAddressProvider: MacOSLANAddressProvider()

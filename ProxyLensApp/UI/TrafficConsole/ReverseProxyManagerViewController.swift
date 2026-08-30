@@ -16,6 +16,11 @@ final class ReverseProxyManagerViewController: NSViewController, NSTableViewData
     private let addButton = NSButton(title: "New Route…", target: nil, action: nil)
     private let editButton = NSButton(title: "Edit…", target: nil, action: nil)
     private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
+    private let systemProxyButton = NSButton(
+        checkboxWithTitle: "Set this Mac's system proxy while capturing",
+        target: nil,
+        action: nil
+    )
     private let socks5EnabledButton = NSButton(
         checkboxWithTitle: "Enable SOCKS5 proxy", target: nil, action: nil
     )
@@ -70,6 +75,15 @@ final class ReverseProxyManagerViewController: NSViewController, NSTableViewData
         lockMessage.textColor = .systemOrange
         lockMessage.setAccessibilityIdentifier("reverseProxyManager.lockMessage")
 
+        systemProxyButton.translatesAutoresizingMaskIntoConstraints = false
+        systemProxyButton.target = self
+        systemProxyButton.action = #selector(toggleSystemProxy)
+        systemProxyButton.toolTip =
+            "Off means macOS stops asking for your password on every capture, and only "
+            + "traffic pointed at ProxyLens is captured."
+        systemProxyButton.setAccessibilityIdentifier("reverseProxyManager.systemProxy")
+        systemProxyButton.setAccessibilityLabel("Set the system proxy while capturing")
+
         let socks5Section = makeSOCKS5Section()
         let externalProxySection = makeExternalHTTPProxySection()
 
@@ -110,8 +124,8 @@ final class ReverseProxyManagerViewController: NSViewController, NSTableViewData
         closeButton.setAccessibilityIdentifier("reverseProxyManager.close")
 
         for subview in [
-            title, subtitle, lockMessage, socks5Section, externalProxySection, scrollView,
-            emptyState,
+            title, subtitle, lockMessage, systemProxyButton, socks5Section,
+            externalProxySection, scrollView, emptyState,
             addButton, editButton, removeButton, closeButton
         ] {
             container.addSubview(subview)
@@ -126,9 +140,14 @@ final class ReverseProxyManagerViewController: NSViewController, NSTableViewData
             lockMessage.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             lockMessage.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             lockMessage.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 6),
+            systemProxyButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            systemProxyButton.trailingAnchor.constraint(lessThanOrEqualTo: title.trailingAnchor),
+            systemProxyButton.topAnchor.constraint(
+                equalTo: lockMessage.bottomAnchor, constant: 8),
             socks5Section.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             socks5Section.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            socks5Section.topAnchor.constraint(equalTo: lockMessage.bottomAnchor, constant: 10),
+            socks5Section.topAnchor.constraint(
+                equalTo: systemProxyButton.bottomAnchor, constant: 10),
             socks5Section.heightAnchor.constraint(equalToConstant: 112),
             externalProxySection.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             externalProxySection.trailingAnchor.constraint(equalTo: title.trailingAnchor),
@@ -162,6 +181,7 @@ final class ReverseProxyManagerViewController: NSViewController, NSTableViewData
     }
 
     func reloadRoutes() {
+        reloadSystemProxyPreference()
         reloadSOCKS5Configuration()
         reloadExternalHTTPProxyConfiguration()
         let selectedID = selectedRoute?.id
@@ -606,6 +626,22 @@ final class ReverseProxyManagerViewController: NSViewController, NSTableViewData
                 externalProxyValidationField.stringValue = error.localizedDescription
             }
         }
+    }
+
+    private func reloadSystemProxyPreference() {
+        systemProxyButton.state = viewModel.currentConfiguresSystemProxy() ? .on : .off
+        systemProxyButton.isEnabled = viewModel.canEditReverseProxyRoutes
+    }
+
+    @objc private func toggleSystemProxy() {
+        do {
+            try viewModel.saveConfiguresSystemProxy(systemProxyButton.state == .on)
+            socks5ValidationField.stringValue = ""
+        } catch {
+            socks5ValidationField.stringValue = error.localizedDescription
+            NSAccessibility.post(element: socks5ValidationField, notification: .valueChanged)
+        }
+        reloadSystemProxyPreference()
     }
 
     @objc private func addRoute() {
